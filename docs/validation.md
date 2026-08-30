@@ -3,6 +3,7 @@
 Run the fast checks before every commit:
 
 ```sh
+python3 -m pip install --requirement requirements.txt
 python3 -m py_compile controller/*.py controller/hot_commands/*.py deploy/*.py tools/*.py
 python3 -m unittest discover -s controller -p 'test_*.py'
 python3 -m unittest discover -s deploy -p 'test_*.py'

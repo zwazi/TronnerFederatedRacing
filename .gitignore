@@ -1,4 +1,6 @@
 __pycache__/
+.venv/
+venv/
 *.py[cod]
 *.swp
 .DS_Store

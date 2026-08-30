@@ -71,6 +71,9 @@ for the security and compatibility gates required before a third live node.
 ## Development
 
 ```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install --requirement requirements.txt
 python3 -m py_compile controller/*.py deploy/*.py tools/*.py
 python3 -m unittest discover -s controller -p 'test_*.py'
 python3 -m unittest discover -s deploy -p 'test_*.py'
