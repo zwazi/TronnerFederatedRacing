@@ -12,6 +12,25 @@ for library in libtron libenginecore libengine libnetwork libui librender libtoo
     test -f "$build_dir/src/$library.a"
 done
 
+read_make_flags() {
+    local variable=$1
+    python3 - "$build_dir/src/Makefile" "$variable" <<'PY'
+import pathlib
+import shlex
+import sys
+
+prefix = sys.argv[2] + " ="
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    if line.startswith(prefix):
+        for value in shlex.split(line.split("=", 1)[1].strip()):
+            print(value)
+        break
+PY
+}
+
+mapfile -t zthread_cxxflags < <(read_make_flags ZTHREAD_CXXFLAGS)
+mapfile -t zthread_libs < <(read_make_flags ZTHREAD_LIBS)
+
 mkdir -p "$output_dir"
 for probe in network_hold player_name_probe server_info_probe; do
     g++ -std=c++11 -O2 -Wl,--allow-multiple-definition \
@@ -23,6 +42,7 @@ for probe in network_hold player_name_probe server_info_probe; do
         -iquote "$source_dir/src/tron" \
         -iquote "$source_dir/src/ui" \
         -iquote "$source_dir/src/render" \
+        "${zthread_cxxflags[@]}" \
         $(pkg-config --cflags libxml-2.0) \
         "$repository_dir/deploy/smoke/$probe.cpp" \
         -Wl,--start-group \
@@ -34,6 +54,7 @@ for probe in network_hold player_name_probe server_info_probe; do
         "$build_dir/src/librender.a" \
         "$build_dir/src/libtools.a" \
         -Wl,--end-group \
+        "${zthread_libs[@]}" \
         $(pkg-config --libs libxml-2.0) -lpthread -lm -lz \
         -o "$output_dir/$probe"
 done
