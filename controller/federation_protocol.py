@@ -18,7 +18,8 @@ from collections import OrderedDict
 from typing import Any
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+LEGACY_PROTOCOL_VERSION = 1
 MAX_DATAGRAM_BYTES = 16_384
 DEFAULT_MAX_CLOCK_SKEW_NS = 30_000_000_000
 MINIMUM_KEY_BYTES = 32
@@ -61,6 +62,8 @@ class Packet:
     sent_ns: int
     kind: str
     payload: dict[str, Any]
+    sender_server_id: str | None = None
+    destination_server_id: str | None = None
 
 
 def _validate_key(key: bytes) -> bytes:
@@ -130,6 +133,8 @@ def encode_packet(
     kind: str,
     payload: dict[str, Any],
     sent_ns: int | None = None,
+    origin_server_id: str | None = None,
+    destination_server_id: str | None = None,
 ) -> bytes:
     """Return one signed federation datagram."""
 
@@ -148,6 +153,21 @@ def encode_packet(
     if not isinstance(payload, dict):
         raise ProtocolError("packet payload must be an object")
 
+    effective_origin = (
+        server_id
+        if origin_server_id is None
+        else _validate_identifier(origin_server_id, "origin server ID")
+    )
+    if destination_server_id is None and origin_server_id is None:
+        version = LEGACY_PROTOCOL_VERSION
+    else:
+        if destination_server_id is None:
+            raise ProtocolError("version 2 packets require a destination server ID")
+        destination_server_id = _validate_identifier(
+            destination_server_id, "destination server ID"
+        )
+        version = PROTOCOL_VERSION
+
     body = {
         "boot_id": boot_id,
         "cluster_id": cluster_id,
@@ -156,8 +176,11 @@ def encode_packet(
         "sent_ns": sent_ns,
         "sequence": sequence,
         "server_id": server_id,
-        "version": PROTOCOL_VERSION,
+        "version": version,
     }
+    if version == PROTOCOL_VERSION:
+        body["origin_server_id"] = effective_origin
+        body["destination_server_id"] = destination_server_id
     packet = dict(body)
     packet["signature"] = _signature(key, body)
     encoded = _canonical_json(packet)
@@ -174,6 +197,8 @@ def decode_packet(
     *,
     expected_cluster_id: str,
     expected_server_id: str | None = None,
+    expected_destination_server_id: str | None = None,
+    allowed_origin_server_ids: frozenset[str] | set[str] | None = None,
     now_ns: int | None = None,
     max_clock_skew_ns: int = DEFAULT_MAX_CLOCK_SKEW_NS,
 ) -> Packet:
@@ -186,6 +211,10 @@ def decode_packet(
     if expected_server_id is not None:
         expected_server_id = _validate_identifier(
             expected_server_id, "expected server ID"
+        )
+    if expected_destination_server_id is not None:
+        expected_destination_server_id = _validate_identifier(
+            expected_destination_server_id, "expected destination server ID"
         )
     if not isinstance(data, bytes):
         raise ProtocolError("datagram must be bytes")
@@ -202,7 +231,7 @@ def decode_packet(
     if not isinstance(decoded, dict):
         raise ProtocolError("packet must be an object")
 
-    required = {
+    legacy_required = {
         "version",
         "cluster_id",
         "server_id",
@@ -213,6 +242,17 @@ def decode_packet(
         "payload",
         "signature",
     }
+    version_value = decoded.get("version")
+    v2_required = legacy_required | {
+        "origin_server_id",
+        "destination_server_id",
+    }
+    if version_value == LEGACY_PROTOCOL_VERSION:
+        required = legacy_required
+    elif version_value == PROTOCOL_VERSION:
+        required = v2_required
+    else:
+        raise ProtocolError(f"unsupported protocol version: {version_value}")
     if set(decoded) != required:
         raise ProtocolError("packet fields do not match protocol schema")
 
@@ -227,15 +267,40 @@ def decode_packet(
     if not hmac.compare_digest(signature, expected_signature):
         raise ProtocolError("packet signature mismatch")
 
-    version = _validate_integer(decoded["version"], "version", 1, 1)
-    if version != PROTOCOL_VERSION:
-        raise ProtocolError(f"unsupported protocol version: {version}")
+    version = _validate_integer(
+        decoded["version"],
+        "version",
+        LEGACY_PROTOCOL_VERSION,
+        PROTOCOL_VERSION,
+    )
     cluster_id = _validate_identifier(decoded["cluster_id"], "cluster ID")
     if cluster_id != expected_cluster_id:
         raise ProtocolError("packet belongs to another cluster")
-    server_id = _validate_identifier(decoded["server_id"], "server ID")
-    if expected_server_id is not None and server_id != expected_server_id:
+    sender_server_id = _validate_identifier(decoded["server_id"], "server ID")
+    if expected_server_id is not None and sender_server_id != expected_server_id:
         raise ProtocolError("packet came from an unexpected server")
+    if version == PROTOCOL_VERSION:
+        origin_server_id = _validate_identifier(
+            decoded["origin_server_id"], "origin server ID"
+        )
+        destination_server_id = _validate_identifier(
+            decoded["destination_server_id"], "destination server ID"
+        )
+        if (
+            expected_destination_server_id is not None
+            and destination_server_id != expected_destination_server_id
+        ):
+            raise ProtocolError("packet was addressed to another server")
+        if (
+            allowed_origin_server_ids is not None
+            and origin_server_id not in allowed_origin_server_ids
+        ):
+            raise ProtocolError("packet has an unexpected origin server")
+    else:
+        if expected_destination_server_id is not None:
+            raise ProtocolError("legacy packet has no destination server")
+        origin_server_id = sender_server_id
+        destination_server_id = None
     boot_id = _validate_identifier(decoded["boot_id"], "boot ID")
     sequence = _validate_integer(
         decoded["sequence"], "sequence", 0, SEQUENCE_MAXIMUM
@@ -261,12 +326,14 @@ def decode_packet(
     return Packet(
         version=version,
         cluster_id=cluster_id,
-        server_id=server_id,
+        server_id=origin_server_id,
         boot_id=boot_id,
         sequence=sequence,
         sent_ns=sent_ns,
         kind=kind,
         payload=payload,
+        sender_server_id=sender_server_id,
+        destination_server_id=destination_server_id,
     )
 
 

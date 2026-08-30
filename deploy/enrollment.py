@@ -159,26 +159,30 @@ def approve_request(args: argparse.Namespace) -> int:
         write_key(bundle / "secrets" / leader_to_follower_name, leader_to_follower)
 
     leader_fragment = {
-        "enabled": True,
-        "listen_host": leader_address,
-        "peer_host": follower_address,
-        "expected_peer_ip": follower_address,
-        "port": federation_port,
-        "peer_server_id": follower_id,
-        "peer_region_label": request["region_label"],
-        "publish_key_name": leader_to_follower_name,
-        "receive_key_name": follower_to_leader_name,
+        "peer": {
+            "server_id": follower_id,
+            "region_label": request["region_label"],
+            "host": follower_address,
+            "expected_peer_ip": follower_address,
+            "port": federation_port,
+            "publish_key_name": leader_to_follower_name,
+            "receive_key_name": follower_to_leader_name,
+        }
     }
     follower_fragment = {
         "enabled": True,
         "listen_host": follower_address,
-        "peer_host": leader_address,
-        "expected_peer_ip": leader_address,
         "port": federation_port,
-        "peer_server_id": leader_id,
-        "peer_region_label": leader_region,
-        "publish_key_name": follower_to_leader_name,
-        "receive_key_name": leader_to_follower_name,
+        "peers": [
+            {
+                "server_id": leader_id,
+                "region_label": leader_region,
+                "host": leader_address,
+                "expected_peer_ip": leader_address,
+                "publish_key_name": follower_to_leader_name,
+                "receive_key_name": leader_to_follower_name,
+            }
+        ],
     }
     safe_output_file(
         leader_bundle / "federation-fragment.json",

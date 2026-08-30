@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "server_id": "region-b",
-  "region_label": "B",
+  "server_id": "region-c",
+  "region_label": "C",
   "role": "follower",
-  "server_name": "Example Racing | Region B",
+  "server_name": "Example Racing | Region C",
   "website_url": "https://example.invalid/",
-  "server_dns": "game-b.example.invalid",
-  "public_base_url": "http://maps-b.example.invalid:8080/",
+  "server_dns": "game-c.example.invalid",
+  "public_base_url": "http://maps-c.example.invalid:8080/",
   "master_list": false,
   "game_bind": "0.0.0.0",
   "game_port": 4534,
@@ -14,7 +14,7 @@
   "resource_port": 8080,
   "federation": {
     "enabled": true,
-    "listen_host": "10.77.0.2",
+    "listen_host": "10.77.0.3",
     "port": 4540,
     "peers": [
       {
@@ -22,8 +22,8 @@
         "region_label": "A",
         "host": "10.77.0.1",
         "expected_peer_ip": "10.77.0.1",
-        "publish_key_name": "region-b-to-region-a.key",
-        "receive_key_name": "region-a-to-region-b.key"
+        "publish_key_name": "region-c-to-region-a.key",
+        "receive_key_name": "region-a-to-region-c.key"
       }
     ]
   }

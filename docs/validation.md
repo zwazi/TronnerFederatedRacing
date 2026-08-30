@@ -34,6 +34,7 @@ export SMOKE_PROBE_DIR=/tmp/tronner-validation/probes
 ./deploy/smoke/run_round_sync_smoke.sh
 ./deploy/smoke/run_bidirectional_smoke.sh
 DISPLAY_SERVER_TAGS=1 ./deploy/smoke/run_bidirectional_smoke.sh
+python3 controller/test_three_region_transport.py
 ```
 
 These tests bind only loopback ports, never advertise to the master list, use

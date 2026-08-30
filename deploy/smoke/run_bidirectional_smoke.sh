@@ -128,11 +128,12 @@ identity = "616c696365"
 display = "416c696365"
 colored = "3078666630303030416c696365"
 authenticated = "416c69636540666f72756d73"
+region = "414d53"
 now = time.time_ns()
 lines = [
-    f"GHOST_V2 PRESENCE {identity} {display} {colored} {authenticated} 15 2 0 0.125 {now} 1",
+    f"GHOST_V3 PRESENCE {identity} {region} {display} {colored} {authenticated} 15 2 0 0.125 {now} 1",
     f"GHOST_V1 COLOR {identity} {now + 1} 0.2 0.4 0.6",
-    f"GHOST_V2 STATE {identity} {display} {colored} {authenticated} 15 2 0 0.125 {now + 2} 10.0 5 7 1 0 30 1",
+    f"GHOST_V3 STATE {identity} {region} {display} {colored} {authenticated} 15 2 0 0.125 {now + 2} 10.0 5 7 1 0 30 1",
     f"GHOST_V1 FLAGS {identity} {now + 3} 1",
     f"GHOST_V1 CHAT {identity} 68656c6c6f2066726f6d20736d6f6b65",
 ]
@@ -142,7 +143,7 @@ for line in lines:
 for tick in range(60):
     observed = time.time_ns()
     line = (
-        "GHOST_V2 STATE 616c696365 416c696365 3078666630303030416c696365 "
+        "GHOST_V3 STATE 616c696365 414d53 416c696365 3078666630303030416c696365 "
         "416c69636540666f72756d73 "
         f"15 2 0 0.125 {observed} {10.0 + tick * 0.05} 5 7 1 0 0.1 1"
     )
@@ -167,7 +168,7 @@ import time
 target = sys.argv[1]
 now = time.time_ns()
 line = (
-    "GHOST_V2 STATE 616c696365 416c696365 3078666630303030416c696365 "
+    "GHOST_V3 STATE 616c696365 414d53 416c696365 3078666630303030416c696365 "
     "416c69636540666f72756d73 "
     f"15 2 0 0.125 {now} 13.5 5 7 1 0 0.1 1"
 )
@@ -192,12 +193,12 @@ wait "$client_job" || client_status=$?
 client_job=
 [[ "$client_status" -eq 0 ]]
 if [[ "$display_server_tags" == 1 ]]; then
-  grep -E "human=0 .*ai=0 .*ghost=1 .*name=\[B\] Alice" "$client_log"
-  grep -E "ghost=1 .*colored=.*0x66ccff\[B\].*0xff0000Alice" "$client_log"
+  grep -E "human=0 .*ai=0 .*ghost=1 .*name=\[AMS\] Alice" "$client_log"
+  grep -E "ghost=1 .*colored=.*0x66ccff\[AMS\].*0xff0000Alice" "$client_log"
 else
   grep -E "human=0 .*ai=0 .*ghost=1 .*name=Alice" "$client_log"
   grep -E "ghost=1 .*colored=.*0xff0000Alice" "$client_log"
-  ! grep -Fq "[B] Alice" "$client_log"
+  ! grep -Fq "[AMS] Alice" "$client_log"
 fi
 grep -E "^[^ ]+ 1 125 [^ ]+ [^ ]+ Alice$" \
   "$work_dir/var/online_players.txt"
@@ -212,7 +213,7 @@ import time
 target = sys.argv[1]
 now = time.time_ns()
 line = (
-    "GHOST_V2 STATE 616c696365 416c696365 3078666630303030416c696365 "
+    "GHOST_V3 STATE 616c696365 414d53 416c696365 3078666630303030416c696365 "
     "416c69636540666f72756d73 "
     f"15 2 0 0.125 {now} 11.0 0 0 0 0 0 0"
 )

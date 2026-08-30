@@ -2630,6 +2630,59 @@ class StateStore:
             for row in rows
         ]
 
+    def federation_record_snapshot(
+        self,
+        local_server_id: str,
+        limit: int,
+        offset: int = 0,
+    ) -> list[dict[str, object]]:
+        """Return a stable authenticated PB page for a newly joined peer."""
+        rows = self.connection.execute(
+            "SELECT records.map_key, records.identity_key, records.username, "
+            "records.best_seconds, records.best_turns, records.achieved_at, "
+            "records.replay_available OR EXISTS(SELECT 1 FROM replay_runs "
+            "JOIN replay_players ON replay_players.id=replay_runs.player_ref "
+            "JOIN replay_maps ON replay_maps.id=replay_runs.map_ref WHERE "
+            "replay_players.identity_key=records.identity_key AND "
+            "replay_maps.resource_key=records.map_key AND replay_runs.outcome=1 "
+            "AND replay_runs.finish_seconds IS NOT NULL) FROM records WHERE "
+            "records.authenticated=1 ORDER BY records.map_key, records.identity_key "
+            "LIMIT ? OFFSET ?",
+            (
+                max(1, min(int(limit), MAX_FEDERATION_RECORDS_PER_BATCH)),
+                max(0, int(offset)),
+            ),
+        ).fetchall()
+        records = []
+        for row in rows:
+            map_key = str(row[0])
+            identity_key = str(row[1])
+            username = str(row[2])
+            best_seconds = float(row[3])
+            best_turns = int(row[4]) if row[4] is not None else None
+            achieved_at = float(row[5])
+            has_replay = bool(row[6])
+            records.append({
+                "event_id": self._federation_record_event_id(
+                    local_server_id,
+                    map_key,
+                    identity_key,
+                    username,
+                    best_seconds,
+                    best_turns,
+                    achieved_at,
+                    has_replay,
+                ),
+                "map_key": map_key,
+                "identity_key": identity_key,
+                "username": username,
+                "best_seconds": best_seconds,
+                "best_turns": best_turns,
+                "achieved_at": achieved_at,
+                "has_replay": has_replay,
+            })
+        return records
+
     def acknowledge_federation_records(self, event_ids: Sequence[str]) -> int:
         values = list(dict.fromkeys(event_ids))
         if not values:
@@ -4222,6 +4275,44 @@ class TronnerRacing:
                 federation.get("leader_region_label", "REMOTE"),
             )
         )[:16] or "REMOTE"
+        configured_remote_servers = federation.get("remote_servers")
+        if configured_remote_servers is None:
+            configured_remote_servers = (
+                {self.federation_remote_server_id: self.federation_remote_region}
+                if self.federation_remote_server_id
+                else {}
+            )
+        if not isinstance(configured_remote_servers, dict):
+            raise ValueError("federation remote_servers must be an object")
+        self.federation_remote_regions: dict[str, str] = {}
+        for raw_server_id, raw_region in configured_remote_servers.items():
+            server_id = clean_console_text(raw_server_id)
+            region = clean_console_text(raw_region)[:16]
+            if (
+                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", server_id)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,15}", region)
+                or server_id == self.federation_local_server_id
+            ):
+                raise ValueError("invalid federation remote server")
+            self.federation_remote_regions[server_id] = region
+        self.federation_leader_server_id = clean_console_text(
+            federation.get(
+                "leader_server_id",
+                (
+                    self.federation_local_server_id
+                    if self.federation_role == "leader"
+                    else self.federation_remote_server_id
+                ),
+            )
+        )
+        if self.federation_role != "off":
+            if not self.federation_remote_regions:
+                raise ValueError("federation requires at least one remote server")
+            if self.federation_role == "leader":
+                if self.federation_leader_server_id != self.federation_local_server_id:
+                    raise ValueError("federation leader identity mismatch")
+            elif self.federation_leader_server_id not in self.federation_remote_regions:
+                raise ValueError("federation follower must include its leader")
         socket_value = str(federation.get("controller_import_socket", "")).strip()
         self.federation_import_socket = Path(socket_value) if socket_value else None
         publish_socket_value = str(
@@ -4287,6 +4378,9 @@ class TronnerRacing:
         self.federation_round_last_release_at = 0.0
         self.federation_round_release_key = ""
         self.federation_remote_players: dict[str, dict[str, object]] = {}
+        self.federation_remote_round_ready: dict[str, tuple[str, float]] = {}
+        self.federation_remote_maps: dict[str, str] = {}
+        self.federation_remote_rounds: dict[str, tuple[bool, str, str]] = {}
         self.federation_remote_map_key = ""
         self.federation_remote_round_active = False
         self.federation_remote_round_map_key = ""
@@ -4295,9 +4389,11 @@ class TronnerRacing:
         self.federation_command_players: dict[str, Player] = {}
         self.federation_finalists: set[str] = set()
         self.federation_snapshot_received = False
+        self.federation_snapshots_received: set[str] = set()
         self.federation_last_received_monotonic = 0.0
         self.federation_last_sent_ns = 0
         self.federation_last_state_sent_ns: dict[str, int] = {}
+        self.federation_peer_last_received_monotonic: dict[str, float] = {}
         self.federation_last_boot_id = ""
         self._federation_transport: asyncio.DatagramTransport | None = None
         self._federation_publish_transport: socket.socket | None = None
@@ -4306,6 +4402,10 @@ class TronnerRacing:
         self.federation_catalog_refresh_after_monotonic = 0.0
         self._federation_event_tasks: set[asyncio.Task] = set()
         self._federation_record_wakeup = asyncio.Event()
+        self.federation_peer_timeout_seconds = max(
+            4.0,
+            min(30.0, float(federation.get("peer_timeout_seconds", 7.0))),
+        )
         live_config = config.get("live_dashboard", {})
         if not isinstance(live_config, dict):
             live_config = {}
@@ -4370,8 +4470,8 @@ class TronnerRacing:
         self._federation_transport = transport
         os.chmod(path, 0o660)
         LOG.info(
-            "federation import ready: remote=%s socket=%s",
-            self.federation_remote_server_id,
+            "federation import ready: remotes=%s socket=%s",
+            ",".join(sorted(self.federation_remote_regions)),
             path,
         )
 
@@ -4491,16 +4591,18 @@ class TronnerRacing:
         item: dict[str, object],
         server_id: str | None = None,
     ) -> Player:
-        player = self.federation_command_players.get(key)
+        effective_server_id = server_id or self.federation_remote_server_id
+        remote_key = f"{effective_server_id}\0{key}"
+        player = self.federation_command_players.get(remote_key)
         if player is None:
             player = Player(
                 str(item["player_id"]),
                 str(item["display_name"]),
                 federation_server_id=(
-                    server_id or self.federation_remote_server_id
+                    effective_server_id
                 ),
             )
-            self.federation_command_players[key] = player
+            self.federation_command_players[remote_key] = player
         player.log_name = str(item["player_id"])
         player.display_name = str(item["display_name"])
         player.colored_name = str(item.get("colored_name", "")) or None
@@ -4514,10 +4616,10 @@ class TronnerRacing:
     async def handle_federation_datagram(self, data: bytes) -> None:
         try:
             event = json.loads(data.decode("utf-8"))
-            if not isinstance(event, dict) or event.get("version") != 1:
+            if not isinstance(event, dict) or event.get("version") not in {1, 2}:
                 raise ValueError("invalid envelope")
             server_id = str(event.get("server_id", ""))
-            if server_id != self.federation_remote_server_id:
+            if server_id not in self.federation_remote_regions:
                 raise ValueError("unexpected remote server")
             sent_ns = int(event.get("sent_ns", 0))
             if sent_ns <= 0:
@@ -4555,35 +4657,41 @@ class TronnerRacing:
                     else "presence"
                 )
             if state_bucket:
+                bucket_key = f"{server_id}:{state_bucket}"
                 last_sent_ns = self.federation_last_state_sent_ns.get(
-                    state_bucket, 0
+                    bucket_key, 0
                 )
                 if sent_ns < last_sent_ns:
                     return
-                self.federation_last_state_sent_ns[state_bucket] = sent_ns
+                self.federation_last_state_sent_ns[bucket_key] = sent_ns
             self.federation_last_sent_ns = max(
                 self.federation_last_sent_ns, sent_ns
             )
             self.federation_last_received_monotonic = time.monotonic()
+            self.federation_peer_last_received_monotonic[server_id] = time.monotonic()
             self.federation_last_boot_id = str(event.get("boot_id", ""))
             if kind == "chat":
-                await self._handle_federation_chat(payload)
+                await self._handle_federation_chat(server_id, payload)
             elif kind == "command":
                 await self._handle_federation_command(server_id, payload)
             elif kind == "controller_message":
-                await self._handle_federation_controller_message(payload)
+                if server_id == self.federation_leader_server_id:
+                    await self._handle_federation_controller_message(payload)
             elif kind == "countdown_state":
-                await self._handle_federation_countdown(payload)
+                if server_id == self.federation_leader_server_id:
+                    await self._handle_federation_countdown(payload)
             elif kind == "player_snapshot":
-                await self._handle_federation_snapshot(payload)
+                await self._handle_federation_snapshot(server_id, payload)
                 round_active = payload.get("round_active")
                 if isinstance(round_active, bool):
+                    round_bucket = f"{server_id}:round"
                     round_sent_ns = self.federation_last_state_sent_ns.get(
-                        "round", 0
+                        round_bucket, 0
                     )
                     if sent_ns >= round_sent_ns:
-                        self.federation_last_state_sent_ns["round"] = sent_ns
+                        self.federation_last_state_sent_ns[round_bucket] = sent_ns
                         self._handle_federation_round_state(
+                            server_id,
                             {
                                 "action": (
                                     "round_started"
@@ -4597,13 +4705,15 @@ class TronnerRacing:
                             }
                         )
             elif kind == "player_event":
-                await self._handle_federation_player_event(payload)
+                await self._handle_federation_player_event(server_id, payload)
             elif kind == "map_commit":
-                await self._handle_federation_map(payload)
+                if server_id == self.federation_leader_server_id:
+                    await self._handle_federation_map(payload)
             elif kind == "map_prepare":
-                await self._handle_federation_map_prepare(payload)
+                if server_id == self.federation_leader_server_id:
+                    await self._handle_federation_map_prepare(payload)
             elif kind == "round_sync":
-                await self._handle_federation_round_sync(payload)
+                await self._handle_federation_round_sync(server_id, payload)
             elif kind == "records_delta":
                 await self._handle_federation_records_delta(server_id, payload)
             elif kind != "heartbeat":
@@ -4710,7 +4820,50 @@ class TronnerRacing:
         payload: dict[str, object],
     ) -> None:
         operation = payload.get("operation")
+        if operation == "snapshot_request":
+            if not self.federation_leader:
+                # The hub relays follower-originated control packets to every
+                # enrolled peer. Other followers are not snapshot authorities
+                # and simply ignore the request.
+                return
+            offset = payload.get("offset", 0)
+            if (
+                isinstance(offset, bool)
+                or not isinstance(offset, int)
+                or offset < 0
+                or offset > 1_000_000
+            ):
+                raise ValueError("invalid federation PB snapshot offset")
+            await self._publish_federation_record_snapshot(server_id, offset)
+            return
+        if operation == "snapshot_complete":
+            target_server_id = str(payload.get("target_server_id", ""))
+            if target_server_id != self.federation_local_server_id:
+                return
+            if (
+                not self.federation_follower
+                or server_id != self.federation_leader_server_id
+            ):
+                raise ValueError("invalid federation PB snapshot authority")
+            offset = payload.get("snapshot_offset")
+            if (
+                isinstance(offset, bool)
+                or not isinstance(offset, int)
+                or offset != getattr(self, "_federation_record_snapshot_offset", 0)
+            ):
+                return
+            complete = getattr(self, "_federation_record_snapshot_complete", None)
+            if complete is not None:
+                complete.set()
+            progress = getattr(self, "_federation_record_snapshot_progress", None)
+            if progress is not None:
+                progress.set()
+            LOG.info("authenticated PB snapshot is current at %d record(s)", offset)
+            return
         if operation == "ack":
+            target_server_id = str(payload.get("target_server_id", ""))
+            if target_server_id and target_server_id != self.federation_local_server_id:
+                return
             values = payload.get("event_ids")
             if (
                 not isinstance(values, list)
@@ -4737,6 +4890,9 @@ class TronnerRacing:
             return
         if operation != "upsert":
             raise ValueError("invalid federation PB operation")
+        target_server_id = str(payload.get("target_server_id", ""))
+        if target_server_id and target_server_id != self.federation_local_server_id:
+            return
         values = payload.get("records")
         if (
             not isinstance(values, list)
@@ -4745,6 +4901,27 @@ class TronnerRacing:
         ):
             raise ValueError("invalid federation PB batch")
         records = [self._validated_federation_record(value) for value in values]
+        snapshot_offset = payload.get("snapshot_offset")
+        snapshot_next_offset = payload.get("snapshot_next_offset")
+        snapshot_complete = payload.get("snapshot_complete")
+        is_snapshot_page = snapshot_offset is not None
+        if is_snapshot_page:
+            if (
+                not self.federation_follower
+                or server_id != self.federation_leader_server_id
+                or isinstance(snapshot_offset, bool)
+                or not isinstance(snapshot_offset, int)
+                or isinstance(snapshot_next_offset, bool)
+                or not isinstance(snapshot_next_offset, int)
+                or snapshot_offset < 0
+                or snapshot_next_offset != snapshot_offset + len(records)
+                or not isinstance(snapshot_complete, bool)
+            ):
+                raise ValueError("invalid federation PB snapshot page")
+            if snapshot_offset > getattr(
+                self, "_federation_record_snapshot_offset", 0
+            ):
+                return
         changed = 0
         event_ids = []
         for record in records:
@@ -4752,7 +4929,11 @@ class TronnerRacing:
             changed += int(self.store.apply_federated_record(**record))
         await self._publish_federation_control(
             "records_delta",
-            {"operation": "ack", "event_ids": event_ids},
+            {
+                "operation": "ack",
+                "target_server_id": server_id,
+                "event_ids": event_ids,
+            },
         )
         if changed:
             LOG.info(
@@ -4760,6 +4941,114 @@ class TronnerRacing:
                 changed,
                 server_id,
             )
+        if is_snapshot_page and snapshot_offset == getattr(
+            self, "_federation_record_snapshot_offset", 0
+        ):
+            self._federation_record_snapshot_offset = snapshot_next_offset
+            if snapshot_complete:
+                complete = getattr(
+                    self, "_federation_record_snapshot_complete", None
+                )
+                if complete is not None:
+                    complete.set()
+                progress = getattr(
+                    self, "_federation_record_snapshot_progress", None
+                )
+                if progress is not None:
+                    progress.set()
+                LOG.info(
+                    "authenticated PB snapshot completed with %d record(s)",
+                    snapshot_next_offset,
+                )
+            else:
+                progress = getattr(
+                    self, "_federation_record_snapshot_progress", None
+                )
+                if progress is not None:
+                    progress.set()
+
+    async def _publish_federation_record_snapshot(
+        self,
+        target_server_id: str,
+        offset: int,
+    ) -> None:
+        records = self.store.federation_record_snapshot(
+            self.federation_local_server_id,
+            MAX_FEDERATION_RECORDS_PER_BATCH,
+            offset,
+        )
+        if not records:
+            await self._publish_federation_control(
+                "records_delta",
+                {
+                    "operation": "snapshot_complete",
+                    "target_server_id": target_server_id,
+                    "snapshot_offset": offset,
+                },
+            )
+            return
+        while len(records) > 1:
+            candidate = {
+                "kind": "records_delta",
+                "payload": {
+                    "operation": "upsert",
+                    "target_server_id": target_server_id,
+                    "snapshot_offset": offset,
+                    "snapshot_next_offset": offset + len(records),
+                    "snapshot_complete": False,
+                    "records": records,
+                },
+            }
+            size = len(json.dumps(
+                candidate,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8"))
+            if size <= MAX_FEDERATION_CONTROLLER_EVENT_BYTES - 1024:
+                break
+            records.pop()
+        next_offset = offset + len(records)
+        complete = not self.store.federation_record_snapshot(
+            self.federation_local_server_id,
+            1,
+            next_offset,
+        )
+        await self._publish_federation_control(
+            "records_delta",
+            {
+                "operation": "upsert",
+                "target_server_id": target_server_id,
+                "snapshot_offset": offset,
+                "snapshot_next_offset": next_offset,
+                "snapshot_complete": complete,
+                "records": records,
+            },
+        )
+
+    async def _federation_record_snapshot_sync(self) -> None:
+        if not self.federation_follower:
+            return
+        self._federation_record_snapshot_offset = 0
+        self._federation_record_snapshot_complete = asyncio.Event()
+        self._federation_record_snapshot_progress = asyncio.Event()
+        while not self._federation_record_snapshot_complete.is_set():
+            self._federation_record_snapshot_progress.clear()
+            await self._publish_federation_control(
+                "records_delta",
+                {
+                    "operation": "snapshot_request",
+                    "offset": self._federation_record_snapshot_offset,
+                },
+            )
+            try:
+                await asyncio.wait_for(
+                    self._federation_record_snapshot_progress.wait(),
+                    timeout=2.0,
+                )
+            except TimeoutError:
+                continue
 
     async def federation_record_sync(self) -> None:
         """Retry durable PB deltas until the peer acknowledges each version."""
@@ -4825,7 +5114,11 @@ class TronnerRacing:
                 LOG.exception("unable to synchronize federated PB records")
                 await asyncio.sleep(min(retry_seconds, 60.0))
 
-    async def _handle_federation_chat(self, payload: dict[str, object]) -> None:
+    async def _handle_federation_chat(
+        self,
+        server_id: str,
+        payload: dict[str, object],
+    ) -> None:
         if not self.federation_sync_chat:
             return
         parsed = self._federation_player_payload(payload)
@@ -4838,7 +5131,7 @@ class TronnerRacing:
         if not message:
             return
         await self.broadcast(
-            f"[{self.federation_remote_region}] "
+            f"[{self.federation_remote_regions.get(server_id, 'REMOTE')}] "
             f"{player['display_name']}: {message}",
             federate=False,
         )
@@ -4870,7 +5163,8 @@ class TronnerRacing:
             payload.get("arguments", ""), MAX_FEDERATION_CHAT_CHARACTERS
         )
         player = self._federation_command_player(key, item, server_id)
-        self.federation_remote_players[key] = item
+        item["_server_id"] = server_id
+        self.federation_remote_players[f"{server_id}\0{key}"] = item
         await self._dispatch_command(command, player, access_level, arguments)
 
     async def _handle_federation_controller_message(
@@ -4959,57 +5253,76 @@ class TronnerRacing:
 
     async def _handle_federation_snapshot(
         self,
+        server_id: str,
         payload: dict[str, object],
     ) -> None:
         players = payload.get("players", [])
         if payload.get("current_map"):
-            self.federation_remote_map_key = str(payload["current_map"])
+            self.federation_remote_maps[server_id] = str(payload["current_map"])
+            if server_id == self.federation_leader_server_id:
+                self.federation_remote_map_key = str(payload["current_map"])
         if not isinstance(players, list) or len(players) > 256:
             return
         incoming: dict[str, dict[str, object]] = {}
         for raw_player in players:
             parsed = self._federation_player_payload(raw_player)
             if parsed is not None and parsed[1]["connected"]:
-                incoming[parsed[0]] = parsed[1]
-        if self.federation_sync_presence and self.federation_snapshot_received:
-            joined = incoming.keys() - self.federation_remote_players.keys()
-            left = self.federation_remote_players.keys() - incoming.keys()
+                remote_key = f"{server_id}\0{parsed[0]}"
+                parsed[1]["_server_id"] = server_id
+                incoming[remote_key] = parsed[1]
+        previous = {
+            key: item
+            for key, item in self.federation_remote_players.items()
+            if item.get("_server_id") == server_id
+        }
+        if self.federation_sync_presence and server_id in self.federation_snapshots_received:
+            joined = incoming.keys() - previous.keys()
+            left = previous.keys() - incoming.keys()
             for key in sorted(joined):
                 await self.broadcast(
-                    self._federation_presence_message(incoming[key], entered=True),
+                    self._federation_presence_message(
+                        server_id, incoming[key], entered=True
+                    ),
                     federate=False,
                 )
             for key in sorted(left):
                 await self.broadcast(
                     self._federation_presence_message(
-                        self.federation_remote_players[key],
+                        server_id,
+                        previous[key],
                         entered=False,
                     ),
                     federate=False,
                 )
         for key, item in incoming.items():
-            self._federation_command_player(key, item)
-        for key in self.federation_remote_players.keys() - incoming.keys():
+            player_key = str(item["player_id"]).casefold()
+            self._federation_command_player(player_key, item, server_id)
+        for key in previous.keys() - incoming.keys():
             player = self.federation_command_players.get(key)
             if player is not None:
                 player.connected = False
                 player.active = False
                 player.alive = False
-        self.federation_remote_players = incoming
+        for key in previous:
+            self.federation_remote_players.pop(key, None)
+        self.federation_remote_players.update(incoming)
+        self.federation_snapshots_received.add(server_id)
         self.federation_snapshot_received = True
         if self.federation_leader:
             await self._resolve_votes_after_eligibility_change()
         if self.federation_sync_maps and payload.get("current_map"):
-            await self._handle_federation_map(
-                {
-                    "map_key": payload.get("current_map"),
-                    "size_factor": payload.get("size_factor"),
-                    "observed": True,
-                }
-            )
+            if server_id == self.federation_leader_server_id:
+                await self._handle_federation_map(
+                    {
+                        "map_key": payload.get("current_map"),
+                        "size_factor": payload.get("size_factor"),
+                        "observed": True,
+                    }
+                )
 
     def _federation_colored_player_name(
         self,
+        server_id: str,
         player: dict[str, object],
         display_server_tags: bool = False,
     ) -> str:
@@ -5020,7 +5333,8 @@ class TronnerRacing:
                 f"{COLOR_RESET}"
                 f"{self._federation_text(player.get('display_name', ''), 128)}"
             )
-        expected_prefix = f"[{self.federation_remote_region}] "
+        region = self.federation_remote_regions.get(server_id, "REMOTE")
+        expected_prefix = f"[{region}] "
         already_tagged = plain_console_text(colored_name).startswith(expected_prefix)
         colored_prefix = f"{COLOR_FEDERATION_TAG}{expected_prefix}{COLOR_RESET}"
         if already_tagged:
@@ -5037,6 +5351,7 @@ class TronnerRacing:
 
     def _federation_presence_message(
         self,
+        server_id: str,
         player: dict[str, object],
         *,
         entered: bool,
@@ -5044,6 +5359,7 @@ class TronnerRacing:
     ) -> str:
         """Match Armagetron's native player join/leave templates and colors."""
         name = self._federation_colored_player_name(
+            server_id,
             player,
             display_server_tags=display_server_tags,
         )
@@ -5060,19 +5376,22 @@ class TronnerRacing:
 
     async def _handle_federation_player_event(
         self,
+        server_id: str,
         payload: dict[str, object],
     ) -> None:
         action = str(payload.get("action", "")).casefold()
         if action in {"round_started", "round_finished", "round_ended", "new_round"}:
-            self._handle_federation_round_state(payload)
+            self._handle_federation_round_state(server_id, payload)
             return
         parsed = self._federation_player_payload(payload)
         if parsed is None:
             return
-        key, player = parsed
+        player_key, player = parsed
+        key = f"{server_id}\0{player_key}"
+        player["_server_id"] = server_id
         if action == "renamed":
             previous_player_id = str(payload.get("previous_player_id", ""))
-            previous_key = previous_player_id.casefold()
+            previous_key = f"{server_id}\0{previous_player_id.casefold()}"
             if (
                 previous_player_id
                 and len(previous_player_id) <= MAX_FEDERATION_PLAYER_NAME_CHARACTERS
@@ -5093,7 +5412,9 @@ class TronnerRacing:
             self.federation_remote_players.pop(key, None)
             if self.federation_sync_presence and previous is not None:
                 await self.broadcast(
-                    self._federation_presence_message(previous, entered=False),
+                    self._federation_presence_message(
+                        server_id, previous, entered=False
+                    ),
                     federate=False,
                 )
             command_player = self.federation_command_players.get(key)
@@ -5105,12 +5426,12 @@ class TronnerRacing:
                 await self._resolve_votes_after_eligibility_change()
             return
         self.federation_remote_players[key] = player
-        self._federation_command_player(key, player)
+        self._federation_command_player(player_key, player, server_id)
         if (
             self.federation_sync_presence
             and action == "entered"
             and previous is None
-            and self.federation_snapshot_received
+            and server_id in self.federation_snapshots_received
         ):
             # PLAYER_COLORED_NAME normally follows PLAYER_ENTERED immediately.
             # Let that event land so the original join message uses the
@@ -5119,7 +5440,9 @@ class TronnerRacing:
             current = self.federation_remote_players.get(key)
             if current is not None:
                 await self.broadcast(
-                    self._federation_presence_message(current, entered=True),
+                    self._federation_presence_message(
+                        server_id, current, entered=True
+                    ),
                     federate=False,
                 )
         if self.federation_leader:
@@ -5130,9 +5453,12 @@ class TronnerRacing:
         return bool(
             getattr(self, "federation_leader", False)
             and current is not None
-            and getattr(self, "federation_remote_round_active", False)
-            and getattr(self, "federation_remote_round_map_key", "")
-            == current.key
+            and any(
+                active and map_key == current.key
+                for active, map_key, _ in getattr(
+                    self, "federation_remote_rounds", {}
+                ).values()
+            )
         )
 
     def _round_is_active(self) -> bool:
@@ -5167,15 +5493,41 @@ class TronnerRacing:
                 await asyncio.sleep(0.03)
 
     async def _release_federated_round_if_ready(self, map_key: str) -> None:
+        now_monotonic = time.monotonic()
+        healthy_peers = {
+            server_id
+            for server_id, seen_at in self.federation_peer_last_received_monotonic.items()
+            if now_monotonic - seen_at <= self.federation_peer_timeout_seconds
+        }
+        # Empty regions receive the same release but must not hold active
+        # racers behind the engine's safety timeout. Until a presence snapshot
+        # arrives, require the peer conservatively. Once it does, only peers
+        # with an active local racer participate in the readiness barrier.
+        required_peers = {
+            server_id
+            for server_id in healthy_peers
+            if server_id not in self.federation_snapshots_received
+            or any(
+                str(player.get("_server_id", "")) == server_id
+                and bool(player.get("connected", True))
+                and bool(player.get("active", True))
+                for player in self.federation_remote_players.values()
+            )
+        }
+        peers_ready = all(
+            self.federation_remote_round_ready.get(server_id, ("", 0.0))[0]
+            == map_key
+            and self.federation_remote_round_ready.get(server_id, ("", 0.0))[1]
+            > self.federation_round_last_release_at
+            for server_id in required_peers
+        )
         if (
             not self.federation_leader
             or not getattr(self, "federation_round_sync_enabled", False)
             or self.federation_local_round_ready_key != map_key
-            or self.federation_remote_round_ready_key != map_key
             or self.federation_local_round_ready_at
             <= self.federation_round_last_release_at
-            or self.federation_remote_round_ready_at
-            <= self.federation_round_last_release_at
+            or not peers_ready
         ):
             return
         release_at = time.time() + self.federation_round_sync_release_lead_seconds
@@ -5222,6 +5574,7 @@ class TronnerRacing:
 
     async def _handle_federation_round_sync(
         self,
+        server_id: str,
         payload: dict[str, object],
     ) -> None:
         if not getattr(self, "federation_round_sync_enabled", False):
@@ -5239,9 +5592,14 @@ class TronnerRacing:
                 return
             self.federation_remote_round_ready_key = map_key
             self.federation_remote_round_ready_at = ready_at
+            self.federation_remote_round_ready[server_id] = (map_key, ready_at)
             await self._release_federated_round_if_ready(map_key)
             return
-        if action != "release" or not self.federation_follower:
+        if (
+            action != "release"
+            or not self.federation_follower
+            or server_id != self.federation_leader_server_id
+        ):
             return
         try:
             release_at = float(payload.get("release_at", 0))
@@ -5293,7 +5651,13 @@ class TronnerRacing:
         self.federation_remote_round_adopted_key = map_key
         LOG.info(
             "federation authority adopted active peer round: server=%s map=%s",
-            self.federation_remote_server_id,
+            ",".join(
+                sorted(
+                    server_id
+                    for server_id, (active, remote_map, _) in self.federation_remote_rounds.items()
+                    if active and remote_map == map_key
+                )
+            ),
             map_key,
         )
         if not self.round_active:
@@ -5301,6 +5665,7 @@ class TronnerRacing:
 
     def _handle_federation_round_state(
         self,
+        server_id: str,
         payload: dict[str, object],
     ) -> None:
         if not self.federation_leader:
@@ -5315,6 +5680,11 @@ class TronnerRacing:
             self.federation_remote_round_started_at = self._federation_text(
                 payload.get("started_at", ""), 64
             )
+            self.federation_remote_rounds[server_id] = (
+                True,
+                map_key,
+                self.federation_remote_round_started_at,
+            )
             self._adopt_federation_round_start()
             return
         if action not in {"round_finished", "round_ended", "new_round"}:
@@ -5324,6 +5694,19 @@ class TronnerRacing:
             and self.federation_remote_round_map_key
             and map_key != self.federation_remote_round_map_key
         ):
+            return
+        self.federation_remote_rounds[server_id] = (False, "", "")
+        remaining = [
+            (remote_server_id, remote_map, started_at)
+            for remote_server_id, (active, remote_map, started_at)
+            in self.federation_remote_rounds.items()
+            if active
+        ]
+        if remaining:
+            _remote_server_id, remote_map, started_at = remaining[0]
+            self.federation_remote_round_active = True
+            self.federation_remote_round_map_key = remote_map
+            self.federation_remote_round_started_at = started_at
             return
         self.federation_remote_round_active = False
         self.federation_remote_round_map_key = ""
@@ -6413,6 +6796,7 @@ class TronnerRacing:
         self._set_round_started_map(None)
         self.federation_local_round_ready_key = ""
         self.federation_remote_round_ready_key = ""
+        getattr(self, "federation_remote_round_ready", {}).clear()
         self.federation_local_round_ready_at = 0.0
         self.federation_remote_round_ready_at = 0.0
         self.federation_round_release_key = ""
@@ -6420,6 +6804,7 @@ class TronnerRacing:
         self.federation_remote_round_map_key = ""
         self.federation_remote_round_started_at = ""
         self.federation_remote_round_adopted_key = ""
+        getattr(self, "federation_remote_rounds", {}).clear()
         self.transitioning = True
         self.transition_target_key = target_key
         self.transition_map_confirmed = False
@@ -6997,7 +7382,9 @@ class TronnerRacing:
             "checkpointMode": entry.checkpoint_mode,
         }
 
-    def _dashboard_players(self) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    def _dashboard_players(
+        self,
+    ) -> tuple[list[dict[str, object]], dict[str, list[dict[str, object]]]]:
         # The federation transport projects a remote cycle into the local game
         # so that scoreboards and nameplates work across servers. The engine's
         # ONLINE_PLAYER snapshot reports that projection as an unauthenticated
@@ -7034,13 +7421,21 @@ class TronnerRacing:
                 )
             )
         ]
-        remote = [
-            {
+        remote: dict[str, list[dict[str, object]]] = {
+            server_id: [] for server_id in self.federation_remote_regions
+        }
+        for item in self.federation_remote_players.values():
+            if not item.get("connected", True):
+                continue
+            server_id = str(item.get("_server_id", self.federation_remote_server_id))
+            if server_id not in remote:
+                continue
+            remote[server_id].append({
                 "playerId": public_player_id(
                     "auth:" + str(item.get("authenticated_name", "")).casefold()
                     if item.get("authenticated_name")
                     else "guest:"
-                    + self.federation_remote_server_id.casefold()
+                    + server_id.casefold()
                     + ":"
                     + plain_console_text(item.get("display_name", "")).casefold()
                 ),
@@ -7048,17 +7443,18 @@ class TronnerRacing:
                 "active": bool(item.get("active")),
                 "alive": bool(item.get("alive")),
                 "authenticated": bool(item.get("authenticated_name")),
-            }
-            for item in self.federation_remote_players.values()
-            if item.get("connected", True)
-        ]
+            })
         key = lambda item: (not bool(item["active"]), str(item["name"]).casefold())
-        return sorted(local, key=key), sorted(remote, key=key)
+        return sorted(local, key=key), {
+            server_id: sorted(players, key=key)
+            for server_id, players in remote.items()
+        }
 
     def _dashboard_live_state(self) -> dict[str, object]:
         live_config = self.config.get("live_dashboard", {})
         local_players, remote_players = self._dashboard_players()
         now = time.time()
+        now_monotonic = time.monotonic()
         time_left = max(0, int((self.deadline_epoch or now) - now))
         map_metadata = self._dashboard_map_metadata(self.current)
         current_records = self.store.records(map_records_key(self.current)) if self.current else []
@@ -7095,12 +7491,22 @@ class TronnerRacing:
                     "mapKey": map_records_key(self.current) if self.current else "",
                     "players": local_players,
                 },
-                self.federation_remote_server_id: {
-                    "id": self.federation_remote_server_id,
-                    "region": str(live_config.get("remote_region", "PEER"))[:16],
-                    "online": bool(self.federation_snapshot_received),
-                    "mapKey": self.federation_remote_map_key,
-                    "players": remote_players,
+                **{
+                    server_id: {
+                        "id": server_id,
+                        "region": self.federation_remote_regions[server_id],
+                        "online": (
+                            server_id in self.federation_snapshots_received
+                            and now_monotonic
+                            - self.federation_peer_last_received_monotonic.get(
+                                server_id, 0.0
+                            )
+                            <= self.federation_peer_timeout_seconds
+                        ),
+                        "mapKey": self.federation_remote_maps.get(server_id, ""),
+                        "players": remote_players.get(server_id, []),
+                    }
+                    for server_id in self.federation_remote_regions
                 },
             },
         }
@@ -9467,7 +9873,13 @@ class TronnerRacing:
         voters = [player for player in self.active_players() if not player.afk]
         if self.federation_leader:
             for key, item in self.federation_remote_players.items():
-                player = self._federation_command_player(key, item)
+                player = self.federation_command_players.get(key)
+                if player is None:
+                    player = self._federation_command_player(
+                        str(item.get("player_id", "")).casefold(),
+                        item,
+                        str(item.get("_server_id", self.federation_remote_server_id)),
+                    )
                 if (
                     player.connected
                     and player.active
@@ -9785,7 +10197,13 @@ class TronnerRacing:
                 item = self.federation_remote_players.get(key)
                 if not item:
                     continue
-                player = self._federation_command_player(key, item)
+                player = self.federation_command_players.get(key)
+                if player is None:
+                    player = self._federation_command_player(
+                        str(item.get("player_id", "")).casefold(),
+                        item,
+                        str(item.get("_server_id", self.federation_remote_server_id)),
+                    )
                 if player.connected and player.active and player.alive:
                     unique[id(player)] = player
         return list(unique.values())
@@ -11887,6 +12305,10 @@ class TronnerRacing:
             asyncio.create_task(
                 self.federation_record_sync(),
                 name="federation-record-sync",
+            ),
+            asyncio.create_task(
+                self._federation_record_snapshot_sync(),
+                name="federation-record-snapshot-sync",
             ),
             asyncio.create_task(
                 self.helpful_message_announcer(),

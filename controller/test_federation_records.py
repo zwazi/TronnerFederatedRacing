@@ -36,14 +36,41 @@ def record_controller(
     controller.federation_role = "leader"
     controller.federation_local_server_id = local_server_id
     controller.federation_remote_server_id = remote_server_id
+    controller.federation_remote_regions = {remote_server_id: "REMOTE"}
+    controller.federation_leader_server_id = local_server_id
     controller.federation_last_sent_ns = 0
     controller.federation_last_state_sent_ns = {}
     controller.federation_last_boot_id = ""
+    controller.federation_peer_last_received_monotonic = {}
     controller._publish_federation_control = AsyncMock(return_value=True)
     return controller
 
 
 class FederationRecordStoreTests(unittest.TestCase):
+    def test_peer_snapshot_is_authenticated_stable_and_paginated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "records.sqlite3")
+            first = Player("first", "First", auth_name="First@forums")
+            second = Player("second", "Second", auth_name="Second@forums")
+            guest = Player("guest", "Guest")
+            store.add_finish("a-map", first, 10.0, 12)
+            store.add_finish("b-map", second, 11.0, 14)
+            store.add_finish("c-map", guest, 9.0, 10)
+
+            first_page = store.federation_record_snapshot("region-a", 1, 0)
+            second_page = store.federation_record_snapshot("region-a", 1, 1)
+            repeated = store.federation_record_snapshot("region-a", 1, 0)
+
+            self.assertEqual(len(first_page), 1)
+            self.assertEqual(len(second_page), 1)
+            self.assertEqual(first_page, repeated)
+            self.assertNotEqual(
+                first_page[0]["identity_key"], second_page[0]["identity_key"]
+            )
+            self.assertTrue(str(first_page[0]["identity_key"]).startswith("auth:"))
+            self.assertTrue(str(second_page[0]["identity_key"]).startswith("auth:"))
+            store.close()
+
     def test_dashboard_metadata_uses_a_worker_local_sqlite_connection(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(Path(tmp) / "records.sqlite3")
@@ -216,6 +243,108 @@ class FederationRecordStoreTests(unittest.TestCase):
 
 
 class FederationRecordControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_leader_serves_a_snapshot_only_to_requesting_peer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "records.sqlite3")
+            player = Player("racer", "Racer", auth_name="Racer@forums")
+            store.add_finish("map", player, 10.0, 12)
+            controller = record_controller(
+                store,
+                local_server_id="region-a",
+                remote_server_id="region-b",
+            )
+
+            await controller._handle_federation_records_delta(
+                "region-c",
+                {"operation": "snapshot_request"},
+            )
+
+            controller._publish_federation_control.assert_awaited_once()
+            kind, payload = controller._publish_federation_control.await_args.args
+            self.assertEqual(kind, "records_delta")
+            self.assertEqual(payload["operation"], "upsert")
+            self.assertEqual(payload["target_server_id"], "region-c")
+            self.assertEqual(payload["snapshot_offset"], 0)
+            self.assertEqual(payload["snapshot_next_offset"], 1)
+            self.assertTrue(payload["snapshot_complete"])
+            self.assertEqual(len(payload["records"]), 1)
+            store.close()
+
+    async def test_non_target_follower_ignores_targeted_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "records.sqlite3")
+            controller = record_controller(
+                store,
+                local_server_id="region-b",
+                remote_server_id="region-a",
+            )
+            controller.federation_role = "follower"
+            record = {
+                "event_id": "a" * 64,
+                "map_key": "map",
+                "identity_key": "auth:racer@forums",
+                "username": "Racer@forums",
+                "best_seconds": 10.0,
+                "best_turns": 12,
+                "achieved_at": time.time(),
+                "has_replay": False,
+            }
+
+            await controller._handle_federation_records_delta(
+                "region-a",
+                {
+                    "operation": "upsert",
+                    "target_server_id": "region-c",
+                    "records": [record],
+                },
+            )
+
+            self.assertEqual(store.records("map"), [])
+            controller._publish_federation_control.assert_not_awaited()
+            store.close()
+
+    async def test_follower_ignores_another_followers_snapshot_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "records.sqlite3")
+            controller = record_controller(
+                store,
+                local_server_id="region-b",
+                remote_server_id="region-a",
+            )
+            controller.federation_role = "follower"
+
+            await controller._handle_federation_records_delta(
+                "region-c",
+                {"operation": "snapshot_request", "offset": 20},
+            )
+
+            controller._publish_federation_control.assert_not_awaited()
+            store.close()
+
+    async def test_follower_requests_authority_snapshot_on_sync_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "records.sqlite3")
+            controller = record_controller(
+                store,
+                local_server_id="region-b",
+                remote_server_id="region-a",
+            )
+            controller.federation_role = "follower"
+            controller.federation_leader_server_id = "region-a"
+            controller._federation_record_wakeup = asyncio.Event()
+
+            task = asyncio.create_task(controller._federation_record_snapshot_sync())
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            controller._publish_federation_control.assert_awaited_once_with(
+                "records_delta",
+                {"operation": "snapshot_request", "offset": 0},
+            )
+            store.close()
+
     async def test_acknowledgments_advance_snapshot_without_retry_delay(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(Path(tmp) / "records.sqlite3")
@@ -285,6 +414,7 @@ class FederationRecordControllerTests(unittest.IsolatedAsyncioTestCase):
                 "records_delta",
                 {
                     "operation": "ack",
+                    "target_server_id": "region-a",
                     "event_ids": [leader_batch[0]["event_id"]],
                 },
             )

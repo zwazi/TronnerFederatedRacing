@@ -1,8 +1,8 @@
-# Multi-region roadmap
+# Multi-region design and rollout gates
 
-The current release deliberately supports one leader and one follower. It is
-safe for reproducing the present topology or replacing a region, but it must
-not be stretched to three nodes by reusing identities or credentials.
+The current release supports a bounded leader hub with multiple followers.
+The gates below document what is implemented and what operators must verify
+before admitting each permanent region.
 
 ## Gate 1: public, reproducible two-node baseline
 
@@ -15,22 +15,21 @@ not be stretched to three nodes by reusing identities or credentials.
 
 This gate is implemented by the initial repository release.
 
-## Gate 2: versioned multi-peer envelope
+## Gate 2: versioned multi-peer envelope — implemented
 
 - Introduce a new protocol version with explicit origin and destination IDs.
 - Give every leader/follower pair independent directional credentials and
   replay windows; never share one cluster-wide signing key.
-- Configure a bounded peer registry with per-peer capabilities such as
-  presence, cycles, chat, records, map control, and round readiness.
+- Configure a bounded peer registry with a maximum of 16 members.
 - Have the leader validate and fan out origin-preserving events. Followers do
   not send packets directly to each other.
 - Reject unknown protocol versions, identities, destinations, capabilities,
   and origin/transport mismatches.
 
-This requires implementation and compatibility tests before a third live node
-is admitted.
+The transport has unit tests plus a live three-sidecar UDP test proving
+follower-to-follower relay and leader control fan-out.
 
-## Gate 3: authority and failure behavior
+## Gate 3: authority and failure behavior — implemented
 
 - Keep one elected-by-configuration leader authoritative for maps, countdowns,
   record ordering, and round release. Automatic leader election is out of
@@ -40,7 +39,8 @@ is admitted.
 - Define idempotent record-delta IDs and leader acknowledgements so reconnects
   cannot lose or duplicate personal bests.
 - Bound queues and stale presence per peer so one slow region cannot delay the
-  leader or another follower.
+  leader or another follower. A send failure to one peer is isolated from the
+  remaining fan-out.
 
 ## Gate 4: controlled regional rollout
 

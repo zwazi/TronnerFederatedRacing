@@ -245,61 +245,186 @@ def render(cluster: dict[str, Any], node: dict[str, Any], *, production: bool) -
 
     peer_id = ""
     peer_region = ""
+    remote_servers: dict[str, str] = {}
     listen_host = ""
     peer_host = ""
     expected_peer_ip = ""
     federation_config: dict[str, Any] | None = None
     required_secrets: list[str] = []
+    federation_private_addresses: list[tuple[str, str]] = []
     if federation_enabled:
-        peer_id = identifier(federation.get("peer_server_id", ""), "peer server ID")
-        if peer_id == server_id:
-            raise ConfigurationError("peer server ID must differ from local server ID")
-        if role == "follower" and peer_id != leader_id:
-            raise ConfigurationError("a follower must peer with the configured leader")
-        peer_region = region_label(
-            federation.get("peer_region_label", ""), "peer region label"
-        )
         listen_host = ipv4_address(
             federation.get("listen_host", ""), "federation listen host"
         )
-        peer_host = ipv4_address(
-            federation.get("peer_host", ""), "federation peer host"
-        )
-        expected_peer_ip = ipv4_address(
-            federation.get("expected_peer_ip", ""), "expected peer IP"
-        )
         federation_port = port(federation.get("port", 4540), "federation port")
-        publish_name = secret_name(
-            federation.get("publish_key_name", ""), "publish key name"
-        )
-        receive_name = secret_name(
-            federation.get("receive_key_name", ""), "receive key name"
-        )
-        if publish_name == receive_name:
-            raise ConfigurationError("publish and receive keys must be different")
-        required_secrets = [publish_name, receive_name]
-        federation_config = {
-            "cluster_id": cluster_id,
-            "server_id": server_id,
-            "mode": "both",
-            "region_label": local_region,
-            "peer_host": peer_host,
-            "peer_port": federation_port,
-            "listen_host": listen_host,
-            "listen_port": federation_port,
-            "expected_server_id": peer_id,
-            "expected_peer_ip": expected_peer_ip,
-            "publish_key_file": f"/etc/tronner-federation/keys/{publish_name}",
-            "receive_key_file": f"/etc/tronner-federation/keys/{receive_name}",
-            "ladderlog": "/var/lib/armagetronad/ladderlog.txt",
-            "engine_export_socket": "/run/tronner-federation/engine-export.sock",
-            "controller_publish_socket": "/run/tronner-federation/controller-publish.sock",
-            "controller_import_socket": "/run/tronner-racing/federation-import.sock",
-            "engine_import_socket": "/run/armagetronad/federation-import.sock",
-            "heartbeat_seconds": 2.0,
-            "maximum_clock_skew_seconds": 30.0,
-            "game_text_encoding": "iso8859-1",
-        }
+        raw_members = cluster.get("members")
+        raw_peers = federation.get("peers")
+        if isinstance(raw_members, dict) and isinstance(raw_peers, list):
+            if not 2 <= len(raw_members) <= 16:
+                raise ConfigurationError("cluster members must contain 2..16 servers")
+            members: dict[str, str] = {}
+            for raw_member_id, raw_member_region in raw_members.items():
+                member_id = identifier(raw_member_id, "member server ID")
+                members[member_id] = region_label(
+                    raw_member_region, "member region label"
+                )
+            if members.get(server_id) != local_region or leader_id not in members:
+                raise ConfigurationError(
+                    "cluster members must contain matching local and leader identities"
+                )
+            remote_servers = {
+                member_id: member_region
+                for member_id, member_region in members.items()
+                if member_id != server_id
+            }
+            expected_ids = (
+                set(remote_servers) if role == "leader" else {leader_id}
+            )
+            if not raw_peers or len(raw_peers) > 15:
+                raise ConfigurationError("federation peers must contain 1..15 entries")
+            rendered_peers: list[dict[str, object]] = []
+            seen_ids: set[str] = set()
+            seen_secret_names: set[str] = set()
+            for raw_peer in raw_peers:
+                if not isinstance(raw_peer, dict):
+                    raise ConfigurationError("federation peer must be an object")
+                current_peer_id = identifier(
+                    raw_peer.get("server_id", ""), "peer server ID"
+                )
+                current_peer_region = region_label(
+                    raw_peer.get("region_label", ""), "peer region label"
+                )
+                if (
+                    current_peer_id in seen_ids
+                    or current_peer_id not in expected_ids
+                    or members.get(current_peer_id) != current_peer_region
+                ):
+                    raise ConfigurationError("invalid or duplicate federation peer")
+                current_peer_host = ipv4_address(
+                    raw_peer.get("host", ""), "federation peer host"
+                )
+                current_expected_ip = ipv4_address(
+                    raw_peer.get("expected_peer_ip", ""), "expected peer IP"
+                )
+                federation_private_addresses.extend(
+                    [
+                        (current_peer_host, "federation peer host"),
+                        (current_expected_ip, "expected peer IP"),
+                    ]
+                )
+                publish_name = secret_name(
+                    raw_peer.get("publish_key_name", ""), "publish key name"
+                )
+                receive_name = secret_name(
+                    raw_peer.get("receive_key_name", ""), "receive key name"
+                )
+                if (
+                    publish_name == receive_name
+                    or publish_name in seen_secret_names
+                    or receive_name in seen_secret_names
+                ):
+                    raise ConfigurationError("federation key names must be unique")
+                seen_ids.add(current_peer_id)
+                seen_secret_names.update((publish_name, receive_name))
+                required_secrets.extend((publish_name, receive_name))
+                rendered_peers.append(
+                    {
+                        "server_id": current_peer_id,
+                        "region_label": current_peer_region,
+                        "host": current_peer_host,
+                        "port": port(raw_peer.get("port", federation_port), "peer port"),
+                        "expected_ip": current_expected_ip,
+                        "publish_key_file": f"/etc/tronner-federation/keys/{publish_name}",
+                        "receive_key_file": f"/etc/tronner-federation/keys/{receive_name}",
+                    }
+                )
+            if seen_ids != expected_ids:
+                raise ConfigurationError(
+                    "leader must peer with every follower; followers must peer only with leader"
+                )
+            peer_id = leader_id if role == "follower" else rendered_peers[0]["server_id"]
+            peer_region = members[str(peer_id)]
+            federation_config = {
+                "protocol_version": 2,
+                "cluster_id": cluster_id,
+                "server_id": server_id,
+                "mode": "both",
+                "role": role,
+                "leader_server_id": leader_id,
+                "region_label": local_region,
+                "members": members,
+                "listen_host": listen_host,
+                "listen_port": federation_port,
+                "peers": rendered_peers,
+                "ladderlog": "/var/lib/armagetronad/ladderlog.txt",
+                "engine_export_socket": "/run/tronner-federation/engine-export.sock",
+                "controller_publish_socket": "/run/tronner-federation/controller-publish.sock",
+                "controller_import_socket": "/run/tronner-racing/federation-import.sock",
+                "engine_import_socket": "/run/armagetronad/federation-import.sock",
+                "heartbeat_seconds": 2.0,
+                "maximum_clock_skew_seconds": 30.0,
+                "game_text_encoding": "iso8859-1",
+            }
+            federation_private_addresses.append(
+                (listen_host, "federation listen host")
+            )
+        else:
+            peer_id = identifier(
+                federation.get("peer_server_id", ""), "peer server ID"
+            )
+            if peer_id == server_id:
+                raise ConfigurationError("peer server ID must differ from local server ID")
+            if role == "follower" and peer_id != leader_id:
+                raise ConfigurationError("a follower must peer with the configured leader")
+            peer_region = region_label(
+                federation.get("peer_region_label", ""), "peer region label"
+            )
+            remote_servers = {peer_id: peer_region}
+            peer_host = ipv4_address(
+                federation.get("peer_host", ""), "federation peer host"
+            )
+            expected_peer_ip = ipv4_address(
+                federation.get("expected_peer_ip", ""), "expected peer IP"
+            )
+            federation_private_addresses.extend(
+                [
+                    (listen_host, "federation listen host"),
+                    (peer_host, "federation peer host"),
+                    (expected_peer_ip, "expected peer IP"),
+                ]
+            )
+            publish_name = secret_name(
+                federation.get("publish_key_name", ""), "publish key name"
+            )
+            receive_name = secret_name(
+                federation.get("receive_key_name", ""), "receive key name"
+            )
+            if publish_name == receive_name:
+                raise ConfigurationError("publish and receive keys must be different")
+            required_secrets = [publish_name, receive_name]
+            federation_config = {
+                "cluster_id": cluster_id,
+                "server_id": server_id,
+                "mode": "both",
+                "role": role,
+                "region_label": local_region,
+                "peer_host": peer_host,
+                "peer_port": federation_port,
+                "listen_host": listen_host,
+                "listen_port": federation_port,
+                "expected_server_id": peer_id,
+                "expected_peer_ip": expected_peer_ip,
+                "publish_key_file": f"/etc/tronner-federation/keys/{publish_name}",
+                "receive_key_file": f"/etc/tronner-federation/keys/{receive_name}",
+                "ladderlog": "/var/lib/armagetronad/ladderlog.txt",
+                "engine_export_socket": "/run/tronner-federation/engine-export.sock",
+                "controller_publish_socket": "/run/tronner-federation/controller-publish.sock",
+                "controller_import_socket": "/run/tronner-racing/federation-import.sock",
+                "engine_import_socket": "/run/armagetronad/federation-import.sock",
+                "heartbeat_seconds": 2.0,
+                "maximum_clock_skew_seconds": 30.0,
+                "game_text_encoding": "iso8859-1",
+            }
 
     firebase = cluster.get("firebase", {})
     if not isinstance(firebase, dict):
@@ -382,6 +507,8 @@ def render(cluster: dict[str, Any], node: dict[str, Any], *, production: bool) -
             "local_server_id": server_id,
             "remote_server_id": peer_id,
             "remote_region_label": peer_region,
+            "leader_server_id": leader_id,
+            "remote_servers": remote_servers,
             "controller_import_socket": "/run/tronner-racing/federation-import.sock",
             "controller_publish_socket": "/run/tronner-federation/controller-publish.sock",
             "sync_chat": True,
@@ -444,9 +571,8 @@ def render(cluster: dict[str, Any], node: dict[str, Any], *, production: bool) -
         if server_dns and example_hostname(server_dns):
             raise ConfigurationError("replace the example server DNS name")
         if federation_enabled:
-            private_overlay_address(listen_host, "federation listen host")
-            private_overlay_address(peer_host, "federation peer host")
-            private_overlay_address(expected_peer_ip, "expected peer IP")
+            for address, label in federation_private_addresses:
+                private_overlay_address(address, label)
         if firebase_database_url and example_hostname(
             urllib.parse.urlsplit(firebase_database_url).hostname or ""
         ):
@@ -491,7 +617,7 @@ def render(cluster: dict[str, Any], node: dict[str, Any], *, production: bool) -
                 "FEDERATION_IMPORT_SOCKET /run/armagetronad/federation-import.sock",
                 f"FEDERATION_GHOST_LABEL {peer_region}",
                 "FEDERATION_GHOST_TIMEOUT 6",
-                "FEDERATION_GHOST_LIMIT 128",
+                "FEDERATION_GHOST_LIMIT 256",
                 "",
             ]
         )

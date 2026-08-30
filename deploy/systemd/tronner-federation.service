@@ -1,8 +1,8 @@
 [Unit]
 Description=Tronner Racing federation transport
 Documentation=https://github.com/zwazi/TronnerFederatedRacing
-After=network-online.target
-Wants=network-online.target
+After=network-online.target armagetronad.service tronner-racing.service
+Wants=network-online.target armagetronad.service tronner-racing.service
 
 [Service]
 Type=simple
