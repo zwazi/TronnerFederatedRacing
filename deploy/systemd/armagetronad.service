@@ -1,0 +1,36 @@
+[Unit]
+Description=Tronner federated Armagetron dedicated server
+Documentation=https://github.com/zwazi/TronnerFederatedRacing
+Wants=network-online.target
+After=network-online.target tronner-federation.service
+
+[Service]
+Type=simple
+User=armagetron
+Group=armagetron
+WorkingDirectory=/var/lib/armagetronad
+StateDirectory=armagetronad
+RuntimeDirectory=armagetronad
+RuntimeDirectoryMode=0770
+RuntimeDirectoryPreserve=yes
+ExecStartPre=/usr/bin/touch /var/lib/armagetronad/console.in
+ExecStart=/opt/armagetronad/bin/armagetronad-dedicated --daemon --input /var/lib/armagetronad/console.in --configdir /etc/armagetronad-dedicated --datadir /opt/armagetronad/share/games/armagetronad-dedicated --userdatadir /var/lib/armagetronad --vardir /var/lib/armagetronad --extraconfig server.cfg
+Restart=always
+RestartSec=5s
+TimeoutStopSec=45
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/armagetronad /run/armagetronad
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

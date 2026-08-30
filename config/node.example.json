@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "server_id": "region-a",
+  "region_label": "A",
+  "role": "standalone",
+  "server_name": "Example Racing | Region A",
+  "website_url": "https://example.invalid/",
+  "server_dns": "game-a.example.invalid",
+  "public_base_url": "http://maps-a.example.invalid:8080/",
+  "master_list": false,
+  "game_bind": "0.0.0.0",
+  "game_port": 4534,
+  "resource_bind": "0.0.0.0",
+  "resource_port": 8080,
+  "federation": {
+    "enabled": false
+  }
+}

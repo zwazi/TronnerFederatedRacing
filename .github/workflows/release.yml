@@ -1,0 +1,38 @@
+name: Release engine artifact
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  engine:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          autoconf automake build-essential libtool libxml2-dev
+          libzthread-dev pkg-config
+      - name: Build engine
+        env:
+          TRONNER_BUILD_JOBS: "2"
+          TRONNER_ENGINE_PREFIX: ${{ runner.temp }}/armagetronad
+        run: ./deploy/build_engine.sh
+      - name: Prepare checksummed artifact
+        run: |
+          install -m 0755 "${RUNNER_TEMP}/armagetronad/bin/armagetronad-dedicated" \
+            "${RUNNER_TEMP}/armagetronad-dedicated-linux-x86_64"
+          cd "${RUNNER_TEMP}"
+          sha256sum armagetronad-dedicated-linux-x86_64 > armagetronad-dedicated-linux-x86_64.sha256
+      - name: Upload release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release upload "${{ github.event.release.tag_name }}"
+          "${RUNNER_TEMP}/armagetronad-dedicated-linux-x86_64"
+          "${RUNNER_TEMP}/armagetronad-dedicated-linux-x86_64.sha256"
+          --clobber

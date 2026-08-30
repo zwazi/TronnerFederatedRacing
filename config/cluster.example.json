@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "cluster_id": "example-racing-cluster",
+  "leader_server_id": "region-a",
+  "map_repository": {
+    "source": "git",
+    "url": "https://github.com/example/armagetron-maps.git",
+    "branch": "main"
+  },
+  "firebase": {
+    "enabled": false,
+    "project_id": "",
+    "storage_bucket": "",
+    "database_url": "",
+    "catalog_enabled": false,
+    "live_dashboard_enabled": false,
+    "management_enabled": false
+  }
+}

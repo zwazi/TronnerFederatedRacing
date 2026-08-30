@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-and-config:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Compile Python
+        run: python3 -m py_compile controller/*.py controller/hot_commands/*.py deploy/*.py tools/*.py
+      - name: Controller tests
+        working-directory: controller
+        run: python3 -m unittest discover -p 'test_*.py'
+      - name: Deployment tests
+        working-directory: deploy
+        run: python3 -m unittest discover -p 'test_*.py'
+      - name: Repository safety tests
+        working-directory: tools
+        run: python3 -m unittest discover -p 'test_*.py'
+      - name: Validate public tree
+        run: python3 tools/check_public_tree.py .
+      - name: Validate shell
+        run: bash -n deploy/*.sh deploy/smoke/*.sh
+      - name: Render inert example
+        run: >-
+          python3 deploy/render_node.py
+          --cluster config/cluster.example.json
+          --node config/node.example.json
+          --output "${RUNNER_TEMP}/rendered"
+      - name: Confirm examples fail production validation
+        run: >-
+          ! python3 deploy/render_node.py
+          --cluster config/cluster.example.json
+          --node config/node.example.json
+          --output "${RUNNER_TEMP}/must-not-render"
+          --production
+
+  engine-build:
+    runs-on: ubuntu-24.04
+    env:
+      TRONNER_BUILD_JOBS: "2"
+      TRONNER_ENGINE_SOURCE_DIR: ${{ runner.temp }}/engine-source
+      TRONNER_ENGINE_BUILD_DIR: ${{ runner.temp }}/engine-build
+      TRONNER_ENGINE_PREFIX: ${{ runner.temp }}/armagetronad
+      TRONNER_ENGINE_DATA_DIR: ${{ runner.temp }}/armagetronad/share/games/armagetronad-dedicated
+      TRONNER_ENGINE_CONFIG_DIR: ${{ runner.temp }}/armagetronad/etc/games/armagetronad-dedicated
+      SMOKE_PROBE_DIR: ${{ runner.temp }}/smoke-probes
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install engine build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          autoconf automake build-essential libtool libxml2-dev
+          libzthread-dev pkg-config
+      - name: Build patched dedicated server
+        run: ./deploy/build_engine.sh
+      - name: Build disposable protocol probes
+        run: ./deploy/smoke/build_probes.sh
+      - name: Verify synchronized round release
+        run: ./deploy/smoke/run_round_sync_smoke.sh
+      - name: Verify names, colors, cycles, and server-info pairing
+        run: ./deploy/smoke/run_bidirectional_smoke.sh
+      - name: Upload test binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: armagetronad-dedicated-${{ github.sha }}
+          path: ${{ runner.temp }}/armagetronad/bin/armagetronad-dedicated
+          if-no-files-found: error
+          retention-days: 7

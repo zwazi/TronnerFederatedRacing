@@ -1,0 +1,41 @@
+__pycache__/
+*.py[cod]
+*.swp
+.DS_Store
+
+# Runtime state is never source code.
+state/
+logs/
+backups/
+artifacts/
+rendered/
+*.log
+*.sql
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*-shm
+*-wal
+
+# Credentials and local operator configuration.
+.env
+.env.*
+!.env.example
+secrets/
+private/
+inventory/
+*.key
+*.pem
+*.p12
+*.pfx
+*service-account*.json
+cluster.json
+node.json
+
+# Generated engine/build output.
+build/
+dist/
+*.o
+*.so
+armagetronad-dedicated

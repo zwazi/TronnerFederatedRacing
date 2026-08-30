@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.patch text eol=lf diff whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+*.cpp text eol=lf
+*.h text eol=lf

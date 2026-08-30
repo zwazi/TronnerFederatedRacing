@@ -1,0 +1,1 @@
+# Optional one-line server tips. Keep this file empty to disable announcements.

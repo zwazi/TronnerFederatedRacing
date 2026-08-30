@@ -1,0 +1,30 @@
+[Unit]
+Description=Tronner Racing federation transport
+Documentation=https://github.com/zwazi/TronnerFederatedRacing
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=armagetron
+Group=armagetron
+RuntimeDirectory=tronner-federation
+RuntimeDirectoryMode=0770
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/python3 /opt/TronnerRacing/federation_sidecar.py --config /etc/tronner-federation/config.json
+Restart=always
+RestartSec=2s
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/tronner-federation /var/lib/armagetronad
+ReadWritePaths=-/run/tronner-racing -/run/armagetronad
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
