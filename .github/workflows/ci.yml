@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   python-and-config:
     runs-on: ubuntu-24.04
@@ -47,47 +51,3 @@ jobs:
           --node config/node.example.json
           --output "${RUNNER_TEMP}/must-not-render"
           --production
-
-  engine-build:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install engine build dependencies
-        run: >-
-          sudo apt-get update && sudo apt-get install -y
-          autoconf automake build-essential libtool libxml2-dev
-          libzthread-dev pkg-config
-      - name: Build patched dedicated server
-        env:
-          TRONNER_BUILD_JOBS: "2"
-          TRONNER_ENGINE_SOURCE_DIR: ${{ runner.temp }}/engine-source
-          TRONNER_ENGINE_BUILD_DIR: ${{ runner.temp }}/engine-build
-          TRONNER_ENGINE_PREFIX: ${{ runner.temp }}/armagetronad
-        run: ./deploy/build_engine.sh
-      - name: Build disposable protocol probes
-        env:
-          TRONNER_ENGINE_SOURCE_DIR: ${{ runner.temp }}/engine-source
-          TRONNER_ENGINE_BUILD_DIR: ${{ runner.temp }}/engine-build
-          SMOKE_PROBE_DIR: ${{ runner.temp }}/smoke-probes
-        run: ./deploy/smoke/build_probes.sh
-      - name: Verify synchronized round release
-        env:
-          TRONNER_ENGINE_BUILD_DIR: ${{ runner.temp }}/engine-build
-          TRONNER_ENGINE_DATA_DIR: ${{ runner.temp }}/armagetronad/share/games/armagetronad-dedicated
-          TRONNER_ENGINE_CONFIG_DIR: ${{ runner.temp }}/armagetronad/etc/games/armagetronad-dedicated
-          SMOKE_PROBE_DIR: ${{ runner.temp }}/smoke-probes
-        run: ./deploy/smoke/run_round_sync_smoke.sh
-      - name: Verify names, colors, cycles, and server-info pairing
-        env:
-          TRONNER_ENGINE_BUILD_DIR: ${{ runner.temp }}/engine-build
-          TRONNER_ENGINE_DATA_DIR: ${{ runner.temp }}/armagetronad/share/games/armagetronad-dedicated
-          TRONNER_ENGINE_CONFIG_DIR: ${{ runner.temp }}/armagetronad/etc/games/armagetronad-dedicated
-          SMOKE_PROBE_DIR: ${{ runner.temp }}/smoke-probes
-        run: ./deploy/smoke/run_bidirectional_smoke.sh
-      - name: Upload test binary
-        uses: actions/upload-artifact@v7
-        with:
-          name: armagetronad-dedicated-${{ github.sha }}
-          path: ${{ runner.temp }}/armagetronad/bin/armagetronad-dedicated
-          if-no-files-found: error
-          retention-days: 7

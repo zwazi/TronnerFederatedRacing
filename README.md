@@ -84,7 +84,9 @@ python3 tools/check_public_tree.py .
 The engine patch is based on the revision in `engine/UPSTREAM_COMMIT`. CI
 verifies that it applies cleanly and builds it before publishing any release
 artifact. See [Validation](docs/validation.md) for the isolated engine and
-two-node smoke-test workflow.
+two-node smoke-test workflow. The expensive engine job runs only when engine,
+build, or smoke-test paths change; routine documentation and dependency updates
+use the fast test job.
 
 ## License
 
