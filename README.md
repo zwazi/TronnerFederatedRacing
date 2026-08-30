@@ -1,8 +1,8 @@
 # Tronner Federated Racing
 
 Tronner Federated Racing combines a patched Armagetron Advanced dedicated
-server, an external racing controller, and an authenticated UDP sidecar. Two
-approved regional nodes can run the same map and round while exchanging player
+server, an external racing controller, and an authenticated UDP sidecar.
+Approved regional nodes can run the same map and round while exchanging player
 presence, chat, cycle telemetry, commands, and personal-best updates.
 
 This repository contains source code and reproducible deployment material. It
@@ -17,8 +17,8 @@ A fresh installation is standalone, Firebase-disabled, and absent from the
 public master list. Federation requires all of the following:
 
 1. an operator-created node configuration;
-2. two unique, directional secrets delivered outside Git;
-3. the expected peer server ID and overlay-network address;
+2. a unique directional secret for each direction of every approved pair;
+3. the expected peer server IDs and overlay-network addresses;
 4. firewall or WireGuard admission by the federation operator.
 
 Packets use HMAC-SHA256 authentication, bounded timestamps, server and cluster
@@ -60,13 +60,14 @@ rollout are documented in [Installation](docs/installation.md).
 
 ## Current topology
 
-The released transport supports one authenticated peer per node: one leader
-and one follower. The configuration and enrollment formats use stable node and
-cluster identities so additional regions can be introduced without copying
-runtime state. Multi-peer fan-out is tracked as a compatibility-gated protocol
-extension; do not point two publishers at a single identity or reuse a pair's
-keys for another region. See the [multi-region roadmap](docs/multi-region-roadmap.md)
-for the security and compatibility gates required before a third live node.
+Protocol v2 supports a bounded leader-hub topology. The leader authenticates
+every follower independently and relays origin-preserving events; a follower
+peers only with the leader. Map changes, countdowns, record ordering, and round
+release remain leader-authoritative. Never reuse an identity or a pair's keys
+for another region. See [Adding a region](docs/adding-a-region.md) for the
+commissioning workflow and the [multi-region design](docs/multi-region-roadmap.md)
+for authority and failure behavior. The repeatable production sequence is in
+the [permanent-region rollout checklist](docs/production-rollout.md).
 
 ## Development
 
@@ -84,7 +85,7 @@ python3 tools/check_public_tree.py .
 The engine patch is based on the revision in `engine/UPSTREAM_COMMIT`. CI
 verifies that it applies cleanly and builds it before publishing any release
 artifact. See [Validation](docs/validation.md) for the isolated engine and
-two-node smoke-test workflow. The expensive engine job runs only when engine,
+multi-node smoke-test workflow. The expensive engine job runs only when engine,
 build, or smoke-test paths change; routine documentation and dependency updates
 use the fast test job.
 

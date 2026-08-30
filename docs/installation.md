@@ -36,7 +36,7 @@ leader/follower roles.
 ## 2. Enroll a federated node
 
 Follow [Adding a region](adding-a-region.md). Place only the approved node's
-two directional key files in a local mode-`0700` secrets directory. If Firebase
+directional key files in a local mode-`0700` secrets directory. If Firebase
 is explicitly enabled, add `firebase-service-account.json` to that directory.
 
 ## 3. Install without starting
@@ -51,11 +51,21 @@ sudo ./deploy/install.sh \
 Installation does not enable the public master-list flag beyond the value in
 the reviewed node configuration and does not automatically alter the firewall.
 
+On memory-constrained hosts, build the pinned engine on a compatible build
+machine, copy the resulting install prefix to `/opt/armagetronad` over an
+authenticated channel, verify its checksum, and use `--skip-engine-build`.
+Run `ldd` and `--version` on the candidate before trusting the artifact: matching
+CPU architecture does not guarantee a matching shared-library ABI. Building
+C++ on a small production node can exhaust memory and is not required for a
+reproducible install; CI still proves the patch builds from source. If a
+compatible builder is unavailable, add bounded swap and build with one job
+while the candidate remains unlisted.
+
 ## 4. Firewall and private transport
 
 Keep SSH access verified before changing firewall rules. Open the game and map
 ports to players. Permit the federation port only over the private overlay and
-only from the expected peer. Example policy, which must be adapted to the
+only from expected peers. Example follower policy, which must be adapted to the
 operator's interface and addresses:
 
 ```sh
@@ -78,7 +88,8 @@ systemctl --no-pager --full status \
   tronner-federation armagetronad tronner-racing
 ```
 
-Run the bidirectional and synchronized-round smoke tests while the node is
+Run the bidirectional, three-region transport, and synchronized-round smoke
+tests while the node is
 unlisted as described in [Validation](validation.md). Confirm map/resource
 downloads from an external client. Only then set
 `master_list` to true, rerender, reinstall, and deliberately reload the server

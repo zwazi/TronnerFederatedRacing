@@ -7,10 +7,10 @@ requires node-specific secrets, an approved identity, and network admission.
 ## Required controls
 
 1. Put federation traffic on WireGuard or another operator-controlled private
-   network. Bind `listen_host`, `peer_host`, and `expected_peer_ip` to overlay
-   addresses.
-2. Allow federation UDP only on that interface and only from the configured
-   peer. Never expose the application federation port to the general internet.
+   network. Bind `listen_host`, every peer `host`, and `expected_peer_ip` to
+   overlay addresses.
+2. Allow federation UDP only on that interface and only from configured peers.
+   Never expose the application federation port to the general internet.
 3. Generate independent directional HMAC keys for every pair. Never use the
    same key in both directions or across pairs.
 4. Keep `/etc/tronner-federation/keys` owned by `root:armagetron`, mode `0750`,
@@ -50,6 +50,8 @@ operator inventory and deliver credentials directly to the host.
 ## Existing protocol defenses
 
 The application protocol uses canonical JSON, HMAC-SHA256, constant-time
-signature comparison, strict fields and identifiers, a 16 KiB datagram cap,
-clock-skew validation, and a bounded replay window. These protect authenticity
-and freshness but do not replace host firewalling or private-network isolation.
+signature comparison, explicit transport/origin/destination identities, strict
+fields and identifiers, a 16 KiB datagram cap, clock-skew validation, and a
+bounded replay window per peer. The leader rejects a follower that claims
+another origin. These protect authenticity and freshness but do not replace
+host firewalling or private-network isolation.

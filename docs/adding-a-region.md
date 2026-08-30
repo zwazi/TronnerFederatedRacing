@@ -1,15 +1,18 @@
 # Adding an approved region
 
-The current wire release supports a two-node federation. This workflow is safe
-for commissioning or replacing the follower. Do not add a second follower by
-reusing the existing identity, keys, sockets, or port.
+Protocol v2 supports adding a follower to the leader hub. Each new region gets
+its own identity, overlay address, and directional key pair. Never reuse an
+existing identity, keys, or overlay address.
 
 ## 1. Prepare the private network
 
 Create a WireGuard peer for the candidate host in the private operator
 inventory. The candidate keeps its private key locally and shares only its
-public key. Confirm that each node can reach the other's overlay address and
-that the application federation port is unavailable on the public interface.
+public key. Confirm that the candidate and leader can reach each other's
+overlay address and that the application federation port is unavailable on
+every public interface. Provider-private addresses are not necessarily routed
+between regions; use an explicit cross-region overlay rather than assuming
+they are.
 
 ## 2. Create a credential-free request
 
@@ -45,25 +48,28 @@ bundles, two 32-byte directional keys, configuration fragments, and a record of
 the non-secret fingerprints. Copy bundles with SSH or another authenticated
 administrative channel. Never commit the directory.
 
-Merge each `federation-fragment.json` object into that node's `federation`
-section. Store the matching bundle's `secrets` files in the node's private
+Append the leader bundle's `peer` object to the leader's `federation.peers`.
+Use the follower bundle's `federation` object on the candidate. Add the new
+server ID and region label to the cluster `members` registry distributed to
+every node. Store each bundle's `secrets` files only in that node's private
 installer secrets directory.
 
 ## 4. Commission unlisted
 
 1. Install with `master_list` false.
 2. Validate sidecar configuration and key permissions.
-3. Confirm signed heartbeat and player snapshots in both directions.
+3. Confirm signed heartbeat and player snapshots in both directions and
+   origin-preserving relay between the new and existing followers.
 4. Run disposable identity/color/cycle and synchronized-round smoke tests.
-5. Confirm the node receives the same map and releases the round with a
+5. Confirm every node receives the same map and releases the round with a
    synchronized marker rather than its safety timeout.
 6. Test revocation by stopping the tunnel or removing the peer firewall rule.
 7. Re-enable the peer, then deliberately opt into the public master list.
 
 ## Revocation
 
-Stop the federation service on both sides, remove the WireGuard peer and
-firewall admission, archive the enrollment record as revoked, and remove the
-pair's two HMAC keys. If either key may have been copied elsewhere, generate a
-new pair before reconnecting. No unrelated node credential should need
-rotation.
+Stop federation on the candidate, remove its leader WireGuard peer and firewall
+admission, remove the candidate from the leader peer registry, archive the
+enrollment record as revoked, and remove that pair's two HMAC keys. If either
+key may have been copied elsewhere, generate a new pair before reconnecting.
+No unrelated node credential needs rotation.

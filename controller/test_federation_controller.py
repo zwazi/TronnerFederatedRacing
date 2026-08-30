@@ -38,10 +38,15 @@ def follower_controller():
     controller.federation_remote_server_id = "region-a"
     controller.federation_remote_region = "A"
     controller.federation_local_server_id = "region-b"
+    controller.federation_leader_server_id = "region-a"
+    controller.federation_remote_regions = {"region-a": "A"}
     controller.federation_sync_chat = True
     controller.federation_sync_presence = True
     controller.federation_sync_maps = True
     controller.federation_remote_players = {}
+    controller.federation_remote_maps = {}
+    controller.federation_remote_rounds = {}
+    controller.federation_remote_round_ready = {}
     controller.federation_remote_round_active = False
     controller.federation_remote_round_map_key = ""
     controller.federation_remote_round_started_at = ""
@@ -49,9 +54,12 @@ def follower_controller():
     controller.federation_command_players = {}
     controller.federation_finalists = set()
     controller.federation_snapshot_received = False
+    controller.federation_snapshots_received = set()
     controller.federation_last_sent_ns = 0
     controller.federation_last_state_sent_ns = {}
     controller.federation_last_boot_id = ""
+    controller.federation_peer_last_received_monotonic = {"region-a": time.monotonic()}
+    controller.federation_peer_timeout_seconds = 7.0
     controller.federation_prepared_map_key = None
     controller.federation_prepared_map_activate_ns = 0
     controller.players = {}
@@ -76,6 +84,139 @@ def event(kind, payload, sent_ns=None, server_id="region-a"):
 
 
 class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_three_region_release_waits_for_both_healthy_followers(self):
+        controller = follower_controller()
+        controller.federation_role = "leader"
+        controller.federation_local_server_id = "region-a"
+        controller.federation_leader_server_id = "region-a"
+        controller.federation_remote_regions = {"region-b": "B", "region-c": "C"}
+        controller.federation_round_sync_enabled = True
+        controller.federation_round_sync_release_lead_seconds = 0.5
+        controller.federation_local_round_ready_key = ""
+        controller.federation_local_round_ready_at = 0.0
+        controller.federation_remote_round_ready = {}
+        controller.federation_round_last_release_at = 0.0
+        controller.federation_round_release_key = ""
+        controller.federation_peer_last_received_monotonic = {
+            "region-b": time.monotonic(),
+            "region-c": time.monotonic(),
+        }
+        controller.current = SimpleNamespace(key="Tester/maps/Race-v1.aamap.xml")
+        controller.transitioning = True
+        controller.transition_target_key = controller.current.key
+        controller._publish_federation_control = AsyncMock(return_value=True)
+
+        await controller._handle_local_federation_round_ready(controller.current.key)
+        await controller._handle_federation_round_sync(
+            "region-b",
+            {"action": "ready", "map_key": controller.current.key, "ready_at": time.time()},
+        )
+        self.assertFalse(controller.sink.commands)
+        await controller._handle_federation_round_sync(
+            "region-c",
+            {"action": "ready", "map_key": controller.current.key, "ready_at": time.time()},
+        )
+        self.assertTrue(
+            controller.sink.commands[-1].startswith("FEDERATION_ROUND_RELEASE_AT")
+        )
+
+    async def test_empty_healthy_region_does_not_stall_active_region(self):
+        controller = follower_controller()
+        controller.federation_role = "leader"
+        controller.federation_local_server_id = "region-a"
+        controller.federation_leader_server_id = "region-a"
+        controller.federation_remote_regions = {"region-b": "B", "region-c": "C"}
+        controller.federation_round_sync_enabled = True
+        controller.federation_round_sync_release_lead_seconds = 0.5
+        controller.federation_local_round_ready_key = ""
+        controller.federation_local_round_ready_at = 0.0
+        controller.federation_remote_round_ready = {}
+        controller.federation_round_last_release_at = 0.0
+        controller.federation_round_release_key = ""
+        controller.federation_peer_last_received_monotonic = {
+            "region-b": time.monotonic(),
+            "region-c": time.monotonic(),
+        }
+        controller.federation_snapshots_received = {"region-b", "region-c"}
+        controller.federation_remote_players = {
+            "region-b\0alice": {
+                "_server_id": "region-b",
+                "connected": True,
+                "active": True,
+            }
+        }
+        controller.current = SimpleNamespace(key="Tester/maps/Race-v1.aamap.xml")
+        controller.transitioning = True
+        controller.transition_target_key = controller.current.key
+        controller._publish_federation_control = AsyncMock(return_value=True)
+
+        await controller._handle_local_federation_round_ready(controller.current.key)
+        await controller._handle_federation_round_sync(
+            "region-b",
+            {"action": "ready", "map_key": controller.current.key, "ready_at": time.time()},
+        )
+
+        self.assertTrue(
+            controller.sink.commands[-1].startswith("FEDERATION_ROUND_RELEASE_AT")
+        )
+
+    def test_one_idle_peer_cannot_clear_another_peers_active_round(self):
+        controller = follower_controller()
+        controller.federation_role = "leader"
+        controller.federation_local_server_id = "region-a"
+        controller.federation_remote_regions = {"region-b": "B", "region-c": "C"}
+        controller.current = SimpleNamespace(key="Tester/maps/Race-v1.aamap.xml")
+        controller.round_active = False
+        controller.round_started_epoch = 1.0
+        controller.deadline_epoch = 301.0
+        controller.transitioning = False
+        controller._begin_helpful_message_round = Mock()
+        controller._cancel_helpful_message = Mock()
+
+        controller._handle_federation_round_state(
+            "region-b",
+            {"action": "round_started", "map_key": controller.current.key},
+        )
+        controller._handle_federation_round_state(
+            "region-c",
+            {"action": "round_finished", "map_key": controller.current.key},
+        )
+
+        self.assertTrue(controller.federation_remote_round_active)
+        self.assertEqual(
+            controller.federation_remote_round_map_key,
+            controller.current.key,
+        )
+        self.assertEqual(
+            controller.federation_remote_round_adopted_key,
+            controller.current.key,
+        )
+        controller._cancel_helpful_message.assert_not_called()
+
+    async def test_same_player_id_from_two_regions_remains_distinct(self):
+        controller = follower_controller()
+        controller.federation_remote_regions = {"region-a": "A", "region-c": "C"}
+        controller.federation_leader_server_id = "region-a"
+        controller.federation_snapshots_received = set()
+        await controller.handle_federation_datagram(
+            event(
+                "player_snapshot",
+                {"players": [{"player_id": "alice", "display_name": "Alice A"}]},
+                server_id="region-a",
+            )
+        )
+        await controller.handle_federation_datagram(
+            event(
+                "player_snapshot",
+                {"players": [{"player_id": "alice", "display_name": "Alice C"}]},
+                server_id="region-c",
+            )
+        )
+        self.assertEqual(
+            set(controller.federation_remote_players),
+            {"region-a\0alice", "region-c\0alice"},
+        )
+
     async def test_round_release_waits_until_both_federated_engines_are_ready(self):
         controller = follower_controller()
         controller.federation_role = "leader"
@@ -103,7 +244,7 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         ))
 
         before = time.time()
-        await controller._handle_federation_round_sync({
+        await controller._handle_federation_round_sync("region-a", {
             "action": "ready",
             "map_key": controller.current.key,
             "ready_at": time.time(),
@@ -149,7 +290,7 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         release_at = time.time() + 0.5
-        await controller._handle_federation_round_sync({
+        await controller._handle_federation_round_sync("region-a", {
             "action": "release",
             "map_key": controller.current.key,
             "release_at": release_at,
@@ -181,7 +322,7 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         await controller._handle_local_federation_round_ready(
             f"{controller.current.key} {first_ready:.6f}"
         )
-        await controller._handle_federation_round_sync({
+        await controller._handle_federation_round_sync("region-a", {
             "action": "ready",
             "map_key": controller.current.key,
             "ready_at": first_ready + 0.01,
@@ -194,7 +335,7 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(controller.sink.commands), first_command_count)
 
-        await controller._handle_federation_round_sync({
+        await controller._handle_federation_round_sync("region-a", {
             "action": "ready",
             "map_key": controller.current.key,
             "ready_at": first_release + 1.01,
@@ -212,9 +353,10 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
             "other": Player("other", "Other", auth_name="other@forums"),
         }
         controller.federation_remote_players = {
-            "player@forums": {
+            "region-a\0player@forums": {
                 "display_name": "|Player",
                 "authenticated_name": "Player@forums",
+                "_server_id": "region-a",
                 "connected": True,
                 "active": True,
                 "alive": True,
@@ -224,7 +366,9 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         local, remote = controller._dashboard_players()
 
         self.assertEqual([player["name"] for player in local], ["Other"])
-        self.assertEqual([player["name"] for player in remote], ["|Player"])
+        self.assertEqual(
+            [player["name"] for player in remote["region-a"]], ["|Player"]
+        )
 
     async def test_local_chat_is_sent_to_the_local_dashboard_publisher(self):
         controller = Controller.__new__(Controller)
@@ -331,10 +475,12 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
             "active": False,
         }
         entered = controller._federation_presence_message(
+            "region-a",
             spectator,
             entered=True,
         )
         left = controller._federation_presence_message(
+            "region-a",
             spectator,
             entered=False,
         )
@@ -349,6 +495,7 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(left.startswith(COLOR_PLAYER_LEFT))
         tagged = controller._federation_presence_message(
+            "region-a",
             spectator,
             entered=True,
             display_server_tags=True,
@@ -361,6 +508,7 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_join_waits_for_the_immediate_colored_name_event(self):
         controller = follower_controller()
         controller.federation_snapshot_received = True
+        controller.federation_snapshots_received.add("region-a")
         now = time.time_ns()
         entered = asyncio.create_task(
             controller.handle_federation_datagram(
@@ -447,15 +595,19 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
                 sent_ns=now + 1,
             )
         )
-        self.assertNotIn("alice2", controller.federation_remote_players)
-        self.assertIn("alice", controller.federation_remote_players)
-        self.assertFalse(controller.federation_command_players["alice2"].connected)
+        self.assertNotIn("region-a\0alice2", controller.federation_remote_players)
+        self.assertIn("region-a\0alice", controller.federation_remote_players)
+        self.assertFalse(
+            controller.federation_command_players["region-a\0alice2"].connected
+        )
 
     async def test_leader_can_import_chat_from_its_remote_peer(self):
         controller = follower_controller()
         controller.federation_role = "leader"
         controller.federation_remote_server_id = "region-b"
         controller.federation_remote_region = "SFO"
+        controller.federation_remote_regions = {"region-b": "SFO"}
+        controller.federation_leader_server_id = "region-a"
         await controller.handle_federation_datagram(
             event(
                 "chat",
@@ -475,6 +627,8 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         controller.federation_role = "leader"
         controller.federation_local_server_id = "region-a"
         controller.federation_remote_server_id = "region-b"
+        controller.federation_remote_regions = {"region-b": "B"}
+        controller.federation_leader_server_id = "region-a"
         controller._dispatch_command = AsyncMock()
         await controller.handle_federation_datagram(
             event(
@@ -499,6 +653,8 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         controller.federation_role = "leader"
         controller.federation_local_server_id = "region-a"
         controller.federation_remote_server_id = "region-b"
+        controller.federation_remote_regions = {"region-b": "B"}
+        controller.federation_leader_server_id = "region-a"
         controller._dispatch_command = AsyncMock()
         now = time.time_ns()
         await controller.handle_federation_datagram(
@@ -527,6 +683,8 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         controller.federation_role = "leader"
         controller.federation_local_server_id = "region-a"
         controller.federation_remote_server_id = "region-b"
+        controller.federation_remote_regions = {"region-b": "B"}
+        controller.federation_leader_server_id = "region-a"
         controller.current = SimpleNamespace(key="Tester/maps/Race-v1.aamap.xml")
         controller.round_active = False
         controller.round_started_epoch = None
@@ -554,6 +712,7 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         controller.skip_vote_generation = 0
 
         controller._handle_federation_round_state(
+            "region-b",
             {
                 "action": "round_started",
                 "map_key": controller.current.key,
@@ -575,7 +734,8 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
             "active": True,
             "alive": True,
         }
-        controller.federation_remote_players["bob"] = item
+        item["_server_id"] = "region-b"
+        controller.federation_remote_players["region-b\0bob"] = item
         player = controller._federation_command_player("bob", item, "region-b")
         await controller._command_skip(player)
 
@@ -586,6 +746,8 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         controller = follower_controller()
         controller.federation_role = "leader"
         controller.federation_remote_server_id = "region-b"
+        controller.federation_remote_regions = {"region-b": "B"}
+        controller.federation_leader_server_id = "region-a"
         controller._handle_federation_snapshot = AsyncMock()
         controller._handle_federation_round_state = Mock()
 
@@ -603,6 +765,7 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         controller._handle_federation_round_state.assert_called_once_with(
+            "region-b",
             {
                 "action": "round_started",
                 "map_key": "Tester/maps/Race-v1.aamap.xml",
@@ -653,9 +816,10 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         local = Controller.player_for(controller, "alice", create=True)
         local.connected = local.active = local.respawn_enabled = True
         controller.federation_remote_players = {
-            "bob": {
+            "region-a\0bob": {
                 "player_id": "bob",
                 "display_name": "Bob",
+                "_server_id": "region-a",
                 "connected": True,
                 "active": True,
                 "alive": True,

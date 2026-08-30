@@ -41,15 +41,19 @@ class RenderTests(unittest.TestCase):
         )
         leader_network = json.loads(leader["federation.json"])
         follower_network = json.loads(follower["federation.json"])
-        self.assertEqual(leader_network["expected_server_id"], "region-b")
-        self.assertEqual(follower_network["expected_server_id"], "region-a")
+        self.assertEqual(leader_network["protocol_version"], 2)
         self.assertEqual(
-            Path(leader_network["publish_key_file"]).name,
-            Path(follower_network["receive_key_file"]).name,
+            [peer["server_id"] for peer in leader_network["peers"]],
+            ["region-b", "region-c"],
+        )
+        self.assertEqual(follower_network["peers"][0]["server_id"], "region-a")
+        self.assertEqual(
+            Path(leader_network["peers"][0]["publish_key_file"]).name,
+            Path(follower_network["peers"][0]["receive_key_file"]).name,
         )
         self.assertEqual(
-            Path(leader_network["receive_key_file"]).name,
-            Path(follower_network["publish_key_file"]).name,
+            Path(leader_network["peers"][0]["receive_key_file"]).name,
+            Path(follower_network["peers"][0]["publish_key_file"]).name,
         )
 
     def test_production_mode_rejects_examples(self):
@@ -121,9 +125,18 @@ class EnrollmentTests(unittest.TestCase):
 
             leader = json.loads((output / "leader/federation-fragment.json").read_text())
             follower = json.loads((output / "follower/federation-fragment.json").read_text())
-            self.assertEqual(leader["publish_key_name"], follower["receive_key_name"])
-            self.assertEqual(leader["receive_key_name"], follower["publish_key_name"])
-            for name in (leader["publish_key_name"], leader["receive_key_name"]):
+            leader_peer = leader["peer"]
+            follower_peer = follower["peers"][0]
+            self.assertEqual(
+                leader_peer["publish_key_name"], follower_peer["receive_key_name"]
+            )
+            self.assertEqual(
+                leader_peer["receive_key_name"], follower_peer["publish_key_name"]
+            )
+            for name in (
+                leader_peer["publish_key_name"],
+                leader_peer["receive_key_name"],
+            ):
                 leader_key = output / "leader/secrets" / name
                 follower_key = output / "follower/secrets" / name
                 self.assertEqual(leader_key.read_bytes(), follower_key.read_bytes())

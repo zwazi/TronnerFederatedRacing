@@ -15,12 +15,24 @@
   "federation": {
     "enabled": true,
     "listen_host": "10.77.0.1",
-    "peer_host": "10.77.0.2",
-    "expected_peer_ip": "10.77.0.2",
     "port": 4540,
-    "peer_server_id": "region-b",
-    "peer_region_label": "B",
-    "publish_key_name": "region-a-to-region-b.key",
-    "receive_key_name": "region-b-to-region-a.key"
+    "peers": [
+      {
+        "server_id": "region-b",
+        "region_label": "B",
+        "host": "10.77.0.2",
+        "expected_peer_ip": "10.77.0.2",
+        "publish_key_name": "region-a-to-region-b.key",
+        "receive_key_name": "region-b-to-region-a.key"
+      },
+      {
+        "server_id": "region-c",
+        "region_label": "C",
+        "host": "10.77.0.3",
+        "expected_peer_ip": "10.77.0.3",
+        "publish_key_name": "region-a-to-region-c.key",
+        "receive_key_name": "region-c-to-region-a.key"
+      }
+    ]
   }
 }

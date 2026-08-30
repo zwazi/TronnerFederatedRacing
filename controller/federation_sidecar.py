@@ -27,7 +27,7 @@ import stat
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from federation_protocol import (
     DEFAULT_MAX_CLOCK_SKEW_NS,
@@ -46,6 +46,7 @@ MAX_PLAYER_NAME_CHARACTERS = 128
 MAX_BOOTSTRAP_BYTES = 2 * 1024 * 1024
 MAX_LOCAL_EVENT_BYTES = 16_384
 PLAYER_TOKEN_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,128}$")
+MAX_FEDERATION_PEERS = 15
 
 
 class ConfigurationError(ValueError):
@@ -102,6 +103,17 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class FederationPeer:
+    server_id: str
+    region_label: str
+    host: str
+    port: int
+    expected_ip: str
+    publish_key_file: Path
+    receive_key_file: Path
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class FederationConfig:
     cluster_id: str
     server_id: str
@@ -123,6 +135,11 @@ class FederationConfig:
     heartbeat_seconds: float
     game_text_encoding: str
     maximum_clock_skew_ns: int
+    protocol_version: int
+    role: str
+    leader_server_id: str
+    members: tuple[tuple[str, str], ...]
+    peers: tuple[FederationPeer, ...]
 
     @property
     def publishes(self) -> bool:
@@ -132,10 +149,31 @@ class FederationConfig:
     def follows(self) -> bool:
         return self.mode in {"follow", "both"}
 
+    @property
+    def multi_peer(self) -> bool:
+        return self.protocol_version == 2
+
+    @property
+    def member_server_ids(self) -> frozenset[str]:
+        return frozenset(server_id for server_id, _ in self.members)
+
+    def region_for(self, server_id: str) -> str:
+        return dict(self.members).get(server_id, server_id[:16])
+
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "FederationConfig":
         if not isinstance(raw, dict):
             raise ConfigurationError("federation config must be an object")
+        protocol_version_raw = raw.get("protocol_version", 1)
+        if isinstance(protocol_version_raw, bool):
+            raise ConfigurationError("invalid protocol version")
+        try:
+            protocol_version = int(protocol_version_raw)
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError("invalid protocol version") from exc
+        if protocol_version not in {1, 2}:
+            raise ConfigurationError("protocol version must be 1 or 2")
+
         mode = str(raw.get("mode", "")).strip().casefold()
         if mode not in {"publish", "follow", "both"}:
             raise ConfigurationError("mode must be publish, follow, or both")
@@ -205,7 +243,125 @@ class FederationConfig:
             "maximum clock skew",
         )
 
-        if mode in {"publish", "both"}:
+        role = str(raw.get("role", "")).strip().casefold()
+        leader_server_id = str(raw.get("leader_server_id", "")).strip()
+        members: tuple[tuple[str, str], ...] = ()
+        peers: tuple[FederationPeer, ...] = ()
+        if protocol_version == 2:
+            if mode != "both":
+                raise ConfigurationError("protocol version 2 requires mode=both")
+            if role not in {"leader", "follower"}:
+                raise ConfigurationError(
+                    "protocol version 2 role must be leader or follower"
+                )
+            leader_server_id = _identifier(leader_server_id, "leader server ID")
+            if (role == "leader") != (server_id == leader_server_id):
+                raise ConfigurationError("role does not match leader server ID")
+            raw_members = raw.get("members")
+            if not isinstance(raw_members, dict) or not 2 <= len(raw_members) <= 16:
+                raise ConfigurationError("members must contain 2..16 servers")
+            member_items: list[tuple[str, str]] = []
+            for raw_server_id, raw_region in raw_members.items():
+                member_id = _identifier(raw_server_id, "member server ID")
+                member_region = str(raw_region).strip()
+                if not re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9_-]{0,15}", member_region
+                ):
+                    raise ConfigurationError("invalid member region label")
+                member_items.append((member_id, member_region))
+            member_map = dict(member_items)
+            if server_id not in member_map or leader_server_id not in member_map:
+                raise ConfigurationError("members must include this node and the leader")
+            if member_map[server_id] != region_label:
+                raise ConfigurationError("local member region does not match region_label")
+
+            raw_peers = raw.get("peers")
+            if (
+                not isinstance(raw_peers, list)
+                or not raw_peers
+                or len(raw_peers) > MAX_FEDERATION_PEERS
+            ):
+                raise ConfigurationError("peers must contain 1..15 entries")
+            peer_items: list[FederationPeer] = []
+            seen_peer_ids: set[str] = set()
+            seen_key_paths: set[Path] = set()
+            for index, raw_peer in enumerate(raw_peers):
+                if not isinstance(raw_peer, dict):
+                    raise ConfigurationError(f"peer {index} must be an object")
+                peer_id = _identifier(raw_peer.get("server_id", ""), "peer server ID")
+                if (
+                    peer_id == server_id
+                    or peer_id in seen_peer_ids
+                    or peer_id not in member_map
+                ):
+                    raise ConfigurationError("invalid or duplicate peer server ID")
+                peer_region = str(raw_peer.get("region_label", "")).strip()
+                if peer_region != member_map[peer_id]:
+                    raise ConfigurationError("peer region does not match members")
+                peer_publish = Path(str(raw_peer.get("publish_key_file", "")))
+                peer_receive = Path(str(raw_peer.get("receive_key_file", "")))
+                if (
+                    not str(peer_publish)
+                    or not str(peer_receive)
+                    or peer_publish == peer_receive
+                    or peer_publish in seen_key_paths
+                    or peer_receive in seen_key_paths
+                ):
+                    raise ConfigurationError("peer key paths must be unique")
+                seen_key_paths.update((peer_publish, peer_receive))
+                seen_peer_ids.add(peer_id)
+                peer_items.append(
+                    FederationPeer(
+                        server_id=peer_id,
+                        region_label=peer_region,
+                        host=_ipv4_literal(raw_peer.get("host", ""), "peer host"),
+                        port=_port(raw_peer.get("port", DEFAULT_PORT), "peer port"),
+                        expected_ip=_ipv4_literal(
+                            raw_peer.get("expected_ip", ""), "expected peer IP"
+                        ),
+                        publish_key_file=peer_publish,
+                        receive_key_file=peer_receive,
+                    )
+                )
+            expected_peers = (
+                set(member_map) - {server_id}
+                if role == "leader"
+                else {leader_server_id}
+            )
+            if seen_peer_ids != expected_peers:
+                raise ConfigurationError(
+                    "leader must peer with every follower; followers must peer only with leader"
+                )
+            if not listen_host:
+                raise ConfigurationError("protocol version 2 requires listen_host")
+            if (
+                controller_publish_socket is None
+                or controller_import_socket is None
+                or engine_import_socket is None
+            ):
+                raise ConfigurationError(
+                    "protocol version 2 requires controller publish/import sockets "
+                    "and an engine import socket"
+                )
+            if ladderlog is None or engine_export_socket is None:
+                raise ConfigurationError("protocol version 2 requires publisher inputs")
+            members = tuple(member_items)
+            peers = tuple(peer_items)
+        else:
+            role = "leader" if mode == "publish" else "follower"
+            if mode == "both":
+                role = str(raw.get("role", "leader")).strip().casefold()
+                if role not in {"leader", "follower"}:
+                    raise ConfigurationError("legacy role must be leader or follower")
+            leader_server_id = (
+                server_id if role == "leader" else (expected_server_id or "")
+            )
+            member_items = [(server_id, region_label)]
+            if expected_server_id:
+                member_items.append((expected_server_id, expected_server_id[:16]))
+            members = tuple(member_items)
+
+        if protocol_version == 1 and mode in {"publish", "both"}:
             if not peer_host:
                 raise ConfigurationError("publisher requires peer_host")
             if publish_key_file is None:
@@ -214,7 +370,7 @@ class FederationConfig:
                 raise ConfigurationError("publisher requires ladderlog")
             if engine_export_socket is None:
                 raise ConfigurationError("publisher requires engine_export_socket")
-        if mode in {"follow", "both"}:
+        if protocol_version == 1 and mode in {"follow", "both"}:
             if not listen_host:
                 raise ConfigurationError("follower requires listen_host")
             if receive_key_file is None:
@@ -256,6 +412,11 @@ class FederationConfig:
             heartbeat_seconds=heartbeat_seconds,
             game_text_encoding=encoding,
             maximum_clock_skew_ns=int(maximum_clock_skew_seconds * 1_000_000_000),
+            protocol_version=protocol_version,
+            role=role,
+            leader_server_id=leader_server_id,
+            members=members,
+            peers=peers,
         )
 
 
@@ -726,17 +887,38 @@ def parse_engine_telemetry(data: bytes) -> dict[str, Any]:
 
 
 class PacketPublisher:
-    def __init__(self, config: FederationConfig, key: bytes):
+    def __init__(
+        self,
+        config: FederationConfig,
+        key: bytes,
+        peer: FederationPeer | None = None,
+    ):
         self.config = config
         self.key = key
+        self.peer = peer
         self.boot_id = uuid.uuid4().hex
         self.sequence = 0
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setblocking(False)
+        if peer is not None:
+            assert config.listen_host is not None
+            self.socket.bind((config.listen_host, 0))
 
-    async def send(self, kind: str, payload: dict[str, Any]) -> None:
+    async def send(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        origin_server_id: str | None = None,
+    ) -> None:
         if self.sequence > (1 << 63) - 1:
             raise RuntimeError("federation sequence exhausted")
+        packet_options: dict[str, Any] = {}
+        if self.peer is not None:
+            packet_options = {
+                "origin_server_id": origin_server_id or self.config.server_id,
+                "destination_server_id": self.peer.server_id,
+            }
         data = encode_packet(
             self.key,
             cluster_id=self.config.cluster_id,
@@ -745,17 +927,77 @@ class PacketPublisher:
             sequence=self.sequence,
             kind=kind,
             payload=payload,
+            **packet_options,
         )
         self.sequence += 1
-        assert self.config.peer_host is not None
+        if self.peer is not None:
+            target = (self.peer.host, self.peer.port)
+        else:
+            assert self.config.peer_host is not None
+            target = (self.config.peer_host, self.config.peer_port)
         await asyncio.get_running_loop().sock_sendto(
             self.socket,
             data,
-            (self.config.peer_host, self.config.peer_port),
+            target,
         )
 
     def close(self) -> None:
         self.socket.close()
+
+
+class FanoutPublisher:
+    """Publish local events and origin-preserving leader relays per peer."""
+
+    def __init__(self, config: FederationConfig):
+        self.config = config
+        self.publishers = {
+            peer.server_id: PacketPublisher(
+                config,
+                read_key(peer.publish_key_file),
+                peer,
+            )
+            for peer in config.peers
+        }
+
+    async def _send_many(
+        self,
+        operations: list[tuple[str, Awaitable[None]]],
+    ) -> None:
+        results = await asyncio.gather(
+            *(operation for _peer_id, operation in operations),
+            return_exceptions=True,
+        )
+        for (peer_id, _operation), result in zip(operations, results, strict=True):
+            if isinstance(result, BaseException):
+                LOG.warning("unable to send federation datagram to %s: %s", peer_id, result)
+
+    async def send(self, kind: str, payload: dict[str, Any]) -> None:
+        await self._send_many(
+            [
+                (peer_id, publisher.send(kind, payload))
+                for peer_id, publisher in self.publishers.items()
+            ]
+        )
+
+    async def relay(self, packet: Packet) -> None:
+        await self._send_many(
+            [
+                (
+                    peer_id,
+                    publisher.send(
+                        packet.kind,
+                        packet.payload,
+                        origin_server_id=packet.server_id,
+                    ),
+                )
+                for peer_id, publisher in self.publishers.items()
+                if peer_id != packet.server_id
+            ]
+        )
+
+    def close(self) -> None:
+        for publisher in self.publishers.values():
+            publisher.close()
 
 
 class EngineTelemetryProtocol(asyncio.DatagramProtocol):
@@ -1010,6 +1252,100 @@ class NetworkFollowerProtocol(asyncio.DatagramProtocol):
         LOG.warning("federation network socket error: %s", exc)
 
 
+class MultiPeerNetworkProtocol(asyncio.DatagramProtocol):
+    """Authenticate a bounded peer registry and relay through the leader."""
+
+    def __init__(
+        self,
+        config: FederationConfig,
+        queues: FollowerQueues,
+        publisher: FanoutPublisher,
+    ):
+        self.config = config
+        self.queues = queues
+        self.publisher = publisher
+        self.keys = {
+            peer.server_id: read_key(peer.receive_key_file)
+            for peer in config.peers
+        }
+        self.replays = {
+            peer.server_id: ReplayProtector(width=256, maximum_boots=8)
+            for peer in config.peers
+        }
+        self.relay_tasks: set[asyncio.Task[None]] = set()
+
+    def datagram_received(self, data: bytes, address) -> None:
+        candidates = [
+            peer for peer in self.config.peers if peer.expected_ip == address[0]
+        ]
+        if not candidates:
+            LOG.warning(
+                "dropping federation datagram from unexpected address %s", address[0]
+            )
+            return
+        packet: Packet | None = None
+        authenticated_peer: FederationPeer | None = None
+        last_error: ProtocolError | None = None
+        for peer in candidates:
+            try:
+                candidate = decode_packet(
+                    data,
+                    self.keys[peer.server_id],
+                    expected_cluster_id=self.config.cluster_id,
+                    expected_server_id=peer.server_id,
+                    expected_destination_server_id=self.config.server_id,
+                    allowed_origin_server_ids=self.config.member_server_ids,
+                    max_clock_skew_ns=self.config.maximum_clock_skew_ns,
+                )
+            except ProtocolError as exc:
+                last_error = exc
+                continue
+            packet = candidate
+            authenticated_peer = peer
+            break
+        if packet is None or authenticated_peer is None:
+            LOG.warning("dropping invalid federation datagram: %s", last_error)
+            return
+        if (
+            self.config.role == "leader"
+            and packet.server_id != authenticated_peer.server_id
+        ):
+            LOG.warning("dropping follower packet with a forged relay origin")
+            return
+        if not self.replays[authenticated_peer.server_id].accept(packet):
+            LOG.warning(
+                "dropping replayed federation datagram sender=%s boot=%s sequence=%d",
+                authenticated_peer.server_id,
+                packet.boot_id,
+                packet.sequence,
+            )
+            return
+        self.queues.put(packet)
+        if self.config.role == "leader":
+            task = asyncio.create_task(
+                self.publisher.relay(packet),
+                name=f"federation-relay-{packet.server_id}",
+            )
+            self.relay_tasks.add(task)
+            task.add_done_callback(self._relay_finished)
+
+    def _relay_finished(self, task: asyncio.Task[None]) -> None:
+        self.relay_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            LOG.exception("federation relay task failed")
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        for task in self.relay_tasks:
+            task.cancel()
+
+    def error_received(self, exc: Exception) -> None:
+        LOG.warning("federation network socket error: %s", exc)
+
+
 class LocalEventForwarder:
     def __init__(self, config: FederationConfig):
         self.config = config
@@ -1050,6 +1386,7 @@ class LocalEventForwarder:
             "sent_ns": packet.sent_ns,
             "kind": packet.kind,
             "payload": packet.payload,
+            "region_label": self.config.region_for(packet.server_id),
         }
         data = json.dumps(
             event,
@@ -1106,9 +1443,10 @@ class LocalEventForwarder:
             self._ghost_metadata(payload)
         )
         identity = self._ghost_identity(packet.server_id, player_id)
+        region = self.config.region_for(packet.server_id).encode("utf-8").hex()
         connected = int(bool(payload.get("connected", True)))
         line = (
-            f"GHOST_V2 PRESENCE {identity} {display_name} {colored_name or '-'} "
+            f"GHOST_V3 PRESENCE {identity} {region} {display_name} {colored_name or '-'} "
             f"{authenticated_name or '-'} "
             f"{rgb[0]} {rgb[1]} {rgb[2]} {ping:.9g} {packet.sent_ns} {connected}"
         ).encode("ascii")
@@ -1170,6 +1508,7 @@ class LocalEventForwarder:
         if not all(math.isfinite(value) for value in values):
             return
         identity = self._ghost_identity(packet.server_id, player_id)
+        region = self.config.region_for(packet.server_id).encode("utf-8").hex()
         display_name, colored_name, authenticated_name, rgb, ping = (
             self._ghost_metadata(payload)
         )
@@ -1190,7 +1529,7 @@ class LocalEventForwarder:
                 ).encode("ascii")
                 await self._send(self.config.engine_import_socket, color)
         line = (
-            f"GHOST_V2 STATE {identity} {display_name} {colored_name or '-'} "
+            f"GHOST_V3 STATE {identity} {region} {display_name} {colored_name or '-'} "
             f"{authenticated_name or '-'} "
             f"{rgb[0]} {rgb[1]} {rgb[2]} {ping:.9g} {observed_ns} "
             + " ".join(f"{value:.17g}" for value in values)
@@ -1328,12 +1667,95 @@ async def run_follower(config: FederationConfig, stop: asyncio.Event) -> None:
         forwarder.close()
 
 
+async def run_multi_peer(config: FederationConfig, stop: asyncio.Event) -> None:
+    assert config.listen_host is not None
+    assert config.ladderlog is not None
+    assert config.engine_export_socket is not None
+    publisher = FanoutPublisher(config)
+    projection = LadderlogProjection()
+    queues = FollowerQueues()
+    telemetry_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=4096)
+    controller_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(
+        maxsize=128
+    )
+    telemetry_transport, _ = await bind_unix_datagram(
+        config.engine_export_socket,
+        lambda: EngineTelemetryProtocol(telemetry_queue),
+    )
+    controller_transport: asyncio.DatagramTransport | None = None
+    if config.controller_publish_socket is not None:
+        controller_transport, _ = await bind_unix_datagram(
+            config.controller_publish_socket,
+            lambda: ControllerPublishProtocol(controller_queue),
+        )
+    network_transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+        lambda: MultiPeerNetworkProtocol(config, queues, publisher),
+        family=socket.AF_INET,
+        local_addr=(config.listen_host, config.listen_port),
+    )
+    forwarder = LocalEventForwarder(config)
+    tasks = [
+        asyncio.create_task(
+            follow_ladderlog(
+                config.ladderlog,
+                projection,
+                config.game_text_encoding,
+                publisher,
+            ),
+            name="federation-ladderlog",
+        ),
+        asyncio.create_task(
+            publisher_heartbeat(config, projection, publisher),
+            name="federation-heartbeat",
+        ),
+        asyncio.create_task(
+            publish_engine_telemetry(telemetry_queue, projection, publisher),
+            name="federation-engine-telemetry",
+        ),
+        asyncio.create_task(
+            forward_control_events(queues, forwarder),
+            name="federation-control-forwarder",
+        ),
+        asyncio.create_task(
+            forward_cycle_events(queues, forwarder),
+            name="federation-cycle-forwarder",
+        ),
+    ]
+    if controller_transport is not None:
+        tasks.append(
+            asyncio.create_task(
+                publish_controller_events(controller_queue, publisher),
+                name="federation-controller-publisher",
+            )
+        )
+    try:
+        await stop.wait()
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        network_transport.close()
+        telemetry_transport.close()
+        with contextlib.suppress(FileNotFoundError):
+            config.engine_export_socket.unlink()
+        if controller_transport is not None:
+            controller_transport.close()
+            assert config.controller_publish_socket is not None
+            with contextlib.suppress(FileNotFoundError):
+                config.controller_publish_socket.unlink()
+        forwarder.close()
+        publisher.close()
+
+
 async def async_main(config: FederationConfig) -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(signum, stop.set)
+    if config.multi_peer:
+        await run_multi_peer(config, stop)
+        return
     tasks = []
     if config.publishes:
         tasks.append(asyncio.create_task(run_publisher(config, stop), name="publisher"))
@@ -1367,12 +1789,17 @@ def main() -> int:
     args = parse_args()
     try:
         config = load_config(args.config)
-        if config.publishes:
-            assert config.publish_key_file is not None
-            read_key(config.publish_key_file)
-        if config.follows:
-            assert config.receive_key_file is not None
-            read_key(config.receive_key_file)
+        if config.multi_peer:
+            for peer in config.peers:
+                read_key(peer.publish_key_file)
+                read_key(peer.receive_key_file)
+        else:
+            if config.publishes:
+                assert config.publish_key_file is not None
+                read_key(config.publish_key_file)
+            if config.follows:
+                assert config.receive_key_file is not None
+                read_key(config.receive_key_file)
     except ConfigurationError as exc:
         LOG.error("%s", exc)
         return 2

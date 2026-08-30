@@ -1,5 +1,5 @@
 diff --git a/src/engine/ePlayer.cpp b/src/engine/ePlayer.cpp
-index ee4880e..cdeedf5 100644
+index ee4880e9..cdeedf59 100644
 --- a/src/engine/ePlayer.cpp
 +++ b/src/engine/ePlayer.cpp
 @@ -61,6 +61,17 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -616,7 +616,7 @@ index ee4880e..cdeedf5 100644
      {
          // copy it to the name, removing colors of course
 diff --git a/src/engine/ePlayer.h b/src/engine/ePlayer.h
-index 0650a45..97c6e30 100644
+index 0650a456..97c6e309 100644
 --- a/src/engine/ePlayer.h
 +++ b/src/engine/ePlayer.h
 @@ -331,6 +331,7 @@ public:
@@ -675,7 +675,7 @@ index 0650a45..97c6e30 100644
  #endif
 -
 diff --git a/src/network/nAuthentication.cpp b/src/network/nAuthentication.cpp
-index 92bf9e8..9eb06a5 100644
+index 92bf9e88..9eb06a54 100644
 --- a/src/network/nAuthentication.cpp
 +++ b/src/network/nAuthentication.cpp
 @@ -56,7 +56,7 @@ typedef ZThread::ThreadedExecutor nExecutor;
@@ -764,7 +764,7 @@ index 92bf9e8..9eb06a5 100644
  #endif
          if ( delays )
 diff --git a/src/network/nConfig.h b/src/network/nConfig.h
-index 9331df1..b1b2b89 100644
+index 9331df10..b1b2b89b 100644
 --- a/src/network/nConfig.h
 +++ b/src/network/nConfig.h
 @@ -156,6 +156,7 @@ public:
@@ -781,7 +781,7 @@ index 9331df1..b1b2b89 100644
  #endif
 -
 diff --git a/src/network/nNetObject.cpp b/src/network/nNetObject.cpp
-index 396fc6c..d0d75c7 100644
+index 396fc6ca..d0d75c72 100644
 --- a/src/network/nNetObject.cpp
 +++ b/src/network/nNetObject.cpp
 @@ -830,7 +830,9 @@ void nNetObject::DoBroadcastExistence(){
@@ -866,7 +866,7 @@ index 396fc6c..d0d75c7 100644
 -
 -
 diff --git a/src/network/nNetObject.h b/src/network/nNetObject.h
-index c502654..8e9d631 100644
+index c5026544..8e9d631f 100644
 --- a/src/network/nNetObject.h
 +++ b/src/network/nNetObject.h
 @@ -203,6 +203,12 @@ public:
@@ -888,7 +888,7 @@ index c502654..8e9d631 100644
  #endif
 -
 diff --git a/src/network/nServerInfo.cpp b/src/network/nServerInfo.cpp
-index 63c1d50..eea478e 100644
+index 63c1d504..eea478e5 100644
 --- a/src/network/nServerInfo.cpp
 +++ b/src/network/nServerInfo.cpp
 @@ -41,6 +41,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -915,7 +915,7 @@ index 63c1d50..eea478e 100644
 -
 -
 diff --git a/src/network/nServerInfo.h b/src/network/nServerInfo.h
-index 236a254..81605ce 100644
+index 236a2548..81605ce2 100644
 --- a/src/network/nServerInfo.h
 +++ b/src/network/nServerInfo.h
 @@ -390,6 +390,7 @@ protected:
@@ -927,7 +927,7 @@ index 236a254..81605ce 100644
      virtual tString GetGlobalIDs()	const = 0;
      virtual tString	GetOptions()	const = 0;
 diff --git a/src/render/rConsoleCout.cpp b/src/render/rConsoleCout.cpp
-index bb62f29..59081c1 100644
+index bb62f293..59081c14 100644
 --- a/src/render/rConsoleCout.cpp
 +++ b/src/render/rConsoleCout.cpp
 @@ -147,20 +147,45 @@ public:
@@ -1036,7 +1036,7 @@ index bb62f29..59081c1 100644
          close(p_stdin[WRITE]);
      else
 diff --git a/src/tools/pthread-binding.h b/src/tools/pthread-binding.h
-index f13e90d..feab561 100644
+index f13e90db..feab5613 100644
 --- a/src/tools/pthread-binding.h
 +++ b/src/tools/pthread-binding.h
 @@ -11,6 +11,9 @@ public:
@@ -1080,7 +1080,7 @@ index f13e90d..feab561 100644
  };
  
 diff --git a/src/tools/tConfiguration.cpp b/src/tools/tConfiguration.cpp
-index 66fa8de..38ba174 100644
+index 66fa8de5..38ba1748 100644
 --- a/src/tools/tConfiguration.cpp
 +++ b/src/tools/tConfiguration.cpp
 @@ -149,6 +149,17 @@ const tConfiguration* tConfiguration::GetConfiguration() {
@@ -1110,7 +1110,7 @@ index 66fa8de..38ba174 100644
  
      *target=dummy;
 diff --git a/src/tools/tConfiguration.h b/src/tools/tConfiguration.h
-index 311610e..8742b6a 100644
+index 311610e1..8742b6ab 100644
 --- a/src/tools/tConfiguration.h
 +++ b/src/tools/tConfiguration.h
 @@ -280,6 +280,10 @@ public:
@@ -1138,7 +1138,7 @@ index 311610e..8742b6a 100644
  #endif
 -
 diff --git a/src/tools/tMemManager.cpp b/src/tools/tMemManager.cpp
-index b2fa9b9..907a33a 100644
+index b2fa9b98..907a33a6 100644
 --- a/src/tools/tMemManager.cpp
 +++ b/src/tools/tMemManager.cpp
 @@ -90,7 +90,7 @@ static bool reported=false;
@@ -1151,7 +1151,7 @@ index b2fa9b9..907a33a 100644
  typedef tPThreadRecursiveMutex MUTEX;
  #else
 diff --git a/src/tools/tToDo.cpp b/src/tools/tToDo.cpp
-index e693d13..c50ed59 100644
+index e693d133..c50ed599 100644
 --- a/src/tools/tToDo.cpp
 +++ b/src/tools/tToDo.cpp
 @@ -32,7 +32,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -1179,7 +1179,7 @@ index e693d13..c50ed59 100644
          }
      }
 diff --git a/src/tron/gAIBase.cpp b/src/tron/gAIBase.cpp
-index 4fe8b6a..0e42721 100644
+index 4fe8b6ae..0e427219 100644
 --- a/src/tron/gAIBase.cpp
 +++ b/src/tron/gAIBase.cpp
 @@ -3363,4 +3363,3 @@ static void sg_SetAIRoute(std::istream &s)
@@ -1188,7 +1188,7 @@ index 4fe8b6a..0e42721 100644
  static tConfItemFunc sg_SetAIRoute_conf("SET_AI_POSITION",&sg_SetAIRoute);
 -
 diff --git a/src/tron/gCycle.cpp b/src/tron/gCycle.cpp
-index 78153a3..b2cc8b0 100644
+index 78153a33..b2cc8b03 100644
 --- a/src/tron/gCycle.cpp
 +++ b/src/tron/gCycle.cpp
 @@ -58,11 +58,18 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -2375,7 +2375,7 @@ index 78153a3..b2cc8b0 100644
  {
      tString playerStr, rubberStr;
 diff --git a/src/tron/gCycle.h b/src/tron/gCycle.h
-index a003d88..a942f26 100644
+index a003d88a..a942f268 100644
 --- a/src/tron/gCycle.h
 +++ b/src/tron/gCycle.h
 @@ -169,6 +169,26 @@ class gCycle: public gCycleMovement
@@ -2446,7 +2446,7 @@ index a003d88..a942f26 100644
  #endif
 -
 diff --git a/src/tron/gCycleMovement.cpp b/src/tron/gCycleMovement.cpp
-index 2d6db29..5c984e5 100644
+index 2d6db292..5c984e56 100644
 --- a/src/tron/gCycleMovement.cpp
 +++ b/src/tron/gCycleMovement.cpp
 @@ -167,6 +167,147 @@ static nSettingItemWatched<REAL> c_sdb("CYCLE_SPEED_DECAY_BELOW",
@@ -2638,7 +2638,7 @@ index 2d6db29..5c984e5 100644
  static nCallbackFillServerInfo sg_fillCyclePhysics(sg_FillCyclePhysics);
 -
 diff --git a/src/tron/gCycleMovement.h b/src/tron/gCycleMovement.h
-index 849d993..8989e21 100644
+index 849d9930..8989e219 100644
 --- a/src/tron/gCycleMovement.h
 +++ b/src/tron/gCycleMovement.h
 @@ -50,6 +50,20 @@ private:
@@ -2672,7 +2672,7 @@ index 849d993..8989e21 100644
              ,                                         eCoord const &        pos
              ,                                         eCoord const &        dir         )           ;   //!< called when another cycle grinds a wall; this cycle should then drop its current wall if the grinding is too close.
 diff --git a/src/tron/gGame.cpp b/src/tron/gGame.cpp
-index a1d74d7..e8a6fd0 100644
+index a1d74d73..b7bba460 100644
 --- a/src/tron/gGame.cpp
 +++ b/src/tron/gGame.cpp
 @@ -68,6 +68,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -2735,7 +2735,7 @@ index a1d74d7..e8a6fd0 100644
  static REAL sg_svgOutputFreq = -1;
  static tSettingItem<REAL> sg_svgOutputFreqConf( "SVG_OUTPUT_TIMING", sg_svgOutputFreq );
  
-@@ -1034,6 +1069,584 @@ static float sg_playerGridPosInterval=1;
+@@ -1034,6 +1069,607 @@ static float sg_playerGridPosInterval=1;
  static tSettingItem<float> sggpi("PLAYER_GRIDPOS_INTERVAL",
                                   sg_playerGridPosInterval);
  
@@ -2952,23 +2952,36 @@ index a1d74d7..e8a6fd0 100644
 +
 +static bool sg_FederationApplyMetadata(
 +    sg_FederationGhost &ghost,
++    std::string const &labelHex,
 +    std::string const &displayHex,
 +    std::string const &coloredHex,
 +    std::string const &authenticatedHex,
 +    int red, int green, int blue,
 +    double ping )
 +{
-+    std::string display, colored, authenticated;
++    std::string label, display, colored, authenticated;
 +    if ( red < 0 || red > 15 || green < 0 || green > 15 ||
 +         blue < 0 || blue > 15 || !std::isfinite( ping ) ||
 +         ping < 0 || ping > 30 ||
++         ( !labelHex.empty() &&
++           !sg_FederationHexDecode( labelHex, label, 16 ) ) ||
 +         !sg_FederationHexDecode( displayHex, display, 128 ) ||
 +         !sg_FederationHexDecode( coloredHex, colored, 256 ) ||
 +         !sg_FederationHexDecode( authenticatedHex, authenticated, 128 ) ||
 +        display.empty() )
 +        return false;
 +
-+    std::string label = sg_FederationSafeLabel();
++    if ( label.empty() )
++        label = sg_FederationSafeLabel();
++    if ( label.empty() || label.size() > 16 )
++        return false;
++    for ( std::string::const_iterator character = label.begin();
++          character != label.end(); ++character )
++        if ( !( ( *character >= 'a' && *character <= 'z' ) ||
++                ( *character >= 'A' && *character <= 'Z' ) ||
++                ( *character >= '0' && *character <= '9' ) ||
++                *character == '_' || *character == '-' ) )
++            return false;
 +    bool created = !ghost.player;
 +    if ( created )
 +    {
@@ -3030,9 +3043,11 @@ index a1d74d7..e8a6fd0 100644
 +    std::istringstream input( line );
 +    std::string version, action, identity, displayHex, coloredHex, extra;
 +    if ( !( input >> version >> action ) ||
-+         ( version != "GHOST_V1" && version != "GHOST_V2" ) )
++         ( version != "GHOST_V1" && version != "GHOST_V2" &&
++           version != "GHOST_V3" ) )
 +        return;
-+    bool metadataV2 = version == "GHOST_V2";
++    bool metadataV2 = version == "GHOST_V2" || version == "GHOST_V3";
++    bool metadataV3 = version == "GHOST_V3";
 +
 +    if ( action == "CHAT" )
 +    {
@@ -3117,8 +3132,12 @@ index a1d74d7..e8a6fd0 100644
 +    {
 +        int connected = 0;
 +        std::string authenticatedHex = "-";
++        std::string labelHex;
++        if ( metadataV3 && !( input >> identity >> labelHex ) )
++            return;
 +        bool parsed = metadataV2
-+            ? static_cast<bool>( input >> identity >> displayHex >> coloredHex >>
++            ? static_cast<bool>( ( metadataV3 ? input : input >> identity ) >>
++                                 displayHex >> coloredHex >>
 +                                 authenticatedHex >> red >> green >> blue >> ping >>
 +                                 observedNS >> connected )
 +            : static_cast<bool>( input >> identity >> displayHex >> coloredHex >>
@@ -3139,7 +3158,7 @@ index a1d74d7..e8a6fd0 100644
 +        if ( found == sg_federationGhosts.end() ||
 +             observedNS <= found->second.metadataNS ||
 +             !sg_FederationApplyMetadata(
-+                 found->second, displayHex, coloredHex, authenticatedHex,
++                 found->second, labelHex, displayHex, coloredHex, authenticatedHex,
 +                 red, green, blue, ping ) )
 +            return;
 +        found->second.metadataNS = observedNS;
@@ -3150,8 +3169,12 @@ index a1d74d7..e8a6fd0 100644
 +    int alive = 0;
 +    double remoteGameTime = 0, x = 0, y = 0, xdir = 0, ydir = 0, speed = 0;
 +    std::string authenticatedHex = "-";
++    std::string labelHex;
++    if ( metadataV3 && !( input >> identity >> labelHex ) )
++        return;
 +    bool parsed = metadataV2
-+        ? static_cast<bool>( input >> identity >> displayHex >> coloredHex >>
++        ? static_cast<bool>( ( metadataV3 ? input : input >> identity ) >>
++                             displayHex >> coloredHex >>
 +                             authenticatedHex >> red >> green >> blue >> ping >>
 +                             observedNS >> remoteGameTime >> x >> y >> xdir >>
 +                             ydir >> speed >> alive )
@@ -3173,7 +3196,7 @@ index a1d74d7..e8a6fd0 100644
 +    if ( found == sg_federationGhosts.end() ||
 +         observedNS <= found->second.observedNS ||
 +         !sg_FederationApplyMetadata(
-+             found->second, displayHex, coloredHex, authenticatedHex,
++             found->second, labelHex, displayHex, coloredHex, authenticatedHex,
 +             red, green, blue, ping ) )
 +        return;
 +    sg_FederationGhost &ghost = found->second;
@@ -3320,7 +3343,7 @@ index a1d74d7..e8a6fd0 100644
  static float sg_zoneGridPosInterval=1;
  static tSettingItem<float> sggzi("ZONE_GRIDPOS_INTERVAL",
                                   sg_zoneGridPosInterval);
-@@ -1274,6 +1887,7 @@ void gDelayCommand::Run(REAL currentTime)
+@@ -1274,6 +1910,7 @@ void gDelayCommand::Run(REAL currentTime)
  
              std::stringstream st(delayCmd->Command());
              tConfItemBase::LoadAll(st); // run command if it's not too old, otherwise, just skip it ...
@@ -3328,7 +3351,7 @@ index a1d74d7..e8a6fd0 100644
  
              if(delayCmd->Interval() > 0) delayCmd->Update();
              else delayedCommands_.erase(it);
-@@ -1416,8 +2030,6 @@ void check_hs(){
+@@ -1416,8 +2053,6 @@ void check_hs(){
  }
  
  
@@ -3337,7 +3360,7 @@ index a1d74d7..e8a6fd0 100644
  void sg_OutputOnlinePlayers()
  {
      //! Send to /var/online_players.txt
-@@ -1634,6 +2246,31 @@ static tSettingItem<bool> gamestateWaitEnabledConf("GAME_WAIT_PLAYERS_ENABLED",
+@@ -1634,6 +2269,31 @@ static tSettingItem<bool> gamestateWaitEnabledConf("GAME_WAIT_PLAYERS_ENABLED",
  static int gameSinglePlayerHumans=1;
  static tSettingItem<int> gameSinglePlayerHumansConf("GAME_SP_HUMANS", gameSinglePlayerHumans);
  
@@ -3369,7 +3392,7 @@ index a1d74d7..e8a6fd0 100644
  static void sg_endChallenge();
  void update_settings( bool const * goon )
  {
-@@ -1649,6 +2286,8 @@ void update_settings( bool const * goon )
+@@ -1649,6 +2309,8 @@ void update_settings( bool const * goon )
              while ( sg_NumHumans() <= 0 && sg_NumUsers() > 0 && ( !goon || *goon ) && uMenu::quickexit == uMenu::QuickExit_Off )
              {
                  if(!gamestateWaitEnabled) break;
@@ -3378,7 +3401,7 @@ index a1d74d7..e8a6fd0 100644
                  
                  if ( !restarted && bool(sg_currentGame) )
                  {
-@@ -2244,6 +2883,7 @@ void sg_HostGame(){
+@@ -2244,6 +2906,7 @@ void sg_HostGame(){
          while(numPlayers == 0 &&
                  (ded_idle <= 0.0f || tSysTimeFloat()<startTime + ded_idle * 3600 ) && !uMenu::quickexit ){
              sr_Read_stdin();
@@ -3386,7 +3409,7 @@ index a1d74d7..e8a6fd0 100644
              st_DoToDo();
              gGame::NetSyncIdle();
  
-@@ -2880,23 +3520,54 @@ static tConfItemFunc exit_conf("EXIT",&Quit_conf);
+@@ -2880,23 +3543,54 @@ static tConfItemFunc exit_conf("EXIT",&Quit_conf);
  ShutDownCounter::ShutDownCounter()
  {
      isActive_ = false;
@@ -3441,7 +3464,7 @@ index a1d74d7..e8a6fd0 100644
      if ( sg_currentGame )
      {
          sg_currentGame->NoLongerGoOn();
-@@ -2931,7 +3602,7 @@ static void sg_ShutDownParse(std::istream &s)
+@@ -2931,7 +3625,7 @@ static void sg_ShutDownParse(std::istream &s)
  
          sg_ShutDown->SetTimeout(timeout);
          sg_ShutDown->Start();
@@ -3450,7 +3473,7 @@ index a1d74d7..e8a6fd0 100644
      }
      else
      {
-@@ -3637,6 +4308,19 @@ extern REAL sent_per_messid[100];
+@@ -3637,6 +4331,19 @@ extern REAL sent_per_messid[100];
  static REAL lastdeath=0;
  static bool roundOver=false;   // flag set when the round winner is declared
  
@@ -3470,7 +3493,7 @@ index a1d74d7..e8a6fd0 100644
  static void sg_VoteMenuIdle()
  {
      if ( !uMenu::MenuActive() )
-@@ -3651,6 +4335,12 @@ static eLadderLogWriter sg_newRoundWriter("NEW_ROUND", true);
+@@ -3651,6 +4358,12 @@ static eLadderLogWriter sg_newRoundWriter("NEW_ROUND", true);
  static eLadderLogWriter sg_newSetWriter("NEW_SET", true);
  static eLadderLogWriter sg_newMatchWriter("NEW_MATCH", true);
  static eLadderLogWriter sg_waitForExternalScriptWriter("WAIT_FOR_EXTERNAL_SCRIPT", true);
@@ -3483,7 +3506,7 @@ index a1d74d7..e8a6fd0 100644
  static eLadderLogWriter sg_nextRoundWriter("NEXT_ROUND", false);
  static eLadderLogWriter sg_roundCommencingWriter("ROUND_COMMENCING", false);
  static SvgOutput sg_svgOutput;
-@@ -3659,6 +4349,71 @@ static eLadderLogWriter sg_roundFinishedWriter("ROUND_FINISHED", true);
+@@ -3659,6 +4372,71 @@ static eLadderLogWriter sg_roundFinishedWriter("ROUND_FINISHED", true);
  static eLadderLogWriter sg_roundEndedWriter("ROUND_ENDED", true);
  static eLadderLogWriter sg_roundStartedWriter("ROUND_STARTED", true);
  
@@ -3555,7 +3578,7 @@ index a1d74d7..e8a6fd0 100644
  // **********************************************************************
  // *
  // *	Map Display Settings
-@@ -3998,6 +4753,12 @@ void gGame::StateUpdate(){
+@@ -3998,6 +4776,12 @@ void gGame::StateUpdate(){
                  }
                  else
                      mess << "$gamestate_newround_goldengoal";
@@ -3568,7 +3591,7 @@ index a1d74d7..e8a6fd0 100644
                  sn_ConsoleOut(mess);
  
                  se_SaveToScoreFile("$gamestate_newround_log");
-@@ -4080,6 +4841,12 @@ void gGame::StateUpdate(){
+@@ -4080,6 +4864,12 @@ void gGame::StateUpdate(){
                  {
                      sr_Read_stdin();
  
@@ -3581,7 +3604,7 @@ index a1d74d7..e8a6fd0 100644
                      // wait for network messages
                      sn_BasicNetworkSystem.Select( 0.1f );
                      gGame::NetSyncIdle();
-@@ -4825,7 +5592,7 @@ void gGame::Analysis(REAL time){
+@@ -4825,7 +5615,7 @@ void gGame::Analysis(REAL time){
          int humanTeamsClamp = human_teams;
          if ( humanTeamsClamp > 2 )
              humanTeamsClamp = 2;
@@ -3590,7 +3613,7 @@ index a1d74d7..e8a6fd0 100644
          {
              StartNewMatch();
              if (eTeam::ongoingChallenge) sg_endChallenge();
-@@ -4883,10 +5650,22 @@ void gGame::Analysis(REAL time){
+@@ -4883,10 +5673,22 @@ void gGame::Analysis(REAL time){
          int shutdown_countdown = sg_ShutDown->Timeout();
          if (shutdown_countdown > 0)
          {
@@ -3617,7 +3640,7 @@ index a1d74d7..e8a6fd0 100644
  
              sg_ShutDown->SetTimeout(sg_ShutDown->Timeout() - 1);
          }
-@@ -4897,6 +5676,19 @@ void gGame::Analysis(REAL time){
+@@ -4897,6 +5699,19 @@ void gGame::Analysis(REAL time){
          }
      }
  
@@ -3637,7 +3660,7 @@ index a1d74d7..e8a6fd0 100644
      // who is alive?
      if ( time-lastdeath < 1.0f )
      {
-@@ -5010,8 +5802,14 @@ void gGame::Analysis(REAL time){
+@@ -5010,8 +5825,14 @@ void gGame::Analysis(REAL time){
      int winnerExtraRound = ( winner != 0 || alive == 0 ) ? 1 : 0;
  
  
@@ -3654,7 +3677,7 @@ index a1d74d7..e8a6fd0 100644
      {
          roundOver = true;
  
-@@ -5030,7 +5828,7 @@ void gGame::Analysis(REAL time){
+@@ -5030,7 +5851,7 @@ void gGame::Analysis(REAL time){
      }
  
      // analyze the ranking list
@@ -3663,7 +3686,7 @@ index a1d74d7..e8a6fd0 100644
      {
          holdBackNextRound = true;
      }
-@@ -5056,7 +5854,7 @@ void gGame::Analysis(REAL time){
+@@ -5056,7 +5877,7 @@ void gGame::Analysis(REAL time){
                          ||
                          rounds + winnerExtraRound >= sg_currentSettings->limitRounds ||     // or the round limit
                          tSysTimeFloat()>=startTime+sg_currentSettings->limitTime*60 ||      // or the time limit
@@ -3672,7 +3695,7 @@ index a1d74d7..e8a6fd0 100644
                          || // or the mercy limit is hit
                          ( sg_currentSettings->maxBlowout && eTeam::teams.Len() > 1 && eTeam::teams(0)->Score() >= eTeam::teams(1)->Score() + sg_currentSettings->maxBlowout)
                     )
-@@ -5429,6 +6227,8 @@ bool gGame::GameLoop(bool input){
+@@ -5429,6 +6250,8 @@ bool gGame::GameLoop(bool input){
          return false;
      }
  
@@ -3681,7 +3704,7 @@ index a1d74d7..e8a6fd0 100644
      // do basic network receiving and sending. This pushes out all input the player makes as fast as possible.
      sg_Receive();
      sn_SendPlanned();
-@@ -5497,6 +6297,14 @@ bool gGame::GameLoop(bool input){
+@@ -5497,6 +6320,14 @@ bool gGame::GameLoop(bool input){
              ePlayerNetID::GridPosLadderLog();
              lastTime = gtime;
          }
@@ -3696,7 +3719,7 @@ index a1d74d7..e8a6fd0 100644
      } {
          static float lastTime = 1e42;
          if((sg_zoneGridPosInterval >= 0) && (gtime > sg_zoneGridPosInterval) && (gtime >= lastTime + sg_zoneGridPosInterval || gtime < lastTime)) {
-@@ -5667,6 +6475,8 @@ bool GameLoop(bool input=true){
+@@ -5667,6 +6498,8 @@ bool GameLoop(bool input=true){
          REAL t=tSysTimeFloat();
          for(int i=se_PlayerNetIDs.Len()-1;i>=0;i--){
              ePlayerNetID *p=se_PlayerNetIDs(i);
@@ -3706,7 +3729,7 @@ index a1d74d7..e8a6fd0 100644
              // get average and variance (increased a bit) of this player's ping
              nPingAverager const & averager = sn_Connections[p->Owner()].ping;
 diff --git a/src/tron/gGame.h b/src/tron/gGame.h
-index cf09018..7145379 100644
+index cf09018f..71453794 100644
 --- a/src/tron/gGame.h
 +++ b/src/tron/gGame.h
 @@ -242,11 +242,14 @@ class ShutDownCounter
@@ -3738,7 +3761,7 @@ index cf09018..7145379 100644
  #endif
 -
 diff --git a/src/tron/gParser.cpp b/src/tron/gParser.cpp
-index 12b17b3..de61bf8 100644
+index 12b17b34..de61bf83 100644
 --- a/src/tron/gParser.cpp
 +++ b/src/tron/gParser.cpp
 @@ -10,6 +10,8 @@
@@ -3843,7 +3866,7 @@ index 12b17b3..de61bf8 100644
      sizeMultiplier = aSizeMultiplier;
      // EOP
 diff --git a/src/tron/gZone.cpp b/src/tron/gZone.cpp
-index 68b539b..b98269a 100644
+index 68b539bf..b98269ad 100644
 --- a/src/tron/gZone.cpp
 +++ b/src/tron/gZone.cpp
 @@ -64,6 +64,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -4198,7 +4221,7 @@ index 68b539b..b98269a 100644
  
                  //  add the time to the countdown
 diff --git a/src/tron/gZone.h b/src/tron/gZone.h
-index 73c9a2d..6290606 100644
+index 73c9a2dd..6290606a 100644
 --- a/src/tron/gZone.h
 +++ b/src/tron/gZone.h
 @@ -125,6 +125,9 @@ public:

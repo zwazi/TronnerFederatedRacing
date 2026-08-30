@@ -119,6 +119,52 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolError, "duplicate JSON key"):
             decode_packet(raw, KEY, expected_cluster_id="tronner-racing", now_ns=NOW)
 
+    def test_version_two_preserves_origin_through_an_authenticated_hub(self):
+        encoded = packet(
+            server_id="region-a",
+            origin_server_id="region-b",
+            destination_server_id="region-c",
+        )
+        decoded = decode_packet(
+            encoded,
+            KEY,
+            expected_cluster_id="tronner-racing",
+            expected_server_id="region-a",
+            expected_destination_server_id="region-c",
+            allowed_origin_server_ids={"region-a", "region-b", "region-c"},
+            now_ns=NOW,
+        )
+        self.assertEqual(decoded.version, 2)
+        self.assertEqual(decoded.sender_server_id, "region-a")
+        self.assertEqual(decoded.server_id, "region-b")
+        self.assertEqual(decoded.destination_server_id, "region-c")
+
+    def test_version_two_rejects_wrong_destination_and_unknown_origin(self):
+        encoded = packet(
+            origin_server_id="region-b",
+            destination_server_id="region-c",
+        )
+        with self.assertRaisesRegex(ProtocolError, "another server"):
+            decode_packet(
+                encoded,
+                KEY,
+                expected_cluster_id="tronner-racing",
+                expected_server_id="region-a",
+                expected_destination_server_id="region-b",
+                allowed_origin_server_ids={"region-a", "region-b", "region-c"},
+                now_ns=NOW,
+            )
+        with self.assertRaisesRegex(ProtocolError, "unexpected origin"):
+            decode_packet(
+                encoded,
+                KEY,
+                expected_cluster_id="tronner-racing",
+                expected_server_id="region-a",
+                expected_destination_server_id="region-c",
+                allowed_origin_server_ids={"region-a", "region-c"},
+                now_ns=NOW,
+            )
+
 
 class ReplayWindowTests(unittest.TestCase):
     def test_duplicates_and_old_packets_are_rejected(self):

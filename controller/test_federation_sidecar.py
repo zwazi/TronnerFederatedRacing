@@ -13,6 +13,7 @@ from federation_sidecar import (
     FollowerQueues,
     LadderlogProjection,
     LocalEventForwarder,
+    MultiPeerNetworkProtocol,
     NetworkFollowerProtocol,
     parse_engine_telemetry,
     publish_engine_telemetry,
@@ -80,6 +81,140 @@ class ConfigurationTests(unittest.TestCase):
             path.chmod(0o644)
             with self.assertRaisesRegex(ConfigurationError, "accessible by others"):
                 read_key(path)
+
+    def test_three_region_leader_has_one_unique_pair_per_follower(self):
+        config = FederationConfig.from_dict(
+            {
+                "protocol_version": 2,
+                "cluster_id": "tronner-racing",
+                "server_id": "region-a",
+                "mode": "both",
+                "role": "leader",
+                "leader_server_id": "region-a",
+                "region_label": "A",
+                "members": {"region-a": "A", "region-b": "B", "region-c": "C"},
+                "listen_host": "127.0.0.1",
+                "listen_port": 4540,
+                "peers": [
+                    {
+                        "server_id": "region-b",
+                        "region_label": "B",
+                        "host": "127.0.0.2",
+                        "expected_ip": "127.0.0.2",
+                        "publish_key_file": "/tmp/a-to-b.key",
+                        "receive_key_file": "/tmp/b-to-a.key",
+                    },
+                    {
+                        "server_id": "region-c",
+                        "region_label": "C",
+                        "host": "127.0.0.3",
+                        "expected_ip": "127.0.0.3",
+                        "publish_key_file": "/tmp/a-to-c.key",
+                        "receive_key_file": "/tmp/c-to-a.key",
+                    },
+                ],
+                "ladderlog": "/tmp/ladderlog",
+                "engine_export_socket": "/tmp/export.sock",
+                "controller_publish_socket": "/tmp/publish.sock",
+                "controller_import_socket": "/tmp/controller.sock",
+                "engine_import_socket": "/tmp/engine.sock",
+            }
+        )
+        self.assertTrue(config.multi_peer)
+        self.assertEqual([peer.server_id for peer in config.peers], ["region-b", "region-c"])
+        self.assertEqual(config.region_for("region-c"), "C")
+
+
+class MultiPeerReceiverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_leader_accepts_and_relays_an_origin_authentic_packet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {}
+            for name, value in {
+                "a-to-b": b"a" * 32,
+                "b-to-a": b"b" * 32,
+                "a-to-c": b"c" * 32,
+                "c-to-a": b"d" * 32,
+            }.items():
+                path = root / f"{name}.key"
+                path.write_bytes(value)
+                path.chmod(0o600)
+                paths[name] = path
+            raw = {
+                "protocol_version": 2,
+                "cluster_id": "tronner-racing",
+                "server_id": "region-a",
+                "mode": "both",
+                "role": "leader",
+                "leader_server_id": "region-a",
+                "region_label": "A",
+                "members": {"region-a": "A", "region-b": "B", "region-c": "C"},
+                "listen_host": "127.0.0.1",
+                "peers": [
+                    {
+                        "server_id": "region-b",
+                        "region_label": "B",
+                        "host": "127.0.0.2",
+                        "expected_ip": "127.0.0.2",
+                        "publish_key_file": str(paths["a-to-b"]),
+                        "receive_key_file": str(paths["b-to-a"]),
+                    },
+                    {
+                        "server_id": "region-c",
+                        "region_label": "C",
+                        "host": "127.0.0.3",
+                        "expected_ip": "127.0.0.3",
+                        "publish_key_file": str(paths["a-to-c"]),
+                        "receive_key_file": str(paths["c-to-a"]),
+                    },
+                ],
+                "ladderlog": str(root / "ladderlog"),
+                "engine_export_socket": str(root / "export.sock"),
+                "controller_publish_socket": str(root / "publish.sock"),
+                "controller_import_socket": str(root / "controller.sock"),
+                "engine_import_socket": str(root / "engine.sock"),
+            }
+            config = FederationConfig.from_dict(raw)
+
+            class Publisher:
+                def __init__(self):
+                    self.relayed = []
+
+                async def relay(self, packet):
+                    self.relayed.append(packet)
+
+            publisher = Publisher()
+            queues = FollowerQueues()
+            receiver = MultiPeerNetworkProtocol(config, queues, publisher)
+            valid = encode_packet(
+                b"b" * 32,
+                cluster_id="tronner-racing",
+                server_id="region-b",
+                origin_server_id="region-b",
+                destination_server_id="region-a",
+                boot_id="boot-b",
+                sequence=1,
+                kind="chat",
+                payload={"player_id": "bob", "message": "hello"},
+            )
+            receiver.datagram_received(valid, ("127.0.0.2", 50000))
+            await asyncio.sleep(0)
+            self.assertEqual(queues.control.qsize(), 1)
+            self.assertEqual(publisher.relayed[0].server_id, "region-b")
+
+            forged = encode_packet(
+                b"b" * 32,
+                cluster_id="tronner-racing",
+                server_id="region-b",
+                origin_server_id="region-c",
+                destination_server_id="region-a",
+                boot_id="boot-b",
+                sequence=2,
+                kind="chat",
+                payload={"player_id": "mallory", "message": "forged"},
+            )
+            receiver.datagram_received(forged, ("127.0.0.2", 50000))
+            self.assertEqual(queues.control.qsize(), 1)
 
 
 class LadderlogProjectionTests(unittest.TestCase):
@@ -327,12 +462,13 @@ class LocalForwarderTests(unittest.IsolatedAsyncioTestCase):
         for actual, expected in zip(map(float, color_parts[-3:]), (0.2, 0.4, 0.6)):
             self.assertAlmostEqual(actual, expected)
         parts = sent[1][1].decode("ascii").split()
-        self.assertEqual(parts[:2], ["GHOST_V2", "STATE"])
-        self.assertEqual(len(parts), 18)
-        self.assertEqual(bytes.fromhex(parts[3]).decode(), "Alice Rider")
-        self.assertEqual(bytes.fromhex(parts[5]).decode(), "Alice@forums")
-        self.assertEqual(parts[6:9], ["15", "2", "3"])
-        self.assertEqual(parts[9], "0")
+        self.assertEqual(parts[:2], ["GHOST_V3", "STATE"])
+        self.assertEqual(len(parts), 19)
+        self.assertEqual(bytes.fromhex(parts[3]).decode(), "region-a")
+        self.assertEqual(bytes.fromhex(parts[4]).decode(), "Alice Rider")
+        self.assertEqual(bytes.fromhex(parts[6]).decode(), "Alice@forums")
+        self.assertEqual(parts[7:10], ["15", "2", "3"])
+        self.assertEqual(parts[10], "0")
         flag_parts = sent[2][1].decode("ascii").split()
         self.assertEqual(flag_parts[:2], ["GHOST_V1", "FLAGS"])
         self.assertEqual(flag_parts[2], parts[2])
@@ -398,7 +534,7 @@ class LocalForwarderTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         await forwarder.engine_chat(packet)
-        self.assertTrue(sent[0].startswith("GHOST_V2 PRESENCE "))
+        self.assertTrue(sent[0].startswith("GHOST_V3 PRESENCE "))
         self.assertIn(" 0.125 ", sent[0])
         self.assertTrue(sent[1].startswith("GHOST_V1 CHAT "))
         self.assertEqual(bytes.fromhex(sent[1].split()[-1]).decode(), "hello")
