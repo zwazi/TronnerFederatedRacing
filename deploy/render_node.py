@@ -249,6 +249,7 @@ def render(cluster: dict[str, Any], node: dict[str, Any], *, production: bool) -
     listen_host = ""
     peer_host = ""
     expected_peer_ip = ""
+    leader_resource_base_url = ""
     federation_config: dict[str, Any] | None = None
     required_secrets: list[str] = []
     federation_private_addresses: list[tuple[str, str]] = []
@@ -344,6 +345,26 @@ def render(cluster: dict[str, Any], node: dict[str, Any], *, production: bool) -
                 )
             peer_id = leader_id if role == "follower" else rendered_peers[0]["server_id"]
             peer_region = members[str(peer_id)]
+            if role == "follower":
+                leader_resource_base_url = url(
+                    federation.get("leader_resource_base_url", ""),
+                    "leader resource base URL",
+                    allow_http=True,
+                )
+                if not leader_resource_base_url.endswith("/"):
+                    leader_resource_base_url += "/"
+                leader_resource_host = urllib.parse.urlsplit(
+                    leader_resource_base_url
+                ).hostname
+                leader_peer = next(
+                    peer
+                    for peer in rendered_peers
+                    if peer["server_id"] == leader_id
+                )
+                if leader_resource_host != leader_peer["host"]:
+                    raise ConfigurationError(
+                        "leader resource URL must use the leader overlay address"
+                    )
             federation_config = {
                 "protocol_version": 2,
                 "cluster_id": cluster_id,
@@ -386,6 +407,21 @@ def render(cluster: dict[str, Any], node: dict[str, Any], *, production: bool) -
             expected_peer_ip = ipv4_address(
                 federation.get("expected_peer_ip", ""), "expected peer IP"
             )
+            if role == "follower":
+                leader_resource_base_url = url(
+                    federation.get("leader_resource_base_url", ""),
+                    "leader resource base URL",
+                    allow_http=True,
+                )
+                if not leader_resource_base_url.endswith("/"):
+                    leader_resource_base_url += "/"
+                if (
+                    urllib.parse.urlsplit(leader_resource_base_url).hostname
+                    != peer_host
+                ):
+                    raise ConfigurationError(
+                        "leader resource URL must use the leader overlay address"
+                    )
             federation_private_addresses.extend(
                 [
                     (listen_host, "federation listen host"),
@@ -519,6 +555,11 @@ def render(cluster: dict[str, Any], node: dict[str, Any], *, production: bool) -
             "round_sync_release_lead_seconds": 0.5,
             "round_sync_timeout_seconds": 30.0,
         }
+        if role == "follower":
+            controller["federation"]["leader_resource_base_url"] = (
+                leader_resource_base_url
+            )
+            controller["federation"]["resource_timeout_seconds"] = 10.0
 
     firebase_database_url = ""
     if firebase_enabled:

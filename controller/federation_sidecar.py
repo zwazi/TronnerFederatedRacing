@@ -47,6 +47,8 @@ MAX_BOOTSTRAP_BYTES = 2 * 1024 * 1024
 MAX_LOCAL_EVENT_BYTES = 16_384
 PLAYER_TOKEN_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,128}$")
 MAX_FEDERATION_PEERS = 15
+ENGINE_METADATA_REFRESH_NS = 2_000_000_000
+FEDERATION_HEALTH_FILE = Path("/run/tronner-federation/health.json")
 
 
 class ConfigurationError(ValueError):
@@ -859,11 +861,15 @@ def parse_engine_telemetry(data: bytes) -> dict[str, Any]:
         raise ProtocolError("invalid engine telemetry alive state")
     if chatting is not None and chatting not in {0, 1}:
         raise ProtocolError("invalid engine telemetry chatting state")
-    if cycle_rgb is not None and (
-        not all(math.isfinite(value) for value in cycle_rgb)
-        or any(value < 0 or value > 4 for value in cycle_rgb)
-    ):
-        raise ProtocolError("invalid engine telemetry cycle color")
+    if cycle_rgb is not None:
+        if not all(math.isfinite(value) for value in cycle_rgb):
+            raise ProtocolError("invalid engine telemetry cycle color")
+        # Old clients can send color components far outside the documented
+        # 0..15 player range.  The engine tolerates and renders those players,
+        # so dropping their entire motion stream makes them disappear from
+        # every other region.  Bound only the visual metadata to the import
+        # protocol's safe range while preserving position/state delivery.
+        cycle_rgb = tuple(max(0.0, min(4.0, value)) for value in cycle_rgb)
     if ping is not None and (not math.isfinite(ping) or ping < 0 or ping > 30):
         raise ProtocolError("invalid engine telemetry ping")
     payload = {
@@ -980,6 +986,8 @@ class FanoutPublisher:
         )
 
     async def relay(self, packet: Packet) -> None:
+        if not should_relay_from_follower(packet):
+            return
         await self._send_many(
             [
                 (
@@ -998,6 +1006,27 @@ class FanoutPublisher:
     def close(self) -> None:
         for publisher in self.publishers.values():
             publisher.close()
+
+
+def should_relay_from_follower(packet: Packet) -> bool:
+    """Return whether a follower-origin packet belongs at other followers.
+
+    Commands, observed follower maps, readiness notices, and PB snapshot
+    requests terminate at the leader.  Relaying them to every edge created
+    work and duplicate state without a consumer.  Presence, chat, motion and
+    actual PB deltas still fan out through the hub.
+    """
+
+    if packet.kind in {"command", "map_commit"}:
+        return False
+    if packet.kind == "round_sync" and packet.payload.get("action") == "ready":
+        return False
+    if (
+        packet.kind == "records_delta"
+        and packet.payload.get("operation") == "snapshot_request"
+    ):
+        return False
+    return True
 
 
 class EngineTelemetryProtocol(asyncio.DatagramProtocol):
@@ -1211,6 +1240,81 @@ class FollowerQueues:
         return packets
 
 
+class FederationHealth:
+    """Small local status snapshot built from authenticated inbound packets."""
+
+    def __init__(self, config: FederationConfig):
+        self.config = config
+        self.started_ns = time.time_ns()
+        self.received: dict[str, dict[str, object]] = {}
+
+    def observe(self, packet: Packet) -> None:
+        origin = packet.server_id
+        now_ns = time.time_ns()
+        peer = self.received.setdefault(origin, {"kinds": {}})
+        peer["received_ns"] = now_ns
+        peer["sent_ns"] = packet.sent_ns
+        peer["kind"] = packet.kind
+        peer["sequence"] = packet.sequence
+        kinds = peer["kinds"]
+        assert isinstance(kinds, dict)
+        kinds[packet.kind] = {
+            "received_ns": now_ns,
+            "sent_ns": packet.sent_ns,
+            "sequence": packet.sequence,
+        }
+
+    def write(self) -> None:
+        data = {
+            "version": 1,
+            "generated_ns": time.time_ns(),
+            "started_ns": self.started_ns,
+            "cluster_id": self.config.cluster_id,
+            "server_id": self.config.server_id,
+            "role": self.config.role,
+            "members": dict(self.config.members),
+            "received": self.received,
+        }
+        path = FEDERATION_HEALTH_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as output:
+                json.dump(
+                    data,
+                    output,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(temporary, 0o640)
+            os.replace(temporary, path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+
+async def write_federation_health(
+    health: FederationHealth,
+    stop: asyncio.Event,
+) -> None:
+    while not stop.is_set():
+        try:
+            health.write()
+        except OSError:
+            LOG.exception("unable to write federation health snapshot")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=1.0)
+        except TimeoutError:
+            pass
+    with contextlib.suppress(OSError):
+        health.write()
+
+
 class NetworkFollowerProtocol(asyncio.DatagramProtocol):
     def __init__(
         self,
@@ -1260,10 +1364,12 @@ class MultiPeerNetworkProtocol(asyncio.DatagramProtocol):
         config: FederationConfig,
         queues: FollowerQueues,
         publisher: FanoutPublisher,
+        health: FederationHealth | None = None,
     ):
         self.config = config
         self.queues = queues
         self.publisher = publisher
+        self.health = health
         self.keys = {
             peer.server_id: read_key(peer.receive_key_file)
             for peer in config.peers
@@ -1320,6 +1426,8 @@ class MultiPeerNetworkProtocol(asyncio.DatagramProtocol):
                 packet.sequence,
             )
             return
+        if self.health is not None:
+            self.health.observe(packet)
         self.queues.put(packet)
         if self.config.role == "leader":
             task = asyncio.create_task(
@@ -1352,6 +1460,8 @@ class LocalEventForwarder:
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.socket.setblocking(False)
         self.backpressure_warning_ns: dict[Path, int] = {}
+        self.engine_colors: dict[tuple[str, str], tuple[tuple[float, ...], int]] = {}
+        self.engine_flags: dict[tuple[str, str], tuple[bool, int]] = {}
 
     async def _send(self, path: Path, data: bytes) -> None:
         if len(data) > MAX_LOCAL_EVENT_BYTES:
@@ -1508,6 +1618,8 @@ class LocalEventForwarder:
         if not all(math.isfinite(value) for value in values):
             return
         identity = self._ghost_identity(packet.server_id, player_id)
+        state_key = (packet.server_id, player_id.casefold())
+        refresh_ns = time.monotonic_ns()
         region = self.config.region_for(packet.server_id).encode("utf-8").hex()
         display_name, colored_name, authenticated_name, rgb, ping = (
             self._ghost_metadata(payload)
@@ -1523,11 +1635,18 @@ class LocalEventForwarder:
                 and all(math.isfinite(value) for value in effective)
                 and all(0 <= value <= 4 for value in effective)
             ):
-                color = (
-                    f"GHOST_V1 COLOR {identity} {observed_ns} "
-                    + " ".join(f"{value:.17g}" for value in effective)
-                ).encode("ascii")
-                await self._send(self.config.engine_import_socket, color)
+                previous_color = self.engine_colors.get(state_key)
+                if (
+                    previous_color is None
+                    or previous_color[0] != effective
+                    or refresh_ns - previous_color[1] >= ENGINE_METADATA_REFRESH_NS
+                ):
+                    color = (
+                        f"GHOST_V1 COLOR {identity} {observed_ns} "
+                        + " ".join(f"{value:.17g}" for value in effective)
+                    ).encode("ascii")
+                    await self._send(self.config.engine_import_socket, color)
+                    self.engine_colors[state_key] = (effective, refresh_ns)
         line = (
             f"GHOST_V3 STATE {identity} {region} {display_name} {colored_name or '-'} "
             f"{authenticated_name or '-'} "
@@ -1538,10 +1657,20 @@ class LocalEventForwarder:
         await self._send(self.config.engine_import_socket, line)
         chatting = payload.get("chatting")
         if isinstance(chatting, bool):
-            flags = (
-                f"GHOST_V1 FLAGS {identity} {observed_ns} {int(chatting)}"
-            ).encode("ascii")
-            await self._send(self.config.engine_import_socket, flags)
+            previous_flags = self.engine_flags.get(state_key)
+            if (
+                previous_flags is None
+                or previous_flags[0] != chatting
+                or refresh_ns - previous_flags[1] >= ENGINE_METADATA_REFRESH_NS
+            ):
+                flags = (
+                    f"GHOST_V1 FLAGS {identity} {observed_ns} {int(chatting)}"
+                ).encode("ascii")
+                await self._send(self.config.engine_import_socket, flags)
+                self.engine_flags[state_key] = (chatting, refresh_ns)
+        if not alive:
+            self.engine_colors.pop(state_key, None)
+            self.engine_flags.pop(state_key, None)
 
     def close(self) -> None:
         self.socket.close()
@@ -1672,6 +1801,7 @@ async def run_multi_peer(config: FederationConfig, stop: asyncio.Event) -> None:
     assert config.ladderlog is not None
     assert config.engine_export_socket is not None
     publisher = FanoutPublisher(config)
+    health = FederationHealth(config)
     projection = LadderlogProjection()
     queues = FollowerQueues()
     telemetry_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=4096)
@@ -1689,7 +1819,7 @@ async def run_multi_peer(config: FederationConfig, stop: asyncio.Event) -> None:
             lambda: ControllerPublishProtocol(controller_queue),
         )
     network_transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
-        lambda: MultiPeerNetworkProtocol(config, queues, publisher),
+        lambda: MultiPeerNetworkProtocol(config, queues, publisher, health),
         family=socket.AF_INET,
         local_addr=(config.listen_host, config.listen_port),
     )
@@ -1719,6 +1849,10 @@ async def run_multi_peer(config: FederationConfig, stop: asyncio.Event) -> None:
         asyncio.create_task(
             forward_cycle_events(queues, forwarder),
             name="federation-cycle-forwarder",
+        ),
+        asyncio.create_task(
+            write_federation_health(health, stop),
+            name="federation-health-writer",
         ),
     ]
     if controller_transport is not None:
