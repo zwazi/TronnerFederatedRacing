@@ -1457,16 +1457,32 @@ class MultiPeerNetworkProtocol(asyncio.DatagramProtocol):
 class LocalEventForwarder:
     def __init__(self, config: FederationConfig):
         self.config = config
-        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        self.socket.setblocking(False)
+        self.socket = self._new_socket()
+        self.sockets: dict[Path, socket.socket] = {}
         self.backpressure_warning_ns: dict[Path, int] = {}
         self.engine_colors: dict[tuple[str, str], tuple[tuple[float, ...], int]] = {}
         self.engine_flags: dict[tuple[str, str], tuple[bool, int]] = {}
 
-    async def _send(self, path: Path, data: bytes) -> None:
+    @staticmethod
+    def _new_socket() -> socket.socket:
+        destination = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        destination.setblocking(False)
+        destination.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262_144)
+        return destination
+
+    def _socket_for(self, path: Path) -> socket.socket:
+        destination = self.sockets.get(path)
+        if destination is None:
+            # Keep the original attribute for compatibility with operational
+            # probes and use one independent send socket per local consumer.
+            destination = self.socket if not self.sockets else self._new_socket()
+            self.sockets[path] = destination
+        return destination
+
+    async def _send(self, path: Path, data: bytes) -> bool:
         if len(data) > MAX_LOCAL_EVENT_BYTES:
             LOG.error("local federation event exceeds size limit")
-            return
+            return False
         try:
             # Local federation datagrams are snapshots/edges on a continuously
             # refreshed stream.  Waiting for a full consumer socket here can
@@ -1474,17 +1490,30 @@ class LocalEventForwarder:
             # unrelated controller traffic (including map commits) from being
             # delivered.  Make the best-effort send immediately and let a
             # later snapshot refresh any packet dropped under backpressure.
-            self.socket.sendto(data, str(path))
+            self._socket_for(path).sendto(data, str(path))
+            return True
         except BlockingIOError:
             now_ns = time.monotonic_ns()
             previous_ns = self.backpressure_warning_ns.get(path, now_ns - 5_000_000_000)
             if now_ns - previous_ns >= 5_000_000_000:
                 LOG.warning("local federation consumer is backlogged: %s", path)
                 self.backpressure_warning_ns[path] = now_ns
+            return False
         except (FileNotFoundError, ConnectionRefusedError):
             LOG.debug("local federation consumer is unavailable: %s", path)
+            return False
         except OSError as exc:
             LOG.warning("unable to forward local federation event to %s: %s", path, exc)
+            return False
+
+    async def _send_control(self, path: Path, data: bytes) -> None:
+        """Retry low-rate controller events without blocking motion traffic."""
+        deadline = time.monotonic() + 0.5
+        while not await self._send(path, data):
+            if time.monotonic() >= deadline:
+                LOG.error("dropping federated controller event after local backlog")
+                return
+            await asyncio.sleep(0.01)
 
     async def controller(self, packet: Packet) -> None:
         assert self.config.controller_import_socket is not None
@@ -1505,7 +1534,7 @@ class LocalEventForwarder:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-        await self._send(self.config.controller_import_socket, data)
+        await self._send_control(self.config.controller_import_socket, data)
 
     @staticmethod
     def _ghost_identity(server_id: str, player_id: str) -> str:
@@ -1673,7 +1702,13 @@ class LocalEventForwarder:
             self.engine_flags.pop(state_key, None)
 
     def close(self) -> None:
-        self.socket.close()
+        closed: set[int] = set()
+        for destination in (self.socket, *self.sockets.values()):
+            identifier = id(destination)
+            if identifier in closed:
+                continue
+            destination.close()
+            closed.add(identifier)
 
 
 async def forward_control_events(

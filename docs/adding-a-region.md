@@ -66,10 +66,12 @@ rejects a URL whose host is not the configured leader overlay peer.
    origin-preserving relay between the new and existing followers.
    Run `tools/check_federation_health.py` on every node; all must be healthy.
 4. Run disposable identity/color/cycle and synchronized-round smoke tests.
-5. Confirm every node receives the same map and releases the round with a
+5. Confirm the new follower completes a leader preference snapshot before
+   accepting players; saved spawns and start modes must match an existing node.
+6. Confirm every node receives the same map and releases the round with a
    synchronized marker rather than its safety timeout.
-6. Test revocation by stopping the tunnel or removing the peer firewall rule.
-7. Re-enable the peer, then deliberately opt into the public master list.
+7. Test revocation by stopping the tunnel or removing the peer firewall rule.
+8. Re-enable the peer, then deliberately opt into the public master list.
 
 ## Revocation
 

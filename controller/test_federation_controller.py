@@ -93,6 +93,141 @@ def event(kind, payload, sent_ns=None, server_id="region-a"):
 
 
 class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def preference_controller(role="follower"):
+        controller = follower_controller()
+        controller.federation_role = role
+        if role == "leader":
+            controller.federation_local_server_id = "region-a"
+            controller.federation_leader_server_id = "region-a"
+            controller.federation_remote_server_id = "region-b"
+            controller.federation_remote_regions = {"region-b": "B"}
+        controller.start_preferences = {}
+        controller.display_server_tag_preferences = {}
+        controller.spawn_preferences = {}
+        controller.federation_preference_versions = {}
+        controller.federation_preference_pending = {}
+        controller._federation_preference_snapshot_cache = {}
+        controller._persist_federation_preferences = lambda: None
+        controller._publish_federation_control = AsyncMock(return_value=True)
+        return controller
+
+    async def test_follower_preference_update_is_applied_and_echoed_by_leader(self):
+        controller = self.preference_controller("leader")
+        key = controller._federation_preference_key(
+            "spawn", "auth:racer@forums", "map-id:map-1"
+        )
+        entry = {
+            "key": key,
+            "updated_at_ns": 123,
+            "source_server_id": "region-b",
+            "operation": "set",
+            "value": 4,
+        }
+
+        await controller._handle_federation_preference_message(
+            "region-b",
+            {"scope": "federation_preference_update", "entry": entry},
+        )
+
+        self.assertEqual(
+            controller.spawn_preferences["map-id:map-1"]["auth:racer@forums"],
+            4,
+        )
+        echoed = controller._publish_federation_control.await_args.args[1]
+        self.assertEqual(echoed["scope"], "federation_preference_update")
+        self.assertEqual(echoed["entry"], entry)
+
+    async def test_follower_snapshot_repairs_equal_version_value(self):
+        controller = self.preference_controller()
+        key = controller._federation_preference_key(
+            "start", "auth:racer@forums"
+        )
+        controller.start_preferences["auth:racer@forums"] = "brake"
+        controller.federation_preference_versions[key] = [1, "region-a"]
+        controller._federation_preference_snapshot_offset = 0
+        controller._federation_preference_snapshot_seen = set()
+        controller._federation_preference_snapshot_complete = asyncio.Event()
+        controller._federation_preference_snapshot_progress = asyncio.Event()
+
+        await controller._handle_federation_preference_message(
+            "region-a",
+            {
+                "scope": "federation_preference_snapshot",
+                "target_server_id": "region-b",
+                "snapshot_offset": 0,
+                "snapshot_next_offset": 1,
+                "snapshot_complete": True,
+                "entries": [
+                    {
+                        "key": key,
+                        "updated_at_ns": 1,
+                        "source_server_id": "region-a",
+                        "operation": "set",
+                        "value": "respawn",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(
+            controller.start_preferences["auth:racer@forums"], "respawn"
+        )
+        self.assertTrue(controller._federation_preference_snapshot_complete.is_set())
+
+    async def test_newer_offline_follower_preference_is_queued_after_snapshot(self):
+        controller = self.preference_controller()
+        key = controller._federation_preference_key(
+            "tags", "auth:racer@forums"
+        )
+        controller.display_server_tag_preferences["auth:racer@forums"] = True
+        controller.federation_preference_versions[key] = [200, "region-b"]
+        controller._federation_preference_snapshot_offset = 0
+        controller._federation_preference_snapshot_seen = set()
+        controller._federation_preference_snapshot_complete = asyncio.Event()
+        controller._federation_preference_snapshot_progress = asyncio.Event()
+
+        await controller._handle_federation_preference_message(
+            "region-a",
+            {
+                "scope": "federation_preference_snapshot",
+                "target_server_id": "region-b",
+                "snapshot_offset": 0,
+                "snapshot_next_offset": 1,
+                "snapshot_complete": True,
+                "entries": [
+                    {
+                        "key": key,
+                        "updated_at_ns": 100,
+                        "source_server_id": "region-a",
+                        "operation": "set",
+                        "value": False,
+                    }
+                ],
+            },
+        )
+
+        self.assertTrue(
+            controller.display_server_tag_preferences["auth:racer@forums"]
+        )
+        self.assertEqual(
+            controller.federation_preference_pending[key]["updated_at_ns"],
+            200,
+        )
+
+    async def test_preference_delete_is_retained_as_versioned_tombstone(self):
+        controller = self.preference_controller()
+        identity = "auth:racer@forums"
+        controller.start_preferences[identity] = "countdown"
+        key = controller._set_local_federation_preference(
+            "start", identity, None
+        )
+
+        self.assertNotIn(identity, controller.start_preferences)
+        entry = controller._federation_preference_entry(key)
+        self.assertEqual(entry["operation"], "delete")
+        self.assertIn(key, controller.federation_preference_pending)
+
     async def test_three_region_release_waits_for_both_healthy_followers(self):
         controller = follower_controller()
         controller.federation_role = "leader"
