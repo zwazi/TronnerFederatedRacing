@@ -403,6 +403,30 @@ class TelemetryPublisherTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LocalForwarderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_engine_and_controller_consumers_use_independent_sockets(self):
+        forwarder = LocalEventForwarder(follower_config())
+        engine_socket = forwarder._socket_for(Path("/tmp/engine-import.sock"))
+        controller_socket = forwarder._socket_for(
+            Path("/tmp/controller-import.sock")
+        )
+
+        self.assertIsNot(engine_socket, controller_socket)
+        forwarder.close()
+
+    async def test_controller_event_retries_transient_local_backpressure(self):
+        forwarder = LocalEventForwarder(follower_config())
+        attempts = []
+
+        async def transient_send(path, data):
+            attempts.append((path, data))
+            return len(attempts) >= 3
+
+        forwarder._send = transient_send
+        await forwarder._send_control(Path("/tmp/controller.sock"), b"event")
+
+        self.assertEqual(len(attempts), 3)
+        forwarder.close()
+
     async def test_backlogged_local_consumer_does_not_block_forwarding(self):
         class BackloggedSocket:
             def __init__(self):

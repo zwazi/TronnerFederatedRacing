@@ -54,3 +54,20 @@ snapshots from every other semantic origin reached that node, all four local
 Unix sockets exist, and the current map has identical bytes in the engine cache
 and public mirror. Run it on all nodes to prove every required direction. The
 check is read-only and does not restart or reload anything.
+
+For a commissioned node, build `mesh_client_probe` against the installed
+patched engine and run one short observer connection from every region to every
+other region:
+
+```sh
+export TRONNER_ENGINE_DATA_DIR=/opt/armagetronad/share/games/armagetronad-dedicated
+/path/to/mesh_client_probe HOST:PORT observer 2500
+```
+
+The `PROBE` milestones record login latency, received players, federation ghost
+identity, current map settings, and clean disconnect. An optional final
+argument sends one bounded chat command. `/nextmap` is a useful non-mutating
+round-trip canary on a follower: its reply proves follower engine -> follower
+sidecar -> leader controller -> follower sidecar -> follower engine delivery.
+These are one-shot clients; do not leave probes connected or use them as a
+keepalive service.

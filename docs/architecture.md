@@ -39,6 +39,7 @@ without pretending every event is global.
 | Local players, finishes, respawns | each local engine/controller | normalized edges and snapshots |
 | Remote cycle visuals | each local engine | best-effort coalesced UDP telemetry |
 | Authenticated personal bests | node that observed the finish, merged idempotently | PB deltas through the leader |
+| Start mode, saved spawn, server-tag display | latest versioned user change, reconciled by leader | retried deltas and periodic authenticated snapshots; no Firebase |
 | Public website state | leader unless explicitly documented otherwise | external publisher |
 
 Only the leader continuously watches Firebase catalog invalidation. Followers
@@ -66,6 +67,12 @@ SQLite records, recordings, preferences, generated map mirrors, logs, reports,
 and downloaded catalog data are runtime state beneath `/var/lib` or the system
 journal. They are not required to reproduce the software and must not enter the
 source repository.
+
+The sidecar keeps high-rate cycle traffic separate from low-rate controller
+delivery. Cycle positions may be coalesced or dropped and refreshed by the next
+sample. Controller events use an independent local socket and bounded retries,
+so a busy engine import queue cannot discard a command reply or preference
+update.
 
 ## Failure behavior
 
