@@ -3,6 +3,8 @@
 #include "eNetGameObject.h"
 #include "ePlayer.h"
 #include "gAIBase.h"
+#include "gGame.h"
+#include "nNetObject.h"
 #include "nNetwork.h"
 #include "nSocket.h"
 #include "tDirectories.h"
@@ -24,6 +26,8 @@ bool *sg_GetSpecs()
 namespace
 {
 using Clock = std::chrono::steady_clock;
+long const COMMAND_READY_DELAY_MILLISECONDS = 1000;
+unsigned short const GAME_STATE_PLAY = 50;
 
 long ElapsedMilliseconds( Clock::time_point started )
 {
@@ -36,6 +40,39 @@ void Milestone( Clock::time_point started, char const *phase )
 {
     std::cout << "PROBE phase=" << phase
               << " elapsed_ms=" << ElapsedMilliseconds( started ) << "\n";
+}
+
+bool AdvanceGameState(
+    Clock::time_point started,
+    nNetObject const *&lastGame,
+    unsigned short &lastState
+)
+{
+    for ( int index = 0; index < sn_netObjects.Len(); ++index )
+    {
+        gGame *game = dynamic_cast< gGame * >(
+            sn_netObjects( index ).operator->()
+        );
+        if ( !game )
+            continue;
+
+        // A normal client builds the map/grid locally before acknowledging
+        // each server state.  Running that stock transition here keeps this
+        // headless client protocol-correct and prevents it from stalling the
+        // server's SyncState loop.
+        game->StateUpdate();
+        unsigned short state = game->GetState();
+        if ( game == lastGame && state == lastState )
+            return false;
+
+        lastGame = game;
+        lastState = state;
+        std::cout << "PROBE phase=game_state"
+                  << " elapsed_ms=" << ElapsedMilliseconds( started )
+                  << " state=" << state << "\n";
+        return true;
+    }
+    return false;
 }
 }
 
@@ -86,6 +123,8 @@ int main( int argc, char **argv )
     bool loginReported = false;
     bool commandSent = false;
     bool objectReported = false;
+    nNetObject const *lastGame = 0;
+    unsigned short lastGameState = 0;
     long loginMilliseconds = -1;
     long maximumMilliseconds = settleMilliseconds + 15000;
     while (
@@ -95,6 +134,7 @@ int main( int argc, char **argv )
     {
         sn_Receive();
         nNetObject::SyncAll();
+        AdvanceGameState( started, lastGame, lastGameState );
         sn_SendPlanned();
         if ( !loginReported && local->Owner() > 0 )
         {
@@ -102,7 +142,17 @@ int main( int argc, char **argv )
             loginMilliseconds = ElapsedMilliseconds( started );
             Milestone( started, "login_succeeded" );
         }
-        if ( loginReported && !commandSent && !chatCommand.empty() )
+        // A login owner is assigned before the server has necessarily finished
+        // registering the player target.  Sending a canary in that same frame
+        // can produce a valid federated reply that the origin engine cannot yet
+        // route back to the client.  Give the join state one second to settle so
+        // this probe tests federation delivery instead of login timing.
+        if (
+            loginReported && !commandSent && !chatCommand.empty()
+            && lastGameState == GAME_STATE_PLAY
+            && ElapsedMilliseconds( started ) >=
+                loginMilliseconds + COMMAND_READY_DELAY_MILLISECONDS
+        )
         {
             local->Chat( tString( chatCommand.c_str() ) );
             commandSent = true;

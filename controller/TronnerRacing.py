@@ -68,6 +68,7 @@ MAX_FEDERATION_PLAYER_NAME_CHARACTERS = 128
 MAX_FEDERATION_CHAT_CHARACTERS = 512
 MAX_FEDERATION_RECORDS_PER_BATCH = 20
 MAX_FEDERATION_PREFERENCES_PER_BATCH = 100
+MAX_FEDERATION_CATALOG_EXCLUSIONS = 256
 MAX_FEDERATION_RECORD_KEY_CHARACTERS = 1024
 MAX_FEDERATION_RECORD_IDENTITY_CHARACTERS = 256
 MAX_FEDERATION_MAP_BYTES = 4 * 1024 * 1024
@@ -4824,7 +4825,11 @@ class TronnerRacing:
                 await self._handle_federation_command(server_id, payload)
             elif kind == "controller_message":
                 scope = str(payload.get("scope", ""))
-                if scope.startswith("federation_preference_"):
+                if scope.startswith("federation_catalog_exclusion_"):
+                    await self._handle_federation_catalog_exclusion_message(
+                        server_id, payload
+                    )
+                elif scope.startswith("federation_preference_"):
                     await self._handle_federation_preference_message(
                         server_id, payload
                     )
@@ -6621,6 +6626,132 @@ class TronnerRacing:
         return scheduled
 
     @staticmethod
+    def _validated_federation_catalog_exclusions(value: object) -> set[str]:
+        if (
+            not isinstance(value, list)
+            or len(value) > MAX_FEDERATION_CATALOG_EXCLUSIONS
+        ):
+            raise ValueError("invalid federation catalog exclusions")
+        exclusions: set[str] = set()
+        for raw_key in value:
+            if not isinstance(raw_key, str):
+                raise ValueError("invalid federation catalog exclusion key")
+            key = raw_key.strip()
+            if (
+                not key
+                or len(key) > 512
+                or not key.endswith(MAP_SUFFIX)
+                or key.startswith("/")
+                or ".." in Path(key).parts
+                or any(ord(character) < 32 for character in key)
+            ):
+                raise ValueError("invalid federation catalog exclusion key")
+            exclusions.add(key)
+        if len(exclusions) != len(value):
+            raise ValueError("duplicate federation catalog exclusion key")
+        return exclusions
+
+    async def _publish_federation_catalog_exclusions(
+        self,
+        target_server_id: str = "",
+    ) -> bool:
+        if not getattr(self, "federation_leader", False):
+            return False
+        exclusions = sorted(getattr(self, "excluded_map_keys", set()))
+        if len(exclusions) > MAX_FEDERATION_CATALOG_EXCLUSIONS:
+            LOG.error(
+                "refusing to publish %d catalog exclusions; maximum is %d",
+                len(exclusions),
+                MAX_FEDERATION_CATALOG_EXCLUSIONS,
+            )
+            return False
+        payload: dict[str, object] = {
+            "scope": "federation_catalog_exclusion_snapshot",
+            "exclusions": exclusions,
+        }
+        if target_server_id:
+            payload["target_server_id"] = target_server_id
+        return await self._publish_federation_control(
+            "controller_message", payload
+        )
+
+    async def _apply_federation_catalog_exclusions(
+        self,
+        exclusions: set[str],
+    ) -> None:
+        if exclusions == getattr(self, "excluded_map_keys", set()):
+            return
+        self.excluded_map_keys = set(exclusions)
+        self.excluded_map_reasons = {}
+        self.repository.excluded_keys = self.excluded_map_keys
+        self.store.set_json(
+            "excluded_map_keys", sorted(self.excluded_map_keys)
+        )
+        self.store.set_json("excluded_map_reasons", {})
+        await asyncio.to_thread(self.repository.scan)
+        self._reconcile_rotation()
+        LOG.info(
+            "applied leader catalog exclusions: %d excluded, %d available",
+            len(self.excluded_map_keys),
+            len(self.repository.catalog),
+        )
+
+    async def _handle_federation_catalog_exclusion_message(
+        self,
+        server_id: str,
+        payload: dict[str, object],
+    ) -> None:
+        scope = str(payload.get("scope", ""))
+        if scope == "federation_catalog_exclusion_request":
+            if self.federation_leader:
+                await self._publish_federation_catalog_exclusions(server_id)
+            return
+        if scope != "federation_catalog_exclusion_snapshot":
+            raise ValueError("invalid federation catalog exclusion scope")
+        if (
+            not self.federation_follower
+            or server_id != self.federation_leader_server_id
+            or str(payload.get("target_server_id", ""))
+            not in {"", self.federation_local_server_id}
+        ):
+            return
+        exclusions = self._validated_federation_catalog_exclusions(
+            payload.get("exclusions")
+        )
+        map_lock = getattr(self, "map_lock", None)
+        if map_lock is None:
+            await self._apply_federation_catalog_exclusions(exclusions)
+        else:
+            async with map_lock:
+                await self._apply_federation_catalog_exclusions(exclusions)
+        complete = getattr(
+            self, "_federation_catalog_exclusion_complete", None
+        )
+        if complete is not None:
+            complete.set()
+
+    async def federation_catalog_exclusion_sync(self) -> None:
+        if self.federation_role == "off":
+            return
+        if self.federation_leader:
+            while True:
+                await self._publish_federation_catalog_exclusions()
+                await asyncio.sleep(30.0)
+        self._federation_catalog_exclusion_complete = asyncio.Event()
+        while not self._federation_catalog_exclusion_complete.is_set():
+            await self._publish_federation_control(
+                "controller_message",
+                {"scope": "federation_catalog_exclusion_request"},
+            )
+            try:
+                await asyncio.wait_for(
+                    self._federation_catalog_exclusion_complete.wait(),
+                    timeout=2.0,
+                )
+            except TimeoutError:
+                continue
+
+    @staticmethod
     def _federation_preference_key(
         preference_type: str,
         identity_key: str,
@@ -7597,7 +7728,7 @@ class TronnerRacing:
                 partial.append(row)
         return exact or partial
 
-    def _exclude_map_key(self, key: str, reason: str = "") -> None:
+    async def _exclude_map_key(self, key: str, reason: str = "") -> None:
         """Persistently remove one canonical resource from every map selector."""
         self.excluded_map_keys.add(key)
         if not hasattr(self, "excluded_map_reasons"):
@@ -7616,6 +7747,7 @@ class TronnerRacing:
         self.queue = collections.deque(item for item in self.queue if item != key)
         self.cycle_played.discard(key)
         self._save_rotation()
+        await self._publish_federation_catalog_exclusions()
 
     def _reconcile_rotation(self) -> None:
         available = set(self.repository.catalog)
@@ -7911,7 +8043,7 @@ class TronnerRacing:
             # catalog. The durable local exclusion remains authoritative for
             # this server until a later admin/retry reconciles Firebase.
             LOG.exception("unable to publish failed-map exclusion to Firebase")
-        self._exclude_map_key(
+        await self._exclude_map_key(
             target_key,
             "Server automatically deactivated a map that failed to load",
         )
@@ -13186,6 +13318,7 @@ class TronnerRacing:
                 LOG.exception("removing map exclusion failed for %s", key)
                 await self.private(player, f"Removing exclusion failed: {exc}")
                 return
+        await self._publish_federation_catalog_exclusions()
         await self.broadcast(
             f"{player.record_name} returned {selector} by {author} "
             f"[{version}] to the map pool."
@@ -13257,7 +13390,7 @@ class TronnerRacing:
             LOG.exception("publishing map exclusion failed for %s", key)
             await self.private(player, f"Excluding map failed: {exc}")
             return
-        self._exclude_map_key(key, status_reason)
+        await self._exclude_map_key(key, status_reason)
         await self.broadcast(
             f"{player.record_name} excluded {name} from the map pool."
             + (f" Reason: {reason}" if reason else "")
@@ -14075,6 +14208,10 @@ class TronnerRacing:
             asyncio.create_task(
                 self.federation_preference_sync(),
                 name="federation-preference-sync",
+            ),
+            asyncio.create_task(
+                self.federation_catalog_exclusion_sync(),
+                name="federation-catalog-exclusion-sync",
             ),
             asyncio.create_task(
                 self.helpful_message_announcer(),

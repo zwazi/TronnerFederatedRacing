@@ -112,6 +112,82 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         controller._publish_federation_control = AsyncMock(return_value=True)
         return controller
 
+    @staticmethod
+    def catalog_exclusion_controller(role="follower"):
+        controller = follower_controller()
+        controller.federation_role = role
+        if role == "leader":
+            controller.federation_local_server_id = "region-a"
+            controller.federation_leader_server_id = "region-a"
+            controller.federation_remote_server_id = "region-b"
+            controller.federation_remote_regions = {"region-b": "B"}
+        controller.excluded_map_keys = set()
+        controller.excluded_map_reasons = {}
+        controller.store = MemoryStore()
+        controller.repository = SimpleNamespace(
+            excluded_keys=set(),
+            catalog={"existing": object()},
+            scan=Mock(),
+        )
+        controller._reconcile_rotation = Mock()
+        controller.map_lock = asyncio.Lock()
+        controller._publish_federation_control = AsyncMock(return_value=True)
+        return controller
+
+    async def test_leader_answers_catalog_exclusion_request_for_origin(self):
+        controller = self.catalog_exclusion_controller("leader")
+        controller.excluded_map_keys = {
+            "Tester/maps/Second-v2.aamap.xml",
+            "Tester/maps/First-v1.aamap.xml",
+        }
+
+        await controller._handle_federation_catalog_exclusion_message(
+            "region-b",
+            {"scope": "federation_catalog_exclusion_request"},
+        )
+
+        controller._publish_federation_control.assert_awaited_once_with(
+            "controller_message",
+            {
+                "scope": "federation_catalog_exclusion_snapshot",
+                "exclusions": [
+                    "Tester/maps/First-v1.aamap.xml",
+                    "Tester/maps/Second-v2.aamap.xml",
+                ],
+                "target_server_id": "region-b",
+            },
+        )
+
+    async def test_follower_replaces_local_exclusions_with_leader_snapshot(self):
+        controller = self.catalog_exclusion_controller()
+        controller.excluded_map_keys = {"Stale/maps/Local-v1.aamap.xml"}
+        controller._federation_catalog_exclusion_complete = asyncio.Event()
+        expected = {
+            "Tester/maps/First-v1.aamap.xml",
+            "Tester/maps/Second-v2.aamap.xml",
+        }
+
+        await controller._handle_federation_catalog_exclusion_message(
+            "region-a",
+            {
+                "scope": "federation_catalog_exclusion_snapshot",
+                "target_server_id": "region-b",
+                "exclusions": sorted(expected),
+            },
+        )
+
+        self.assertEqual(controller.excluded_map_keys, expected)
+        self.assertEqual(controller.repository.excluded_keys, expected)
+        self.assertEqual(
+            controller.store.values["excluded_map_keys"], sorted(expected)
+        )
+        self.assertEqual(controller.store.values["excluded_map_reasons"], {})
+        controller.repository.scan.assert_called_once_with()
+        controller._reconcile_rotation.assert_called_once_with()
+        self.assertTrue(
+            controller._federation_catalog_exclusion_complete.is_set()
+        )
+
     async def test_follower_preference_update_is_applied_and_echoed_by_leader(self):
         controller = self.preference_controller("leader")
         key = controller._federation_preference_key(

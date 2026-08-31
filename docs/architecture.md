@@ -41,6 +41,7 @@ without pretending every event is global.
 | State | Authority | Distribution |
 | --- | --- | --- |
 | Map choice, timer, queue, global commands | leader controller | authenticated control packets |
+| Rotation exclusions | leader controller | requested snapshot on follower start, immediate and periodic authenticated snapshots |
 | Exact selected map XML | leader immutable mirror | follower fetch over the private overlay, authenticated SHA-256 in `map_prepare` |
 | Local players, finishes, respawns | each local engine/controller | normalized edges and snapshots |
 | Remote cycle visuals | each local engine | best-effort coalesced UDP telemetry |
@@ -76,9 +77,10 @@ source repository.
 
 The sidecar keeps high-rate cycle traffic separate from low-rate controller
 delivery. Cycle positions may be coalesced or dropped and refreshed by the next
-sample. Controller events use an independent local socket and bounded retries,
-so a busy engine import queue cannot discard a command reply or preference
-update.
+sample. Controller events use an independent local socket and a bounded FIFO;
+the forwarder waits through a local controller reload instead of discarding the
+front event. A busy engine import queue therefore cannot block or discard a
+command reply, preference update, or catalog-authority snapshot.
 
 ## Failure behavior
 

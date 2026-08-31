@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sqlite3
 import stat
 import time
 from pathlib import Path
@@ -44,6 +45,103 @@ def is_socket(path: Path) -> bool:
         return stat.S_ISSOCK(path.stat().st_mode)
     except OSError:
         return False
+
+
+def catalog_summary(controller: dict) -> tuple[dict[str, object], list[str]]:
+    """Verify the effective Firebase catalog and its public map mirror."""
+    failures: list[str] = []
+    details: dict[str, object] = {}
+    if str(controller.get("repository_source", "git")).casefold() != "firebase":
+        return details, failures
+    catalog_root = Path(str(controller.get("firebase_catalog_dir", "")))
+    manifest_path = catalog_root / "current" / ".catalog.json"
+    try:
+        manifest = load_object(manifest_path)
+        maps = manifest.get("maps")
+        if not isinstance(maps, list):
+            raise ValueError("maps must be a list")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return details, [f"Firebase catalog: {exc}"]
+
+    active: dict[str, str] = {}
+    for item in maps:
+        if not isinstance(item, dict) or item.get("status") != "active":
+            continue
+        key = item.get("resourcePath")
+        digest = item.get("sha256")
+        if (
+            not isinstance(key, str)
+            or not key
+            or not isinstance(digest, str)
+            or len(digest) != 64
+        ):
+            failures.append("Firebase catalog contains an invalid active map")
+            continue
+        active[key] = digest
+
+    exclusions: set[str] = set()
+    database = Path(str(controller.get("database", "")))
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                ("excluded_map_keys",),
+            ).fetchone()
+        finally:
+            connection.close()
+        values = json.loads(row[0]) if row else []
+        if not isinstance(values, list) or not all(
+            isinstance(value, str) for value in values
+        ):
+            raise ValueError("excluded_map_keys must be a string list")
+        exclusions = set(values)
+    except (OSError, sqlite3.Error, ValueError, json.JSONDecodeError) as exc:
+        failures.append(f"catalog exclusions: {exc}")
+
+    effective = sorted(set(active) - exclusions)
+    digest_input = "".join(f"{key}\0{active[key]}\n" for key in effective)
+    try:
+        catalog_version = int(manifest.get("catalogVersion", 0) or 0)
+    except (TypeError, ValueError):
+        catalog_version = 0
+        failures.append("Firebase catalog has an invalid version")
+    details.update(
+        {
+            "catalog_generation": str(manifest.get("generation", "")),
+            "catalog_version": catalog_version,
+            "catalog_active_maps": len(active),
+            "catalog_exclusions": len(exclusions),
+            "catalog_effective_maps": len(effective),
+            "catalog_effective_sha256": hashlib.sha256(
+                digest_input.encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+
+    public_root = Path(str(controller.get("public_dir", "")))
+    missing: list[str] = []
+    mismatched: list[str] = []
+    for key in effective:
+        path = public_root / key
+        if not path.is_file():
+            missing.append(key)
+            continue
+        if hashlib.sha256(path.read_bytes()).hexdigest() != active[key]:
+            mismatched.append(key)
+    details["catalog_public_missing"] = len(missing)
+    details["catalog_public_mismatched"] = len(mismatched)
+    if missing:
+        failures.append(
+            "effective maps missing from public mirror: "
+            + ", ".join(missing[:5])
+        )
+    if mismatched:
+        failures.append(
+            "effective maps differ from Firebase catalog: "
+            + ", ".join(mismatched[:5])
+        )
+    return details, failures
 
 
 def main() -> int:
@@ -153,6 +251,11 @@ def main() -> int:
             failures.append(f"{label} socket is unavailable")
     details["sockets"] = socket_health
 
+    if controller:
+        catalog_details, catalog_failures = catalog_summary(controller)
+        details.update(catalog_details)
+        failures.extend(catalog_failures)
+
     ladderlog = Path(str(controller.get("ladderlog", "")))
     map_key = latest_current_map(ladderlog) if ladderlog.is_file() else ""
     details["current_map"] = map_key
@@ -191,6 +294,12 @@ def main() -> int:
             )
         if map_key:
             print(f"  map: {map_key}")
+        if "catalog_effective_maps" in details:
+            print(
+                "  catalog: "
+                f"{details['catalog_effective_maps']} effective map(s), "
+                f"hash={details['catalog_effective_sha256']}"
+            )
         for failure in failures:
             print(f"  FAIL: {failure}")
     return 0 if not failures else 1
