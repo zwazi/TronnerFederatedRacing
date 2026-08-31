@@ -54,12 +54,17 @@ server ID and region label to the cluster `members` registry distributed to
 every node. Store each bundle's `secrets` files only in that node's private
 installer secrets directory.
 
+Set the follower node's `federation.leader_resource_base_url` to the leader's
+private overlay map mirror, for example `http://10.77.0.1:8080/`. The renderer
+rejects a URL whose host is not the configured leader overlay peer.
+
 ## 4. Commission unlisted
 
 1. Install with `master_list` false.
 2. Validate sidecar configuration and key permissions.
 3. Confirm signed heartbeat and player snapshots in both directions and
    origin-preserving relay between the new and existing followers.
+   Run `tools/check_federation_health.py` on every node; all must be healthy.
 4. Run disposable identity/color/cycle and synchronized-round smoke tests.
 5. Confirm every node receives the same map and releases the round with a
    synchronized marker rather than its safety timeout.

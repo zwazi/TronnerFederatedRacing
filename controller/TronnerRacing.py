@@ -69,6 +69,7 @@ MAX_FEDERATION_CHAT_CHARACTERS = 512
 MAX_FEDERATION_RECORDS_PER_BATCH = 20
 MAX_FEDERATION_RECORD_KEY_CHARACTERS = 1024
 MAX_FEDERATION_RECORD_IDENTITY_CHARACTERS = 256
+MAX_FEDERATION_MAP_BYTES = 4 * 1024 * 1024
 SERVER_CONSOLE_HISTORY_LINES = 250
 SERVER_CONSOLE_INITIAL_LINES = 100
 SERVER_CONSOLE_BATCH_SIZE = 25
@@ -3956,6 +3957,75 @@ class MapRepository:
             if not cached_dtd.exists():
                 shutil.copy2(dtd, cached_dtd)
 
+    def install_federated_resource(
+        self,
+        key: str,
+        data: bytes,
+        expected_sha256: str,
+    ) -> MapEntry:
+        """Validate and immutably install one leader-selected map resource."""
+
+        if (
+            not isinstance(data, bytes)
+            or not data
+            or len(data) > MAX_FEDERATION_MAP_BYTES
+        ):
+            raise ValueError("invalid federated map size")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ValueError("invalid federated map digest")
+        actual_sha256 = hashlib.sha256(data).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValueError("federated map digest mismatch")
+
+        temporary_root = self.revision_dir / ".federation-incoming"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        temporary = temporary_root / f"{actual_sha256}.{os.getpid()}.tmp"
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            entry = self._parse_map(temporary, source_path=key)
+            if entry.key != key:
+                raise ValueError(
+                    f"federated map identity mismatch: expected {key}, got {entry.key}"
+                )
+            install_immutable_file(temporary, self.public_dir / key)
+            install_immutable_file(temporary, self.cache_dir / key)
+            for dtd in self.public_dir.glob("*.dtd"):
+                cached_dtd = self.cache_dir / dtd.name
+                if not cached_dtd.exists():
+                    shutil.copy2(dtd, cached_dtd)
+            return self._parse_external(self.cache_dir / key, key)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+    def fetch_federated_resource(
+        self,
+        base_url: str,
+        key: str,
+        expected_sha256: str,
+        timeout_seconds: float = 10.0,
+    ) -> MapEntry:
+        """Fetch one authenticated leader selection over the private overlay."""
+
+        parsed = urllib.parse.urlsplit(base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("invalid federation leader resource URL")
+        quoted_key = "/".join(
+            urllib.parse.quote(component, safe="-._~")
+            for component in key.split("/")
+        )
+        url = urllib.parse.urljoin(base_url.rstrip("/") + "/", quoted_key)
+        request = urllib.request.Request(
+            url,
+            headers={"Accept": "application/xml, text/xml, */*"},
+        )
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            data = response.read(MAX_FEDERATION_MAP_BYTES + 1)
+        return self.install_federated_resource(key, data, expected_sha256)
+
     def find_by_spec(self, spec: str) -> MapEntry | None:
         key = spec.split("(", 1)[0]
         if key in self.catalog:
@@ -4403,6 +4473,7 @@ class TronnerRacing:
         self.federation_remote_round_ready_at = 0.0
         self.federation_round_last_release_at = 0.0
         self.federation_round_release_key = ""
+        self.federation_round_release_at = 0.0
         self.federation_remote_players: dict[str, dict[str, object]] = {}
         self.federation_remote_round_ready: dict[str, tuple[str, float]] = {}
         self.federation_remote_maps: dict[str, str] = {}
@@ -4425,6 +4496,30 @@ class TronnerRacing:
         self._federation_publish_transport: socket.socket | None = None
         self.federation_prepared_map_key: str | None = None
         self.federation_prepared_map_activate_ns = 0
+        self.federation_prepared_map_sha256 = ""
+        self.federation_map_prepare_lock = asyncio.Lock()
+        self.federation_leader_current_map_key = ""
+        self.federation_leader_next_map_key = ""
+        self._federation_server_state_last_publish_monotonic = 0.0
+        self.federation_leader_resource_base_url = str(
+            federation.get("leader_resource_base_url", "")
+        ).strip()
+        self.federation_resource_timeout_seconds = max(
+            1.0,
+            min(
+                30.0,
+                float(federation.get("resource_timeout_seconds", 10.0)),
+            ),
+        )
+        if self.federation_leader_resource_base_url:
+            parsed_leader_resources = urllib.parse.urlsplit(
+                self.federation_leader_resource_base_url
+            )
+            if (
+                parsed_leader_resources.scheme not in {"http", "https"}
+                or not parsed_leader_resources.netloc
+            ):
+                raise ValueError("invalid federation leader_resource_base_url")
         self.federation_catalog_refresh_after_monotonic = 0.0
         self._federation_event_tasks: set[asyncio.Task] = set()
         self._federation_record_wakeup = asyncio.Event()
@@ -4546,15 +4641,23 @@ class TronnerRacing:
             self.federation_map_prepare_lead_seconds * 1_000_000_000
         )
         transition_id = f"{activation_at_ns:x}-{entry.key.encode('utf-8').hex()[:24]}"
-        published = await self._publish_federation_control(
-            "map_prepare",
-            {
-                "transition_id": transition_id,
-                "map_key": entry.key,
-                "size_factor": size_factor,
-                "activate_at_ns": activation_at_ns,
-            },
-        )
+        map_sha256 = hashlib.sha256(entry.local_path.read_bytes()).hexdigest()
+        payload = {
+            "transition_id": transition_id,
+            "map_key": entry.key,
+            "map_sha256": map_sha256,
+            "size_factor": size_factor,
+            "activate_at_ns": activation_at_ns,
+        }
+        published = False
+        # Map preparation is idempotent and immutable. Three compact copies
+        # avoid a second catalog synchronization protocol for UDP loss.
+        for attempt in range(3):
+            published = await self._publish_federation_control(
+                "map_prepare", payload
+            ) or published
+            if attempt < 2:
+                await asyncio.sleep(0.03)
         if not published:
             # Observed CURRENT_MAP remains the fail-safe synchronization path;
             # do not delay the live leader if its local sidecar is unavailable.
@@ -4671,6 +4774,11 @@ class TronnerRacing:
                 "countdown_state": "countdown",
                 "round_sync": "round_sync",
             }.get(kind)
+            if (
+                kind == "controller_message"
+                and payload.get("scope") == "server_state"
+            ):
+                state_bucket = "server_state"
             if kind == "player_event":
                 state_bucket = (
                     "round"
@@ -5198,6 +5306,30 @@ class TronnerRacing:
         payload: dict[str, object],
     ) -> None:
         scope = str(payload.get("scope", ""))
+        if scope == "server_state":
+            if not self.federation_follower:
+                return
+            current_map_key = str(payload.get("current_map_key", ""))
+            next_map_key = str(payload.get("next_map_key", ""))
+            for map_key in (current_map_key, next_map_key):
+                if (
+                    len(map_key) > 512
+                    or "\x00" in map_key
+                    or "\r" in map_key
+                    or "\n" in map_key
+                ):
+                    return
+            changed = (
+                self.federation_leader_current_map_key != current_map_key
+                or self.federation_leader_next_map_key != next_map_key
+            )
+            self.federation_leader_current_map_key = current_map_key
+            self.federation_leader_next_map_key = next_map_key
+            if changed:
+                # Force the one-second refresher to replace any stale local
+                # SERVER_OPTIONS immediately after authoritative state lands.
+                self._server_options_last = None
+            return
         if scope not in {"broadcast", "broadcast_block", "private", "private_block", "center", "center_private"}:
             return
         target_server_id = str(payload.get("target_server_id", ""))
@@ -5585,6 +5717,7 @@ class TronnerRacing:
             return
         release_at = time.time() + self.federation_round_sync_release_lead_seconds
         self.federation_round_release_key = map_key
+        self.federation_round_release_at = release_at
         self.federation_round_last_release_at = release_at
         await self.sink.send(f"FEDERATION_ROUND_RELEASE_AT {release_at:.6f}")
         await self._publish_round_sync_reliably(
@@ -5661,7 +5794,17 @@ class TronnerRacing:
         now = time.time()
         if not math.isfinite(release_at) or release_at < now - 5 or release_at > now + 5:
             return
+        if (
+            self.federation_round_release_key == map_key
+            and math.isclose(
+                getattr(self, "federation_round_release_at", 0.0),
+                release_at,
+                abs_tol=0.000001,
+            )
+        ):
+            return
         self.federation_round_release_key = map_key
+        self.federation_round_release_at = release_at
         await self.sink.send(f"FEDERATION_ROUND_RELEASE_AT {release_at:.6f}")
         LOG.info(
             "accepted synchronized federation round release: map=%s at=%.6f",
@@ -5807,6 +5950,7 @@ class TronnerRacing:
             if self.federation_prepared_map_key == entry.key:
                 self.federation_prepared_map_key = None
                 self.federation_prepared_map_activate_ns = 0
+                self.federation_prepared_map_sha256 = ""
             return
         if self.transitioning and self.transition_target_key == entry.key:
             return
@@ -5819,6 +5963,7 @@ class TronnerRacing:
                 if self.federation_prepared_map_key == entry.key:
                     self.federation_prepared_map_key = None
                     self.federation_prepared_map_activate_ns = 0
+                    self.federation_prepared_map_sha256 = ""
                 return
             if self.transitioning and self.transition_target_key == entry.key:
                 return
@@ -5836,6 +5981,7 @@ class TronnerRacing:
             if self.federation_prepared_map_key == entry.key:
                 self.federation_prepared_map_key = None
                 self.federation_prepared_map_activate_ns = 0
+                self.federation_prepared_map_sha256 = ""
             self.round_started_epoch = None
             self.deadline_epoch = None
             self.store.set_json("current_key", entry.key)
@@ -5859,12 +6005,64 @@ class TronnerRacing:
                 federate=False,
             )
 
-    async def _find_federation_map(self, map_key: str) -> MapEntry | None:
-        """Resolve a leader map, refreshing Firebase once when it is new."""
+    async def _find_federation_map(
+        self,
+        map_key: str,
+        expected_sha256: str = "",
+    ) -> MapEntry | None:
+        """Resolve the exact leader map, using Firebase only as a fallback."""
+
         entry = self.repository.find_by_spec(map_key)
-        firebase = getattr(self.repository, "firebase", None)
-        if entry is not None or firebase is None:
+        if entry is not None and expected_sha256:
+            actual_sha256 = hashlib.sha256(entry.local_path.read_bytes()).hexdigest()
+            if actual_sha256 != expected_sha256:
+                LOG.error(
+                    "local immutable map differs from leader digest: "
+                    "map=%s local=%s leader=%s",
+                    map_key,
+                    actual_sha256,
+                    expected_sha256,
+                )
+                entry = None
+        if entry is not None:
             return entry
+
+        leader_base_url = getattr(
+            self, "federation_leader_resource_base_url", ""
+        )
+        if expected_sha256 and leader_base_url:
+            async with self.map_lock:
+                entry = self.repository.find_by_spec(map_key)
+                if entry is not None:
+                    actual_sha256 = hashlib.sha256(
+                        entry.local_path.read_bytes()
+                    ).hexdigest()
+                    if actual_sha256 == expected_sha256:
+                        return entry
+                try:
+                    entry = await asyncio.to_thread(
+                        self.repository.fetch_federated_resource,
+                        leader_base_url,
+                        map_key,
+                        expected_sha256,
+                        getattr(self, "federation_resource_timeout_seconds", 10.0),
+                    )
+                    LOG.info(
+                        "installed leader map over federation overlay: "
+                        "map=%s sha256=%s",
+                        map_key,
+                        expected_sha256,
+                    )
+                    return entry
+                except Exception:
+                    LOG.exception(
+                        "unable to fetch exact leader map over federation overlay: %s",
+                        map_key,
+                    )
+
+        firebase = getattr(self.repository, "firebase", None)
+        if firebase is None:
+            return None
         if time.monotonic() < getattr(
             self,
             "federation_catalog_refresh_after_monotonic",
@@ -5940,9 +6138,8 @@ class TronnerRacing:
             or "\n" in map_key
         ):
             return
-        entry = await self._find_federation_map(map_key)
-        if entry is None:
-            LOG.warning("leader prepared map is unavailable locally: %s", map_key)
+        map_sha256 = str(payload.get("map_sha256", ""))
+        if map_sha256 and not re.fullmatch(r"[0-9a-f]{64}", map_sha256):
             return
         try:
             size_factor = float(payload.get("size_factor", 0.0))
@@ -5950,14 +6147,28 @@ class TronnerRacing:
             return
         if not math.isfinite(size_factor) or abs(size_factor) > 1000:
             return
-        await asyncio.to_thread(self.repository.cache_for_server, entry)
-        self.federation_prepared_map_key = entry.key
-        self.federation_prepared_map_activate_ns = activate_at_ns
-        LOG.info(
-            "pre-cached leader map: map=%s leader_activate_at_ns=%d",
-            entry.key,
-            activate_at_ns,
-        )
+        async with self.federation_map_prepare_lock:
+            if (
+                self.federation_prepared_map_key == map_key
+                and self.federation_prepared_map_activate_ns == activate_at_ns
+                and self.federation_prepared_map_sha256 == map_sha256
+            ):
+                return
+            entry = await self._find_federation_map(map_key, map_sha256)
+            if entry is None:
+                LOG.warning(
+                    "leader prepared map is unavailable locally: %s", map_key
+                )
+                return
+            await asyncio.to_thread(self.repository.cache_for_server, entry)
+            self.federation_prepared_map_key = entry.key
+            self.federation_prepared_map_activate_ns = activate_at_ns
+            self.federation_prepared_map_sha256 = map_sha256
+            LOG.info(
+                "pre-cached leader map: map=%s leader_activate_at_ns=%d",
+                entry.key,
+                activate_at_ns,
+            )
 
     def _apply_advertised_game_encoding(self, advertised: object) -> None:
         current = getattr(
@@ -6777,11 +6988,29 @@ class TronnerRacing:
 
     def _server_options_text(self) -> str:
         current = self.current
-        next_entry = self._peek_next()
         current_name = self._display_map_name(current) if current else "Unknown"
         current_author = current.author if current else "Unknown"
-        next_name = self._display_map_name(next_entry) if next_entry else "Unknown"
-        next_author = next_entry.author if next_entry else "Unknown"
+        if getattr(self, "federation_follower", False):
+            next_key = ""
+            if (
+                current is not None
+                and getattr(self, "federation_leader_current_map_key", "")
+                == current.key
+            ):
+                next_key = getattr(self, "federation_leader_next_map_key", "")
+            next_entry = self.repository.catalog.get(next_key) if next_key else None
+            if next_entry is not None:
+                next_name = self._display_map_name(next_entry)
+                next_author = next_entry.author
+            elif next_key:
+                next_name, next_author, _version = self._excluded_key_parts(next_key)
+                next_name = next_name.replace("_", " ")
+            else:
+                next_name = next_author = "Unknown"
+        else:
+            next_entry = self._peek_next()
+            next_name = self._display_map_name(next_entry) if next_entry else "Unknown"
+            next_author = next_entry.author if next_entry else "Unknown"
         return clean_console_text(
             f"Current map: {current_name} by {current_author} | "
             f"Next Map: {next_name} by {next_author}"
@@ -6789,12 +7018,33 @@ class TronnerRacing:
 
     async def _refresh_server_options_once(self) -> None:
         options = self._server_options_text()
-        if options == self._server_options_last:
+        changed = options != self._server_options_last
+        if changed:
+            await self.sink.send(
+                f"SERVER_OPTIONS {readline_console_text(options)}"
+            )
+            self._server_options_last = options
+        if not getattr(self, "federation_leader", False):
             return
-        await self.sink.send(
-            f"SERVER_OPTIONS {readline_console_text(options)}"
+        now = time.monotonic()
+        last_publish = getattr(
+            self,
+            "_federation_server_state_last_publish_monotonic",
+            0.0,
         )
-        self._server_options_last = options
+        if not changed and now - last_publish < 10.0:
+            return
+        next_entry = self._peek_next()
+        published = await self._publish_federation_control(
+            "controller_message",
+            {
+                "scope": "server_state",
+                "current_map_key": self.current.key if self.current else "",
+                "next_map_key": next_entry.key if next_entry else "",
+            },
+        )
+        if published:
+            self._federation_server_state_last_publish_monotonic = now
 
     async def server_options_refresher(self) -> None:
         interval = max(
@@ -12748,7 +12998,7 @@ class TronnerRacing:
 
     async def catalog_state_monitor(self) -> None:
         """Watch one version document instead of polling full collections."""
-        if self.repository.firebase is None:
+        if self.repository.firebase is None or self.federation_follower:
             await self.stop_event.wait()
             return
         interval = max(

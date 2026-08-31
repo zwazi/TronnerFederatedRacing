@@ -40,3 +40,17 @@ python3 controller/test_three_region_transport.py
 These tests bind only loopback ports, never advertise to the master list, use
 temporary runtime directories, and clean them on exit. They do not contact a
 production controller, peer, Firebase project, or map repository.
+
+## Live node check
+
+After deployment, run this on every region:
+
+```sh
+python3 /opt/TronnerRacing/check_federation_health.py
+```
+
+A healthy result proves that fresh authenticated heartbeats and presence
+snapshots from every other semantic origin reached that node, all four local
+Unix sockets exist, and the current map has identical bytes in the engine cache
+and public mirror. Run it on all nodes to prove every required direction. The
+check is read-only and does not restart or reload anything.
