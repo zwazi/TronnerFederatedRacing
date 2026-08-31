@@ -68,6 +68,8 @@ rejects a URL whose host is not the configured leader overlay peer.
 4. Run disposable identity/color/cycle and synchronized-round smoke tests.
 5. Confirm the new follower completes a leader preference snapshot before
    accepting players; saved spawns and start modes must match an existing node.
+   Confirm its effective catalog count and digest match the leader after the
+   leader exclusion snapshot is applied.
 6. Confirm every node receives the same map and releases the round with a
    synchronized marker rather than its safety timeout.
 7. Test revocation by stopping the tunnel or removing the peer firewall rule.

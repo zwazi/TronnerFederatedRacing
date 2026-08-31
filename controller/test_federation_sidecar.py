@@ -427,6 +427,28 @@ class LocalForwarderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(attempts), 3)
         forwarder.close()
 
+    async def test_controller_event_waits_past_previous_drop_deadline(self):
+        forwarder = LocalEventForwarder(follower_config())
+        attempts = []
+
+        async def delayed_send(path, data):
+            attempts.append((path, data))
+            return len(attempts) >= 60
+
+        forwarder._send = delayed_send
+        previous_delay = federation_sidecar.LOCAL_CONTROL_RETRY_SECONDS
+        federation_sidecar.LOCAL_CONTROL_RETRY_SECONDS = 0
+        try:
+            await asyncio.wait_for(
+                forwarder._send_control(Path("/tmp/controller.sock"), b"event"),
+                timeout=0.1,
+            )
+        finally:
+            federation_sidecar.LOCAL_CONTROL_RETRY_SECONDS = previous_delay
+
+        self.assertEqual(len(attempts), 60)
+        forwarder.close()
+
     async def test_backlogged_local_consumer_does_not_block_forwarding(self):
         class BackloggedSocket:
             def __init__(self):

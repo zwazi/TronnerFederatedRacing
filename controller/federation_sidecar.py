@@ -45,6 +45,7 @@ MAX_CHAT_CHARACTERS = 512
 MAX_PLAYER_NAME_CHARACTERS = 128
 MAX_BOOTSTRAP_BYTES = 2 * 1024 * 1024
 MAX_LOCAL_EVENT_BYTES = 16_384
+LOCAL_CONTROL_RETRY_SECONDS = 0.01
 PLAYER_TOKEN_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,128}$")
 MAX_FEDERATION_PEERS = 15
 ENGINE_METADATA_REFRESH_NS = 2_000_000_000
@@ -1507,13 +1508,16 @@ class LocalEventForwarder:
             return False
 
     async def _send_control(self, path: Path, data: bytes) -> None:
-        """Retry low-rate controller events without blocking motion traffic."""
-        deadline = time.monotonic() + 0.5
+        """Wait for the controller without blocking independent motion traffic.
+
+        A graceful controller reload can take longer than the previous
+        half-second deadline while it verifies the map catalog.  The inbound
+        control queue is already bounded and cycle forwarding has its own
+        task, so retaining this one FIFO event until the local controller is
+        ready is both bounded and preserves command replies and state edges.
+        """
         while not await self._send(path, data):
-            if time.monotonic() >= deadline:
-                LOG.error("dropping federated controller event after local backlog")
-                return
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(LOCAL_CONTROL_RETRY_SECONDS)
 
     async def controller(self, packet: Packet) -> None:
         assert self.config.controller_import_socket is not None
