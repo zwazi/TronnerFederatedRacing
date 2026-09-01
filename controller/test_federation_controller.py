@@ -240,14 +240,14 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
                         "updated_at_ns": 1,
                         "source_server_id": "region-a",
                         "operation": "set",
-                        "value": "respawn",
+                        "value": "countdown 12",
                     }
                 ],
             },
         )
 
         self.assertEqual(
-            controller.start_preferences["auth:racer@forums"], "respawn"
+            controller.start_preferences["auth:racer@forums"], "countdown 12"
         )
         self.assertTrue(controller._federation_preference_snapshot_complete.is_set())
 
