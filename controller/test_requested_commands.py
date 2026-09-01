@@ -156,7 +156,9 @@ class RequestedBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 await controller._run_final_countdown()
                 self.assertIn(
                     "CONSOLE_MESSAGE Map time expired. "
-                    "Respawning is disabled. Final countdown: 90 seconds.",
+                    "Respawning is disabled. Final countdown: 90 seconds. "
+                    "Use /rate # for the current map or /rate [map] # "
+                    "for a specific map.",
                     [
                         plain_console_text(command)
                         for command in controller.sink.commands

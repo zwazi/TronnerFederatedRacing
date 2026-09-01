@@ -109,7 +109,12 @@ class ReportTests(unittest.IsolatedAsyncioTestCase):
 
             with mock.patch(
                 "TronnerRacing.send_resend_report"
-            ) as send:
+            ) as send, mock.patch(
+                "TronnerRacing.asyncio.to_thread",
+                new=mock.AsyncMock(
+                    side_effect=lambda function, *args: function(*args)
+                ),
+            ):
                 await controller._command_report(
                     player, "A player is griefing.", access_level=1
                 )
@@ -181,6 +186,45 @@ class ReportTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("wait 30 seconds", admin_message)
         self.assertIn("wait 300 seconds", player_message)
+
+    async def test_suggest_reuses_resend_configuration_and_quota(self):
+        controller = object.__new__(TronnerRacing)
+        controller.sink = Sink()
+        controller.config = {
+            "report_recipient": "owner@example.com",
+            "report_sender": "Reports <onboarding@resend.dev>",
+            "report_timezone": "America/Phoenix",
+        }
+        controller.report_last_sent = {}
+        controller.report_success_epochs = collections.deque()
+        controller.store = SimpleNamespace(set_json=lambda key, value: None)
+        controller.current = SimpleNamespace(name="Glacier")
+        controller._display_map_name = lambda entry: entry.name
+        controller._report_api_key = lambda: "test-key"
+        player = Player("racer", "Display Racer", auth_name="racer@forums")
+
+        with mock.patch("TronnerRacing.send_resend_report") as send, mock.patch(
+            "TronnerRacing.asyncio.to_thread",
+            new=mock.AsyncMock(
+                side_effect=lambda function, *args: function(*args)
+            ),
+        ):
+            await controller._command_suggest(
+                player, "Add a ghost racing mode.", access_level=20
+            )
+
+        send.assert_called_once()
+        _, recipient, sender, subject, body = send.call_args.args[:5]
+        self.assertEqual(recipient, "owner@example.com")
+        self.assertEqual(sender, "Reports <onboarding@resend.dev>")
+        self.assertIn("Feature suggestion", subject)
+        self.assertIn("Suggestion:\nAdd a ghost racing mode.", body)
+        self.assertEqual(len(controller.report_success_epochs), 1)
+        messages = [plain_console_text(item) for item in controller.sink.commands]
+        self.assertIn(
+            'PLAYER_MESSAGE racer "Your suggestion was sent. Thank you."',
+            messages,
+        )
 
 
 if __name__ == "__main__":
