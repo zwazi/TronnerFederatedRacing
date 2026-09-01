@@ -4335,6 +4335,23 @@ class TronnerRacing:
         self.queue: collections.deque[str] = collections.deque(
             self.store.get_json("queue", [])
         )
+        saved_pending_size_change = self.store.get_json(
+            "pending_size_change", {}
+        )
+        self.pending_size_change: dict[str, str] = (
+            {
+                key: str(saved_pending_size_change.get(key, ""))
+                for key in (
+                    "source_map_key",
+                    "target_map_key",
+                    "source_records_key",
+                    "target_records_key",
+                )
+            }
+            if isinstance(saved_pending_size_change, dict)
+            and saved_pending_size_change.get("target_map_key")
+            else {}
+        )
         self.cycle_played: set[str] = set(self.store.get_json("cycle_played", []))
         # Upgrade state written by versions that only persisted the remaining
         # rotation.  The active repository map has necessarily been consumed.
@@ -6380,6 +6397,8 @@ class TronnerRacing:
             if entry:
                 self.current = entry
                 self.current_spec = first_line
+                if self._pending_size_target_key() == entry.key:
+                    self._consume_pending_size_change(entry)
                 if (
                     self.transitioning
                     and self.transition_target_key == entry.key
@@ -7657,6 +7676,45 @@ class TronnerRacing:
         self.store.set_json("queue", list(self.queue))
         self.store.set_json("cycle_played", sorted(self.cycle_played))
 
+    def _pending_size_target_key(self) -> str | None:
+        pending = getattr(self, "pending_size_change", {})
+        if not isinstance(pending, dict):
+            return None
+        target = str(pending.get("target_map_key", "")).strip()
+        return target or None
+
+    def _clear_pending_size_change(self) -> None:
+        self.pending_size_change = {}
+        self.store.set_json("pending_size_change", {})
+
+    def _consume_pending_size_change(
+        self,
+        entry: MapEntry,
+    ) -> tuple[int, int] | None:
+        """Reset superseded records once the scheduled resized map activates."""
+        if self._pending_size_target_key() != entry.key:
+            return None
+        pending = self.pending_size_change
+        record_keys = []
+        for field in ("source_records_key", "target_records_key"):
+            key = str(pending.get(field, "")).strip()
+            if key and key not in record_keys:
+                record_keys.append(key)
+        reset_records = 0
+        reset_finishes = 0
+        for key in record_keys:
+            record_count, finish_count = self.store.reset_map(key)
+            reset_records += record_count
+            reset_finishes += finish_count
+        self._clear_pending_size_change()
+        LOG.info(
+            "activated resized map %s; reset %d records and %d finishes",
+            entry.key,
+            reset_records,
+            reset_finishes,
+        )
+        return reset_records, reset_finishes
+
     def _display_map_name(self, entry: MapEntry) -> str:
         repository = getattr(self, "repository", None)
         if repository is not None and hasattr(repository, "display_name"):
@@ -7853,6 +7911,11 @@ class TronnerRacing:
 
     def _peek_next(self) -> MapEntry | None:
         current_key = self.current.key if self.current else None
+        pending_size_key = self._pending_size_target_key()
+        if pending_size_key and pending_size_key != current_key:
+            pending_entry = self.repository.catalog.get(pending_size_key)
+            if pending_entry is not None:
+                return pending_entry
         for key in self.queue:
             if key != current_key:
                 return self.repository.catalog.get(key)
@@ -7938,6 +8001,22 @@ class TronnerRacing:
     def _take_next(self) -> MapEntry | None:
         current_key = self.current.key if self.current else None
         key = None
+        pending_size_key = self._pending_size_target_key()
+        if pending_size_key and pending_size_key != current_key:
+            if pending_size_key in self.repository.catalog:
+                key = pending_size_key
+                self.queue = collections.deque(
+                    item for item in self.queue if item != pending_size_key
+                )
+                self.rotation = collections.deque(
+                    item for item in self.rotation if item != pending_size_key
+                )
+            else:
+                LOG.error(
+                    "scheduled resized map is unavailable; clearing target: %s",
+                    pending_size_key,
+                )
+                self._clear_pending_size_change()
         while self.queue and key is None:
             candidate = self.queue.popleft()
             if candidate == current_key:
@@ -8177,6 +8256,7 @@ class TronnerRacing:
             size_factor = self._effective_map_size_factor(entry)
             await self._prepare_federated_leader_map(entry, size_factor)
             LOG.info("advancing to %s (%s)", entry.key, reason)
+            size_reset = self._consume_pending_size_change(entry)
             self._clear_final_countdown_state()
             self.current = entry
             self.current_spec = entry.key
@@ -8203,9 +8283,16 @@ class TronnerRacing:
                 "KILL_ALL",
                 "GET_CURRENT_MAP",
             )
-            await self.broadcast(
+            announcement = (
                 f"Next map: {self._display_map_name(entry)} by {entry.author}"
             )
+            if size_reset is not None:
+                reset_record_count, reset_finish_count = size_reset
+                announcement += (
+                    f". Resized revision activated; reset {reset_record_count} "
+                    f"records and {reset_finish_count} finish entries"
+                )
+            await self.broadcast(announcement)
 
     def _reset_attempts(self) -> None:
         for task in self.respawn_tasks.values():
@@ -13639,6 +13726,15 @@ class TronnerRacing:
         if not self.current:
             await self.private(player, "No active map is available to revise.")
             return
+        if not self._round_is_active():
+            await self.private(player, "The current map has not started yet.")
+            return
+        if self.transitioning:
+            await self.private(player, "A map change is already in progress.")
+            return
+        if self.final_countdown_active or self.final_countdown_announcement:
+            await self.private(player, "The end-of-map timer is already active.")
+            return
         delta = float(match.group(2)) * (1 if match.group(1) == "+" else -1)
         current_factor = self.current_size_factor
         if current_factor is None:
@@ -13662,9 +13758,27 @@ class TronnerRacing:
         async with self.map_lock:
             old_entry = self.current
             try:
+                # Firebase swaps the catalog snapshot after publishing the new
+                # immutable revision. Preserve the currently loaded XML in the
+                # engine cache so countdown route checks and reload recovery can
+                # still read the old revision until the transition completes.
+                await asyncio.to_thread(
+                    self.repository.cache_for_server, old_entry
+                )
+                preserved_old_entry = old_entry
+                cache_dir = getattr(self.repository, "cache_dir", None)
+                if isinstance(old_entry, MapEntry) and cache_dir is not None:
+                    cached_old_path = Path(cache_dir) / old_entry.key
+                    if cached_old_path.is_file():
+                        preserved_old_entry = dataclasses.replace(
+                            old_entry,
+                            local_path=cached_old_path,
+                        )
                 revision = await asyncio.to_thread(
                     self.repository.create_size_revision, old_entry, revised_factor
                 )
+                old_entry = preserved_old_entry
+                self.current = preserved_old_entry
                 # Firebase advances the logical map document to a new immutable
                 # resource path, so its superseded path is already absent from
                 # rotation. Only the legacy Git backend needs a local exclusion.
@@ -13685,53 +13799,52 @@ class TronnerRacing:
                     for key in self.queue
                     if key not in {old_entry.key, revision.key}
                 )
-                self.cycle_played.add(revision.key)
+                self.queue.appendleft(revision.key)
                 self._save_rotation()
                 await asyncio.to_thread(self.repository.cache_for_server, revision)
-                await self._prepare_federated_leader_map(
-                    revision,
-                    revised_factor,
-                )
             except Exception as exc:
                 LOG.exception("unable to create SIZE_FACTOR map revision")
                 await self.private(player, f"Unable to revise this map: {exc}")
                 return
 
-            old_record_count, old_finish_count = self.store.reset_map(
-                map_records_key(old_entry)
+            self.pending_size_change = {
+                "source_map_key": old_entry.key,
+                "target_map_key": revision.key,
+                "source_records_key": map_records_key(old_entry),
+                "target_records_key": map_records_key(revision),
+            }
+            self.store.set_json(
+                "pending_size_change", self.pending_size_change
             )
-            new_record_count, new_finish_count = self.store.reset_map(
-                map_records_key(revision)
-            )
-            reset_record_count = old_record_count + new_record_count
-            reset_finish_count = old_finish_count + new_finish_count
 
-            self._clear_final_countdown_state()
-            self.current = revision
-            self.current_spec = revision.key
-            self.current_size_factor = revised_factor
-            self.round_started_epoch = None
-            self.deadline_epoch = time.time() + self._map_open_play_seconds(revision)
-            self.store.set_json("current_key", revision.key)
-            self.store.set_json("deadline_epoch", self.deadline_epoch)
-            self.store.set_json("round_started_epoch", None)
-            self._clear_all_votes()
-            self._begin_map_transition(revision.key)
-            self.round_active = False
-            self._reset_attempts()
-            await self.sink.send(
-                f"SIZE_FACTOR {format_size_factor(float(self.config.get('default_size_factor', 0)))}",
-                f"MAP_FILE {quote_console(revision.key)}",
-                "START_NEW_MATCH",
-                "KILL_ALL",
-                "GET_CURRENT_MAP",
-            )
-            await self.broadcast(
+            # Keep the current grid alive and use the established final-countdown
+            # path to disable respawns and give active racers one last run. The
+            # protected pending target makes the new immutable revision next even
+            # if an administrator edits the ordinary map queue in the meantime.
+            self.final_countdown_active = True
+            self.final_countdown_end_epoch = None
+            self.final_countdown_map_key = old_entry.key
+            self.final_countdown_announcement = (
                 f"Map size changed from {format_size_factor(current_factor)} to "
-                f"{format_size_factor(revised_factor)}. Reloading "
-                f"{self._display_map_name(revision)} "
-                f"version {revision.version}. Reset {reset_record_count} records "
-                f"and {reset_finish_count} finish entries."
+                f"{format_size_factor(revised_factor)}."
+            )
+            self.store.set_json("final_countdown_active", True)
+            self.store.set_json("final_countdown_end_epoch", None)
+            self.store.set_json("final_countdown_map_key", old_entry.key)
+            idle_seconds = float(
+                self.config.get("final_countdown_idle_seconds", 10)
+            )
+            if (
+                idle_seconds > 0
+                and not self._final_countdown_grief_detection_enabled()
+            ):
+                await self.sink.send(f"KILL_IDLE_PLAYERS {idle_seconds:.9g}")
+            await self.broadcast(
+                f"{player.record_name} resized "
+                f"{self._display_map_name(revision)} from "
+                f"{format_size_factor(current_factor)} to "
+                f"{format_size_factor(revised_factor)}. Version "
+                f"{revision.version} will load after the final countdown."
             )
 
     async def _command_checkpoint_respawn(self, player: Player) -> None:
