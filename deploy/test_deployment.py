@@ -64,6 +64,56 @@ class RenderTests(unittest.TestCase):
                 production=True,
             )
 
+    def test_production_standalone_retains_firebase_integrations(self):
+        cluster = self.load("cluster.example.json")
+        cluster.update(
+            {
+                "cluster_id": "tronner-racing",
+                "leader_server_id": "nyc1",
+                "members": {"nyc1": "NY"},
+                "map_repository": {
+                    "source": "firebase",
+                    "url": "https://github.com/zwazi/TronnerRepository.git",
+                    "branch": "main",
+                },
+                "firebase": {
+                    "enabled": True,
+                    "project_id": "tronner-racing",
+                    "storage_bucket": "tronner-racing.appspot.com",
+                    "database_url": (
+                        "https://tronner-racing-default-rtdb." + "firebaseio.com"
+                    ),
+                    "catalog_enabled": True,
+                    "live_dashboard_enabled": True,
+                    "management_enabled": True,
+                },
+            }
+        )
+        node = self.load("node.example.json")
+        node.update(
+            {
+                "server_id": "nyc1",
+                "region_label": "NY",
+                "server_name": "Tronner Racing",
+                "website_url": "https://tronner.io/",
+                "server_dns": "race.tronner.io",
+                "public_base_url": "http://maps.tronner.io:8080/",
+                "master_list": True,
+            }
+        )
+
+        rendered = render_node.render(cluster, node, production=True)
+        manifest = json.loads(rendered["manifest.json"])
+        controller = json.loads(rendered["controller.json"])
+        self.assertFalse(manifest["federationEnabled"])
+        self.assertTrue(manifest["firebaseEnabled"])
+        self.assertTrue(manifest["masterListEnabled"])
+        self.assertEqual(controller["server_id"], "nyc1")
+        self.assertEqual(controller["federation"], {"role": "off"})
+        self.assertTrue(controller["live_dashboard"]["enabled"])
+        self.assertTrue(controller["live_dashboard"]["management_enabled"])
+        self.assertNotIn("federation.json", rendered)
+
     def test_duplicate_json_keys_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "duplicate.json"

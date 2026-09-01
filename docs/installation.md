@@ -100,3 +100,21 @@ during an approved maintenance window.
 `node.example.json` is intentionally inert. It can be rendered for local
 inspection with `--allow-examples`, but the installer refuses to combine that
 flag with `--start`.
+
+## Stage a clean vanilla server without starting it
+
+To prepare an unpatched upstream engine alongside an existing Tronner install,
+use a separate prefix:
+
+```sh
+TRONNER_ENGINE_PREFIX=/opt/armagetronad-vanilla \
+  ./deploy/build_vanilla_engine.sh
+```
+
+Install `config/vanilla-unlisted.cfg` as
+`/etc/armagetronad-vanilla/server.cfg` and
+`deploy/systemd/armagetronad-vanilla.service` as a disabled unit. The unit is
+fail-closed: it cannot start until an operator deliberately creates
+`/etc/armagetronad-vanilla/READY_TO_START`. The staging configuration disables
+master-list advertising and contains no federation, racing-controller,
+Firebase, Vectron, or website-management integration.
