@@ -2798,6 +2798,17 @@ class StateStore:
         ).fetchone()
         return float(row[0]) if row and row[0] is not None else None
 
+    def rating_summaries(self) -> dict[str, tuple[float, int]]:
+        """Return every map rating using one bounded aggregate query."""
+        rows = self.current_connection().execute(
+            "SELECT map_key, AVG(rating), COUNT(*) FROM ratings GROUP BY map_key"
+        ).fetchall()
+        return {
+            str(row[0]): (float(row[1]), int(row[2]))
+            for row in rows
+            if row[1] is not None and int(row[2]) > 0
+        }
+
     def rating_for(self, map_key: str, identity_key: str) -> int | None:
         row = self.connection.execute(
             "SELECT rating FROM ratings WHERE map_key=? AND identity_key=?",
@@ -9150,6 +9161,7 @@ class TronnerRacing:
                 pass
 
     def _dashboard_maps_by_record_key(self) -> dict[str, dict[str, object]]:
+        ratings = self.store.rating_summaries()
         return {
             map_records_key(entry): {
                 "mapId": entry.map_id,
@@ -9157,6 +9169,9 @@ class TronnerRacing:
                 "author": entry.author,
                 "version": entry.version,
                 "storagePath": entry.storage_path,
+                "ratingKey": entry.rating_key,
+                "rating": ratings.get(entry.rating_key, (None, 0))[0],
+                "ratingCount": ratings.get(entry.rating_key, (None, 0))[1],
             }
             for entry in self.repository.catalog.values()
             if entry.storage_path
