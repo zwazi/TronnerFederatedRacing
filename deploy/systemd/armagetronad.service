@@ -1,8 +1,8 @@
 [Unit]
-Description=Tronner federated Armagetron dedicated server
+Description=Tronner Racing Armagetron dedicated server
 Documentation=https://github.com/zwazi/TronnerFederatedRacing
 Wants=network-online.target
-After=network-online.target tronner-federation.service
+After=network-online.target
 
 [Service]
 Type=simple

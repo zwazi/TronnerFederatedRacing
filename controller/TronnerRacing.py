@@ -4344,9 +4344,24 @@ class TronnerRacing:
         self.federation_role = str(federation.get("role", "off")).casefold()
         if self.federation_role not in {"off", "leader", "follower"}:
             raise ValueError("federation role must be off, leader, or follower")
-        self.federation_local_server_id = clean_console_text(
-            federation.get("local_server_id", "")
+        self.server_id = clean_console_text(
+            config.get(
+                "server_id",
+                federation.get(
+                    "local_server_id",
+                    config.get("firebase_server_id", "local"),
+                ),
+            )
         )
+        if not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", self.server_id
+        ):
+            raise ValueError("invalid server_id")
+        self.federation_local_server_id = clean_console_text(
+            federation.get("local_server_id", self.server_id)
+        )
+        if not self.federation_local_server_id:
+            self.federation_local_server_id = self.server_id
         self.federation_remote_server_id = clean_console_text(
             federation.get(
                 "remote_server_id",
@@ -4537,7 +4552,7 @@ class TronnerRacing:
         if (
             isinstance(live_config, dict)
             and live_config.get("enabled") is True
-            and self.federation_leader
+            and self.live_dashboard_authority
             and self.repository.firebase is not None
         ):
             self.live_dashboard = FirebaseLiveDashboardPublisher(
@@ -4564,6 +4579,10 @@ class TronnerRacing:
     @property
     def federation_leader(self) -> bool:
         return getattr(self, "federation_role", "off") == "leader"
+
+    @property
+    def live_dashboard_authority(self) -> bool:
+        return getattr(self, "federation_role", "off") != "follower"
 
     async def _start_federation_import(self) -> None:
         if self.federation_import_socket is None:
@@ -8819,10 +8838,13 @@ class TronnerRacing:
             if not message:
                 raise ValueError("Enter an announcement.")
             federate = command.get("scope") == "federation"
-            if federate and not self.federation_leader:
+            if federate and self.federation_follower:
                 raise ValueError("Federation-wide announcements must target the leader.")
-            await self.broadcast(message, federate=federate)
-            return "Announcement delivered.", {"scope": "federation" if federate else "local"}
+            federation_scope = bool(federate and self.federation_leader)
+            await self.broadcast(message, federate=federation_scope)
+            return "Announcement delivered.", {
+                "scope": "federation" if federation_scope else "local"
+            }
 
         if command_type == "start_console_stream":
             now = time.monotonic()

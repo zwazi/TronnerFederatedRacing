@@ -5,6 +5,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from TronnerRacing import Player, TronnerRacing
 
@@ -123,6 +124,26 @@ class ServerManagementTest(unittest.IsolatedAsyncioTestCase):
                 "requestedName": "Grid admin",
                 "mapKey": "author/maps/example.aamap.xml",
             })
+
+    async def test_standalone_accepts_group_announcement_as_local(self):
+        controller = self.controller()
+        controller.federation_role = "off"
+        controller.broadcast = AsyncMock()
+
+        result, details = await controller._execute_server_management_command({
+            "type": "announce",
+            "requestedBy": "admin-id",
+            "requestedName": "Grid admin",
+            "message": "Server maintenance soon.",
+            "scope": "federation",
+        })
+
+        self.assertEqual(result, "Announcement delivered.")
+        self.assertEqual(details, {"scope": "local"})
+        controller.broadcast.assert_awaited_once_with(
+            "Server maintenance soon.", federate=False
+        )
+        self.assertTrue(controller.live_dashboard_authority)
 
     async def test_console_stream_is_temporary_and_replays_only_a_bounded_tail(self):
         controller = self.controller()
