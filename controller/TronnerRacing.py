@@ -77,6 +77,10 @@ SERVER_CONSOLE_INITIAL_LINES = 100
 SERVER_CONSOLE_BATCH_SIZE = 25
 SERVER_CONSOLE_STREAM_SECONDS = 90.0
 SERVER_CONSOLE_MAX_FILE_BYTES = 8 * 1024 * 1024
+DEFAULT_START_COUNTDOWN_SECONDS = 3
+MIN_START_COUNTDOWN_SECONDS = 1
+MAX_START_COUNTDOWN_SECONDS = 60
+START_MODES = frozenset({"brake", "immediate", "countdown", "respawn"})
 SERVER_CONSOLE_SENSITIVE_RE = re.compile(
     r"(?i)\b(?:admin[_-]?pass|password|passphrase|secret|api[_-]?key|"
     r"authorization|bearer|private[_-]?key)\b"
@@ -135,6 +139,40 @@ SERVER_MANAGEMENT_ENGINE_OPTIONS = {
     "CYCLE_ACCEL": (0.0, 1_000.0),
     "CYCLE_BRAKE": (0.0, 1.0),
 }
+
+
+def normalize_start_preference(value: object) -> str | None:
+    """Return one canonical persisted start preference, including its timer."""
+    parts = str(value).strip().casefold().split()
+    if not parts or parts[0] not in START_MODES:
+        return None
+    mode = parts[0]
+    if mode != "countdown":
+        return mode if len(parts) == 1 else None
+    if len(parts) == 1:
+        return "countdown"
+    if len(parts) != 2 or not re.fullmatch(r"[0-9]+", parts[1]):
+        return None
+    seconds = int(parts[1])
+    if not MIN_START_COUNTDOWN_SECONDS <= seconds <= MAX_START_COUNTDOWN_SECONDS:
+        return None
+    return (
+        "countdown"
+        if seconds == DEFAULT_START_COUNTDOWN_SECONDS
+        else f"countdown {seconds}"
+    )
+
+
+def start_preference_details(value: object) -> tuple[str, int, str]:
+    """Return mode, countdown seconds, and canonical persisted preference."""
+    preference = normalize_start_preference(value) or "immediate"
+    parts = preference.split()
+    seconds = (
+        int(parts[1])
+        if parts[0] == "countdown" and len(parts) == 2
+        else DEFAULT_START_COUNTDOWN_SECONDS
+    )
+    return parts[0], seconds, preference
 
 
 def _ascii_compatible_encoding(value: object) -> str | None:
@@ -1188,8 +1226,8 @@ USER_COMMAND_HELP = (
         "Always use a spawn number; omit # for latest or use 0 to clear it.",
     ),
     (
-        "/start [brake|immediate|countdown|respawn]",
-        "Choose how your cycle begins moving after each respawn.",
+        "/start [brake|immediate|countdown [1-60]|respawn]",
+        "Choose how your cycle begins moving and optionally set its countdown.",
     ),
     (
         "/display_server_tags",
@@ -1622,6 +1660,7 @@ class Player:
     dead_since_monotonic: float | None = None
     suspended_votes: dict[str, int] = dataclasses.field(default_factory=dict)
     start_mode: str = "immediate"
+    start_countdown_seconds: int = DEFAULT_START_COUNTDOWN_SECONDS
     display_server_tags: bool = False
     pending_start_mode: str = "immediate"
     manual_restart_pending: bool = False
@@ -4201,16 +4240,15 @@ class TronnerRacing:
         self.repository = MapRepository(config)
         self.store = StateStore(Path(config["database"]))
         saved_start_preferences = self.store.get_json("start_preferences", {})
-        self.start_preferences: dict[str, str] = {
-            str(identity_key): str(mode).casefold()
-            for identity_key, mode in (
-                saved_start_preferences.items()
-                if isinstance(saved_start_preferences, dict)
-                else ()
-            )
-            if str(mode).casefold()
-            in {"brake", "immediate", "countdown", "respawn"}
-        }
+        self.start_preferences: dict[str, str] = {}
+        for identity_key, raw_preference in (
+            saved_start_preferences.items()
+            if isinstance(saved_start_preferences, dict)
+            else ()
+        ):
+            preference = normalize_start_preference(raw_preference)
+            if preference is not None:
+                self.start_preferences[str(identity_key)] = preference
         saved_server_tag_preferences = self.store.get_json(
             "display_server_tag_preferences", {}
         )
@@ -7002,10 +7040,8 @@ class TronnerRacing:
             return result
         preference_value = value.get("value")
         if preference_type == "start":
-            preference_value = str(preference_value).casefold()
-            if preference_value not in {
-                "brake", "immediate", "countdown", "respawn"
-            }:
+            preference_value = normalize_start_preference(preference_value)
+            if preference_value is None:
                 raise ValueError("invalid federated start preference")
         elif preference_type == "tags":
             if not isinstance(preference_value, bool):
@@ -7561,13 +7597,21 @@ class TronnerRacing:
         )
 
     def _start_mode_for(self, player: Player) -> str:
-        mode = getattr(player, "start_mode", "immediate").casefold()
+        mode = str(getattr(player, "start_mode", "immediate")).casefold()
+        fallback_value = (
+            "countdown "
+            f"{getattr(player, 'start_countdown_seconds', DEFAULT_START_COUNTDOWN_SECONDS)}"
+            if mode == "countdown"
+            else mode
+        )
+        _, _, fallback = start_preference_details(fallback_value)
         preferences = getattr(self, "start_preferences", {})
-        saved = str(preferences.get(player.identity_key, mode)).casefold()
-        if saved not in {"brake", "immediate", "countdown", "respawn"}:
-            saved = "immediate"
-        player.start_mode = saved
-        return saved
+        saved_mode, saved_seconds, _ = start_preference_details(
+            preferences.get(player.identity_key, fallback)
+        )
+        player.start_mode = saved_mode
+        player.start_countdown_seconds = saved_seconds
+        return saved_mode
 
     def _preferred_spawn_index(self, player: Player) -> int | None:
         if not self.current or not self.current.spawns:
@@ -9393,12 +9437,7 @@ class TronnerRacing:
         player = self.aliases.get(name.casefold()) or self.players.get(name.casefold())
         if not player and create:
             player = Player(name, name)
-            player.start_mode = str(
-                getattr(self, "start_preferences", {}).get(
-                    player.identity_key,
-                    "immediate",
-                )
-            ).casefold()
+            self._start_mode_for(player)
             self.players[name.casefold()] = player
             self.aliases[name.casefold()] = player
         return player
@@ -9838,10 +9877,7 @@ class TronnerRacing:
             self._set_local_federation_preference(
                 "start", player.identity_key, previous_start_mode
             )
-        player.start_mode = self.start_preferences.get(
-            player.identity_key,
-            "immediate",
-        )
+        self._start_mode_for(player)
         for map_key, map_preferences in list(self.spawn_preferences.items()):
             if (
                 isinstance(map_preferences, dict)
@@ -10496,6 +10532,7 @@ class TronnerRacing:
         ):
             return
         start_mode = self._start_mode_for(player)
+        countdown_seconds = player.start_countdown_seconds
         manual_restart = player.manual_restart_pending
         if start_mode == "respawn" and not manual_restart:
             await self.center_private(player, "Type /restart to respawn")
@@ -10539,7 +10576,7 @@ class TronnerRacing:
             await self.sink.send(
                 *self._checkpoint_color_reset_commands(player),
                 f"RESPAWN_PLAYER_HELD {spawn_arguments}",
-                f"FREEZE_PLAYER {player.target} 3",
+                f"FREEZE_PLAYER {player.target} {countdown_seconds}",
             )
         else:
             await self.sink.send(
@@ -10550,12 +10587,14 @@ class TronnerRacing:
         if old_task:
             old_task.cancel()
         wait_for_start = (
-            self._wait_for_countdown_start
+            self._wait_for_countdown_start(
+                player, generation, countdown_seconds
+            )
             if start_mode == "countdown"
-            else self._wait_for_brake_start
+            else self._wait_for_brake_start(player, generation)
         )
         self.freeze_tasks[id(player)] = asyncio.create_task(
-            wait_for_start(player, generation)
+            wait_for_start
         )
 
     async def _respawn_from_checkpoint(self, player: Player) -> None:
@@ -10571,6 +10610,7 @@ class TronnerRacing:
         player.pending_respawn_kind = "checkpoint"
         player.attempt_started_game = None
         start_mode = self._start_mode_for(player)
+        countdown_seconds = player.start_countdown_seconds
         player.pending_start_mode = start_mode
         speed = (
             snapshot.speed
@@ -10590,7 +10630,7 @@ class TronnerRacing:
         if start_mode == "countdown":
             await self.sink.send(
                 f"RESPAWN_PLAYER_CHECKPOINT_HELD {spawn_arguments}",
-                f"FREEZE_PLAYER {player.target} 3",
+                f"FREEZE_PLAYER {player.target} {countdown_seconds}",
             )
         else:
             await self.sink.send(
@@ -10600,12 +10640,14 @@ class TronnerRacing:
         if old_task:
             old_task.cancel()
         wait_for_start = (
-            self._wait_for_countdown_start
+            self._wait_for_countdown_start(
+                player, generation, countdown_seconds
+            )
             if start_mode == "countdown"
-            else self._wait_for_brake_start
+            else self._wait_for_brake_start(player, generation)
         )
         self.freeze_tasks[id(player)] = asyncio.create_task(
-            wait_for_start(player, generation)
+            wait_for_start
         )
 
     async def _wait_for_brake_start(self, player: Player, generation: int) -> None:
@@ -10636,9 +10678,10 @@ class TronnerRacing:
         self,
         player: Player,
         generation: int,
+        countdown_seconds: int,
     ) -> None:
         try:
-            for number in (3, 2, 1):
+            for number in range(countdown_seconds, 0, -1):
                 if not (
                     generation == player.generation
                     and player.connected
@@ -12217,12 +12260,7 @@ class TronnerRacing:
             # controller restart.  Let them queue/query maps, but do not count
             # them as active voters until a grid/online event confirms it.
             player = Player(player_name, player_name, connected=True, active=False)
-            player.start_mode = str(
-                getattr(self, "start_preferences", {}).get(
-                    player.identity_key,
-                    "immediate",
-                )
-            ).casefold()
+            self._start_mode_for(player)
             player.display_server_tags = bool(
                 getattr(self, "display_server_tag_preferences", {}).get(
                     player.identity_key,
@@ -12829,31 +12867,44 @@ class TronnerRacing:
     async def _command_start(self, player: Player, argument: str) -> None:
         requested = argument.strip().casefold()
         if not requested:
+            mode = self._start_mode_for(player)
+            timer = (
+                f" ({player.start_countdown_seconds} seconds)"
+                if mode == "countdown"
+                else ""
+            )
             await self.private(
                 player,
-                f"Start mode: {self._start_mode_for(player)}. "
-                "Usage: /start brake, /start immediate, /start countdown, "
-                "or /start respawn.",
+                f"Start mode: {mode}{timer}. "
+                "Usage: /start brake, /start immediate, "
+                "/start countdown [1-60], or /start respawn.",
             )
             return
-        if requested not in {"brake", "immediate", "countdown", "respawn"}:
+        preference = normalize_start_preference(requested)
+        if preference is None:
             await self.private(
                 player,
-                "Usage: /start brake, /start immediate, /start countdown, "
-                "or /start respawn.",
+                "Usage: /start brake, /start immediate, "
+                "/start countdown [1-60], or /start respawn. "
+                "Countdown seconds must be a whole number from 1 to 60.",
             )
             return
-        player.start_mode = requested
+        mode, countdown_seconds, preference = start_preference_details(preference)
+        player.start_mode = mode
+        player.start_countdown_seconds = countdown_seconds
         if not hasattr(self, "start_preferences"):
             self.start_preferences = {}
         preference_key = self._set_local_federation_preference(
-            "start", player.identity_key, requested
+            "start", player.identity_key, preference
         )
         await self._publish_federation_preference_update(preference_key)
         descriptions = {
             "brake": "Press brake to begin moving after each respawn.",
             "immediate": "Begin moving immediately after each automatic respawn.",
-            "countdown": "Wait for 3, 2, 1, Go! after each respawn.",
+            "countdown": (
+                f"Wait for a {countdown_seconds}-second countdown and Go!, "
+                "or press brake to start early."
+            ),
             "respawn": "Wait after a crash, then begin immediately when you use /restart.",
         }
         pending = (
@@ -12863,7 +12914,7 @@ class TronnerRacing:
         )
         await self.private(
             player,
-            f"Start mode set to {requested}. {descriptions[requested]}{pending}",
+            f"Start mode set to {mode}. {descriptions[mode]}{pending}",
         )
 
     async def _command_display_server_tags(self, player: Player) -> None:
