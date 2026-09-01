@@ -176,12 +176,13 @@ class CountdownEnforcementTests(unittest.IsolatedAsyncioTestCase):
         player = Player("racer", "Racer", connected=True, active=True, alive=True)
         controller.finalists = {id(player)}
 
-        with mock.patch(
-            "TronnerRacing.time.time", side_effect=[7.0, 8.0, 9.0, 10.0]
-        ):
+        with mock.patch("TronnerRacing.time.time", return_value=7.0) as clock:
             await controller._record_final_countdown_progress(player, 0.0, (0.0, 0.0))
+            clock.return_value = 8.0
             await controller._record_final_countdown_progress(player, 1.0, (10.0, 0.0))
+            clock.return_value = 9.0
             await controller._record_final_countdown_progress(player, 2.0, (10.0, 10.0))
+            clock.return_value = 10.0
             await controller._record_final_countdown_progress(player, 3.0, (0.0, 10.0))
 
         self.assertTrue(any("warning" in message.casefold() for message in messages))
@@ -245,11 +246,12 @@ class CountdownEnforcementTests(unittest.IsolatedAsyncioTestCase):
         player = Player("racer", "Racer", connected=True, active=True, alive=True)
         controller.finalists = {id(player)}
 
-        with mock.patch("TronnerRacing.time.time", side_effect=[8.0, 10.0]):
+        with mock.patch("TronnerRacing.time.time", return_value=8.0) as clock:
             await controller._record_final_countdown_progress(
                 player, 0.0, (0.0, 0.0), native_idle_seconds=11.0
             )
             self.assertEqual(controller.sink.commands, [])
+            clock.return_value = 10.0
             await controller._record_final_countdown_progress(
                 player, 2.0, (0.0, 0.0), native_idle_seconds=13.0
             )
