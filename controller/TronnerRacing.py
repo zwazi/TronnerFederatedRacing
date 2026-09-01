@@ -81,6 +81,7 @@ FEDERATION_LOCAL_COMMANDS = frozenset(
         "/link",
         "/reload_controller",
         "/report",
+        "/suggest",
         "/respawn",
         "/restart",
         "/setspawn",
@@ -1164,6 +1165,7 @@ USER_COMMAND_HELP = (
     ("/q remove [map]", "Remove the first matching map from the queue."),
     ("/q clear", "Clear every map from the queue."),
     ("/rate [1-5]", "Rate the current map."),
+    ("/rate [map] [1-5]", "Rate a specific map."),
     ("/rate undo", "Undo your latest rating change on the current map."),
     ("/rate revoke", "Remove your rating from the current map."),
     ("/extend", "Vote to add five minutes to the current map."),
@@ -1198,6 +1200,7 @@ USER_COMMAND_HELP = (
     ("/join", "Enable respawning without killing your current cycle."),
     ("/spec or /spectate", "Disable scripted respawning."),
     ("/report [message]", "Privately send a report to the server owner."),
+    ("/suggest [message]", "Privately suggest a feature to the server owner."),
     ("/help", "Show the commands available to you."),
 )
 
@@ -1597,6 +1600,17 @@ class Player:
     last_activity_position: tuple[float, float] | None = None
     activity_cycle_alive: bool = False
     activity_snapshot_seen: bool = False
+    activity_run_samples: collections.deque[tuple[float, float, float]] = (
+        dataclasses.field(default_factory=collections.deque)
+    )
+    activity_area_samples: collections.deque[tuple[float, float, float]] = (
+        dataclasses.field(default_factory=collections.deque)
+    )
+    afk_recovery_samples: collections.deque[tuple[float, float, float]] = (
+        dataclasses.field(default_factory=collections.deque)
+    )
+    passive_death_streak: int = 0
+    dead_since_monotonic: float | None = None
     suspended_votes: dict[str, int] = dataclasses.field(default_factory=dict)
     start_mode: str = "immediate"
     display_server_tags: bool = False
@@ -8591,6 +8605,11 @@ class TronnerRacing:
             # state silently so entering or leaving spectate never produces an
             # AFK status announcement.
             player.afk = False
+            player.dead_since_monotonic = None
+            player.passive_death_streak = 0
+            player.activity_run_samples.clear()
+            player.activity_area_samples.clear()
+            player.afk_recovery_samples.clear()
             self.finalists.discard(id(player))
             self._cancel_player_freeze(player)
             if clear_center:
@@ -8661,6 +8680,11 @@ class TronnerRacing:
             player.last_activity_position = None
             player.activity_cycle_alive = False
             player.activity_snapshot_seen = False
+            player.dead_since_monotonic = None
+            player.passive_death_streak = 0
+            player.activity_run_samples.clear()
+            player.activity_area_samples.clear()
+            player.afk_recovery_samples.clear()
 
     def _handle_player_login(self, payload: str) -> Player | None:
         parts = payload.split(maxsplit=1)
@@ -9048,6 +9072,17 @@ class TronnerRacing:
         assert player
         was_active = player.active
         player.alive = True
+        player.dead_since_monotonic = None
+        player.activity_snapshot_seen = False
+        player.activity_cycle_alive = True
+        player.activity_run_samples.clear()
+        player.afk_recovery_samples.clear()
+        with contextlib.suppress(ValueError):
+            position = (float(parts[1]), float(parts[2]))
+            now = time.monotonic()
+            player.last_activity_position = position
+            player.activity_run_samples.append((now, *position))
+            player.activity_area_samples.append((now, *position))
         if player.is_ai:
             player.active = True
             return
@@ -9153,7 +9188,8 @@ class TronnerRacing:
             event_time = float(parts[-1])
         except ValueError:
             return
-        await self._record_player_activity(player)
+        if not player.afk:
+            player.last_activity_monotonic = time.monotonic()
         respawn_kind = player.pending_respawn_kind
         if (
             respawn_kind != "checkpoint"
@@ -9186,6 +9222,19 @@ class TronnerRacing:
             # This is the old cycle disappearing after its replacement command
             # was queued; CYCLE_CREATED has not confirmed the held cycle yet.
             return
+        now = time.monotonic()
+        player.dead_since_monotonic = now
+        if self._activity_run_looks_passive(player):
+            player.passive_death_streak += 1
+        elif player.activity_run_samples:
+            player.passive_death_streak = 0
+        player.activity_run_samples.clear()
+        player.afk_recovery_samples.clear()
+        passive_death_limit = max(
+            2, int(self.config.get("afk_straight_death_limit", 4))
+        )
+        if player.passive_death_streak >= passive_death_limit:
+            await self._set_player_afk(player)
         player.checkpoints_collected.clear()
         player.checkpoint_notice_monotonic = None
         if held_cycle_destroyed:
@@ -10024,9 +10073,14 @@ class TronnerRacing:
         player: Player,
         activity_time: float | None = None,
     ) -> None:
-        player.last_activity_monotonic = (
-            time.monotonic() if activity_time is None else activity_time
+        activity_time = time.monotonic() if activity_time is None else activity_time
+        player.last_activity_monotonic = activity_time
+        player.dead_since_monotonic = (
+            activity_time if player.active and not player.alive else None
         )
+        player.passive_death_streak = 0
+        player.activity_area_samples.clear()
+        player.afk_recovery_samples.clear()
         if not player.afk:
             return
         player.afk = False
@@ -10044,11 +10098,11 @@ class TronnerRacing:
             player.afk
             or not player.connected
             or not player.active
-            or not player.alive
             or not player.respawn_enabled
         ):
             return
         player.afk = True
+        player.afk_recovery_samples.clear()
         suspended = self._suspend_player_votes(player)
         await self.broadcast(
             f"{player.record_name} is now AFK and does not count toward votes."
@@ -10059,22 +10113,167 @@ class TronnerRacing:
     async def _check_afk_players(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         timeout = max(1.0, float(self.config.get("afk_timeout_seconds", 60)))
+        dead_timeout = max(
+            1.0,
+            float(self.config.get("afk_dead_timeout_seconds", timeout)),
+        )
         players = {
             id(item): item for item in getattr(self, "players", {}).values()
         }.values()
         for player in players:
-            last_activity = player.last_activity_monotonic
+            idle_since = (
+                player.last_activity_monotonic
+                if player.alive
+                else player.dead_since_monotonic
+                if player.dead_since_monotonic is not None
+                else player.last_activity_monotonic
+            )
             if (
                 player.connected
                 and player.active
-                and player.alive
                 and player.respawn_enabled
                 and not player.is_ai
                 and not player.afk
-                and last_activity is not None
-                and now - last_activity >= timeout
+                and idle_since is not None
+                and now - idle_since >= (timeout if player.alive else dead_timeout)
             ):
                 await self._set_player_afk(player)
+
+    @staticmethod
+    def _activity_trajectory(
+        samples: collections.deque[tuple[float, float, float]],
+    ) -> tuple[float, float, float, float]:
+        """Return duration, travelled distance, displacement, and total turn."""
+        if len(samples) < 2:
+            return 0.0, 0.0, 0.0, 0.0
+        duration = max(0.0, samples[-1][0] - samples[0][0])
+        path = 0.0
+        vectors: list[tuple[float, float]] = []
+        sample_list = list(samples)
+        for previous, current in zip(sample_list, sample_list[1:]):
+            dx = current[1] - previous[1]
+            dy = current[2] - previous[2]
+            length = math.hypot(dx, dy)
+            if length <= 1e-6:
+                continue
+            path += length
+            vectors.append((dx / length, dy / length))
+        displacement = math.hypot(
+            samples[-1][1] - samples[0][1],
+            samples[-1][2] - samples[0][2],
+        )
+        total_turn = 0.0
+        for previous, current in zip(vectors, vectors[1:]):
+            dot = max(
+                -1.0,
+                min(1.0, previous[0] * current[0] + previous[1] * current[1]),
+            )
+            total_turn += math.acos(dot)
+        return duration, path, displacement, total_turn
+
+    def _activity_run_looks_passive(self, player: Player) -> bool:
+        _, path, displacement, total_turn = self._activity_trajectory(
+            player.activity_run_samples
+        )
+        minimum_distance = max(
+            0.1, float(self.config.get("afk_straight_minimum_distance", 6.0))
+        )
+        minimum_ratio = min(
+            1.0, max(0.0, float(self.config.get("afk_straight_ratio", 0.92)))
+        )
+        maximum_turn = math.radians(
+            max(
+                0.0,
+                float(self.config.get("afk_straight_maximum_turn_degrees", 20)),
+            )
+        )
+        return (
+            path >= minimum_distance
+            and displacement / max(path, 1e-9) >= minimum_ratio
+            and total_turn <= maximum_turn
+        )
+
+    async def _record_passive_motion(
+        self,
+        player: Player,
+        now: float,
+        position: tuple[float, float],
+        native_idle_seconds: float,
+        previous_position: tuple[float, float] | None = None,
+    ) -> None:
+        sample = (now, position[0], position[1])
+        player.activity_run_samples.append(sample)
+        maximum_samples = max(
+            8, int(self.config.get("afk_motion_maximum_samples", 240))
+        )
+        while len(player.activity_run_samples) > maximum_samples:
+            player.activity_run_samples.popleft()
+
+        if player.afk:
+            recent_input = native_idle_seconds <= max(
+                0.25,
+                float(self.config.get("afk_recovery_input_seconds", 2.5)),
+            )
+            if not recent_input:
+                player.afk_recovery_samples.clear()
+                return
+            if not player.afk_recovery_samples and previous_position is not None:
+                player.afk_recovery_samples.append((now, *previous_position))
+            player.afk_recovery_samples.append(sample)
+            while len(player.afk_recovery_samples) > maximum_samples:
+                player.afk_recovery_samples.popleft()
+            duration, path, _, total_turn = self._activity_trajectory(
+                player.afk_recovery_samples
+            )
+            if (
+                duration
+                >= max(
+                    1.0,
+                    float(self.config.get("afk_recovery_motion_seconds", 3.0)),
+                )
+                and path
+                >= max(
+                    0.1,
+                    float(self.config.get("afk_recovery_distance", 4.0)),
+                )
+                and total_turn
+                >= math.radians(
+                    max(
+                        1.0,
+                        float(self.config.get("afk_recovery_turn_degrees", 15)),
+                    )
+                )
+            ):
+                await self._record_player_activity(player, now)
+            return
+
+        player.activity_area_samples.append(sample)
+        confinement_seconds = max(
+            1.0,
+            float(
+                self.config.get(
+                    "afk_confinement_seconds",
+                    self.config.get("afk_timeout_seconds", 60),
+                )
+            ),
+        )
+        while (
+            player.activity_area_samples
+            and now - player.activity_area_samples[0][0]
+            > confinement_seconds * 1.1
+        ):
+            player.activity_area_samples.popleft()
+        if len(player.activity_area_samples) < 2:
+            return
+        area_duration = now - player.activity_area_samples[0][0]
+        xs = [item[1] for item in player.activity_area_samples]
+        ys = [item[2] for item in player.activity_area_samples]
+        area_span = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        maximum_span = max(
+            0.1, float(self.config.get("afk_confinement_maximum_span", 12.0))
+        )
+        if area_duration >= confinement_seconds * 0.95 and area_span <= maximum_span:
+            await self._set_player_afk(player)
 
     async def _handle_player_activity_snapshot(self, payload: str) -> None:
         parts = payload.split()
@@ -10093,10 +10292,15 @@ class TronnerRacing:
         candidate_activity = now - native_idle_seconds
         previous_position = player.last_activity_position
         was_alive = player.activity_cycle_alive
-        first_snapshot = not player.activity_snapshot_seen
         player.activity_snapshot_seen = True
         player.activity_cycle_alive = cycle_alive
         player.last_activity_position = position if cycle_alive else None
+
+        if not cycle_alive:
+            if player.active and player.dead_since_monotonic is None:
+                player.dead_since_monotonic = now
+            player.afk_recovery_samples.clear()
+            return
 
         moved = False
         if cycle_alive and previous_position is not None and was_alive:
@@ -10109,11 +10313,9 @@ class TronnerRacing:
                 + (position[1] - previous_position[1]) ** 2
                 > epsilon**2
             )
-        elif cycle_alive and previous_position is None and first_snapshot:
-            # Establishing a live position after controller startup or a new
-            # cycle receives one grace window; subsequent snapshots must move
-            # or contain genuine native input.
-            moved = True
+        elif cycle_alive and previous_position is None:
+            player.activity_run_samples.append((now, *position))
+            player.activity_area_samples.append((now, *position))
 
         last_activity = player.last_activity_monotonic
         native_input = (
@@ -10121,9 +10323,20 @@ class TronnerRacing:
             or candidate_activity > last_activity + 0.5
         )
         if moved:
-            await self._record_player_activity(player, now)
-        elif native_input:
-            await self._record_player_activity(player, candidate_activity)
+            await self._record_passive_motion(
+                player,
+                now,
+                position,
+                native_idle_seconds,
+                previous_position,
+            )
+            if not player.afk:
+                player.last_activity_monotonic = now
+        if native_input and not player.afk:
+            player.last_activity_monotonic = max(
+                candidate_activity,
+                player.last_activity_monotonic or candidate_activity,
+            )
 
     async def player_activity_monitor(self) -> None:
         interval = max(
@@ -10342,7 +10555,9 @@ class TronnerRacing:
             )
             await self.broadcast(
                 f"{announcement} Respawning is disabled. "
-                f"Final countdown: {math.ceil(duration)} seconds."
+                f"Final countdown: {math.ceil(duration)} seconds. "
+                "Use /rate # for the current map or /rate [map] # "
+                "for a specific map."
             )
             LOG.info(
                 "final countdown map=%s duration=%.3f record=%s",
@@ -10453,6 +10668,8 @@ class TronnerRacing:
             await self._command_help(player, access_level)
         elif command == "/report":
             await self._command_report(player, arguments, access_level)
+        elif command == "/suggest":
+            await self._command_suggest(player, arguments, access_level)
         elif command == "/leaderboard":
             await self._command_leaderboard(player)
         elif command == "/setspawn":
@@ -10580,12 +10797,47 @@ class TronnerRacing:
         )
 
     async def _command_rate(self, player: Player, argument: str) -> None:
-        if not self.current:
+        requested = argument.strip().casefold()
+        entry = self.current
+
+        if requested in {"undo", "revoke"} and not entry:
             await self.private(player, "No current map is available to rate.")
             return
-        requested = argument.strip().casefold()
-        map_key = self.current.rating_key
-        map_name = self._display_map_name(self.current)
+
+        if requested not in {"undo", "revoke"}:
+            parsed = re.fullmatch(r"(?:(.+?)\s+)?([1-5])", argument.strip())
+            if not parsed:
+                await self.private(
+                    player,
+                    "Usage: /rate [1-5], /rate [map] [1-5], "
+                    "/rate undo, or /rate revoke",
+                )
+                return
+            map_query, requested_rating = parsed.groups()
+            if map_query:
+                matches = self.repository.search(map_query)
+                if not matches:
+                    await self.private(
+                        player, f"No map found matching: {map_query}"
+                    )
+                    return
+                if len(matches) > 1:
+                    preview = ", ".join(
+                        f"{self._display_map_name(item)} ({item.author})"
+                        for item in matches[:5]
+                    )
+                    await self.private(
+                        player, f"Map name is ambiguous: {preview}"
+                    )
+                    return
+                entry = matches[0]
+            requested = requested_rating
+
+        if not entry:
+            await self.private(player, "No current map is available to rate.")
+            return
+        map_key = entry.rating_key
+        map_name = self._display_map_name(entry)
 
         if requested == "undo":
             result = self.store.undo_rating(map_key, player.identity_key)
@@ -10625,7 +10877,8 @@ class TronnerRacing:
         if not re.fullmatch(r"[1-5]", requested):
             await self.private(
                 player,
-                "Usage: /rate [1-5], /rate undo, or /rate revoke",
+                "Usage: /rate [1-5], /rate [map] [1-5], "
+                "/rate undo, or /rate revoke",
             )
             return
         rating = int(requested)
@@ -10671,45 +10924,81 @@ class TronnerRacing:
         player: Player,
         argument: str,
         access_level: int,
+        *,
+        submission_type: str = "report",
     ) -> None:
+        is_suggestion = submission_type == "suggestion"
+        config_prefix = "suggest" if is_suggestion else "report"
+        command_name = "/suggest" if is_suggestion else "/report"
+        singular = "suggestion" if is_suggestion else "report"
+        plural = "Suggestions" if is_suggestion else "Reports"
         maximum_characters = max(
-            1, int(self.config.get("report_maximum_characters", 1000))
+            1,
+            int(
+                self.config.get(
+                    f"{config_prefix}_maximum_characters",
+                    self.config.get("report_maximum_characters", 1000),
+                )
+            ),
         )
         message = plain_console_text(argument).strip()
         if not message:
-            await self.private(player, "Usage: /report [message]")
+            await self.private(player, f"Usage: {command_name} [message]")
             return
         if len(message) > maximum_characters:
             await self.private(
                 player,
-                f"Reports may be at most {maximum_characters} characters.",
+                f"{plural} may be at most {maximum_characters} characters.",
             )
             return
 
         api_key = self._report_api_key()
-        recipient = str(self.config.get("report_recipient", "")).strip()
-        sender = str(self.config.get("report_sender", "")).strip()
+        recipient = str(
+            self.config.get(
+                f"{config_prefix}_recipient",
+                self.config.get("report_recipient", ""),
+            )
+        ).strip()
+        sender = str(
+            self.config.get(
+                f"{config_prefix}_sender",
+                self.config.get("report_sender", ""),
+            )
+        ).strip()
         if not api_key or not recipient or not sender:
-            LOG.error("report service configuration is unavailable")
+            LOG.error("%s service configuration is unavailable", singular)
             await self.private(
                 player,
-                "Reports are temporarily unavailable. Please try again later.",
+                f"{plural} are temporarily unavailable. Please try again later.",
             )
             return
 
         now_monotonic = time.monotonic()
         maximum_admin_access = int(
-            self.config.get("report_admin_access_level", 1)
+            self.config.get(
+                f"{config_prefix}_admin_access_level",
+                self.config.get("report_admin_access_level", 1),
+            )
         )
         if access_level <= maximum_admin_access:
             cooldown_seconds = max(
                 0.0,
-                float(self.config.get("report_admin_cooldown_seconds", 30)),
+                float(
+                    self.config.get(
+                        f"{config_prefix}_admin_cooldown_seconds",
+                        self.config.get("report_admin_cooldown_seconds", 30),
+                    )
+                ),
             )
         else:
             cooldown_seconds = max(
                 0.0,
-                float(self.config.get("report_cooldown_seconds", 300)),
+                float(
+                    self.config.get(
+                        f"{config_prefix}_cooldown_seconds",
+                        self.config.get("report_cooldown_seconds", 300),
+                    )
+                ),
             )
         last_sent = self.report_last_sent.get(player.identity_key)
         if last_sent is not None and now_monotonic - last_sent < cooldown_seconds:
@@ -10719,7 +11008,7 @@ class TronnerRacing:
             )
             await self.private(
                 player,
-                f"Please wait {remaining} seconds before sending another report.",
+                f"Please wait {remaining} seconds before sending another {singular}.",
             )
             return
 
@@ -10737,10 +11026,11 @@ class TronnerRacing:
         ):
             self.report_success_epochs.popleft()
         if len(self.report_success_epochs) >= quota_maximum:
-            LOG.warning("report service quota guard reached")
+            LOG.warning("email submission service quota guard reached")
             await self.private(
                 player,
-                "The report limit has been reached. Please contact an admin directly.",
+                "The report and suggestion limit has been reached. "
+                "Please contact an admin directly.",
             )
             return
 
@@ -10751,7 +11041,10 @@ class TronnerRacing:
             plain_console_text(player.auth_name or "Not authenticated")
         )[:120] or "Not authenticated"
         timezone_name = str(
-            self.config.get("report_timezone", "America/Phoenix")
+            self.config.get(
+                f"{config_prefix}_timezone",
+                self.config.get("report_timezone", "America/Phoenix"),
+            )
         )
         try:
             report_timezone = ZoneInfo(timezone_name)
@@ -10760,22 +11053,25 @@ class TronnerRacing:
             report_timezone = datetime.timezone.utc
         reported_at = datetime.datetime.now(report_timezone)
         timestamp = reported_at.strftime("%Y-%m-%d %H:%M:%S %Z")
+        subject_label = "Feature suggestion" if is_suggestion else "Report"
         subject = (
-            f"[{timestamp}] Report from {username} "
+            f"[{timestamp}] {subject_label} from {username} "
             f"(auth: {authenticated_username})"
         )
         map_name = (
             self._display_map_name(self.current) if self.current else "Unknown"
         )
+        body_label = "Feature Suggestion" if is_suggestion else "Player Report"
+        message_label = "Suggestion" if is_suggestion else "Report"
         body = (
-            "Tronner Racing Player Report\n"
+            f"Tronner Racing {body_label}\n"
             "\n"
-            f"Reported: {timestamp}\n"
+            f"Submitted: {timestamp}\n"
             f"Display username: {username}\n"
             f"Authenticated username: {authenticated_username}\n"
             f"Current map: {map_name}\n"
             "\n"
-            "Report:\n"
+            f"{message_label}:\n"
             f"{message}\n"
         )
         try:
@@ -10787,18 +11083,27 @@ class TronnerRacing:
                 subject,
                 body,
                 str(self.config.get("resend_endpoint", RESEND_ENDPOINT)),
-                max(1.0, float(self.config.get("report_timeout_seconds", 10))),
+                max(
+                    1.0,
+                    float(
+                        self.config.get(
+                            f"{config_prefix}_timeout_seconds",
+                            self.config.get("report_timeout_seconds", 10),
+                        )
+                    ),
+                ),
             )
         except Exception as error:
             LOG.warning(
-                "report submission failed for username=%r auth=%r: %s",
+                "%s submission failed for username=%r auth=%r: %s",
+                singular,
                 username,
                 authenticated_username,
                 error,
             )
             await self.private(
                 player,
-                "Unable to send your report right now. Please try again later.",
+                f"Unable to send your {singular} right now. Please try again later.",
             )
             return
 
@@ -10808,11 +11113,25 @@ class TronnerRacing:
             "report_success_epochs", list(self.report_success_epochs)
         )
         LOG.info(
-            "report submitted for username=%r auth=%r",
+            "%s submitted for username=%r auth=%r",
+            singular,
             username,
             authenticated_username,
         )
-        await self.private(player, "Your report was sent. Thank you.")
+        await self.private(player, f"Your {singular} was sent. Thank you.")
+
+    async def _command_suggest(
+        self,
+        player: Player,
+        argument: str,
+        access_level: int,
+    ) -> None:
+        await self._command_report(
+            player,
+            argument,
+            access_level,
+            submission_type="suggestion",
+        )
 
     async def _command_leaderboard(self, player: Player) -> None:
         if not self.current:

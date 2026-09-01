@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from TronnerRacing import (
     MapEntry,
@@ -87,6 +88,47 @@ class MapRatingCommandTests(unittest.IsolatedAsyncioTestCase):
                 controller.store.rating_for(
                     controller.current.rating_key, player.identity_key
                 )
+            )
+            controller.store.close()
+
+    async def test_rate_can_target_a_specific_map(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = object.__new__(TronnerRacing)
+            controller.current = current_map()
+            target = MapEntry(
+                "Builder/maps/Orbit-v2.aamap.xml",
+                "Orbit",
+                "Builder",
+                "v2",
+                "maps",
+                "Builder/maps/Orbit-v2.aamap.xml",
+                Path("Orbit-v2.aamap.xml"),
+                (),
+                4,
+            )
+            controller.repository = SimpleNamespace(
+                search=lambda query: [target]
+                if query.casefold() == "orbit"
+                else []
+            )
+            controller.store = StateStore(Path(tmp) / "state.sqlite3")
+            controller.sink = Sink()
+            player = Player("racer", "Racer")
+
+            await controller._command_rate(player, "Orbit 5")
+
+            self.assertEqual(
+                controller.store.rating_for(target.rating_key, player.identity_key),
+                5,
+            )
+            self.assertIsNone(
+                controller.store.rating_for(
+                    controller.current.rating_key, player.identity_key
+                )
+            )
+            self.assertIn(
+                "Racer rated Orbit 5/5",
+                plain_console_text(controller.sink.commands[-1]),
             )
             controller.store.close()
 
