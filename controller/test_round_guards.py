@@ -9,7 +9,7 @@ from TronnerRacing import MapEntry, Player, StateStore, TronnerRacing as Control
 
 
 class RoundGuardTests(unittest.IsolatedAsyncioTestCase):
-    async def test_successful_skip_immediately_kills_idle_players(self):
+    async def test_successful_skip_defers_to_warn_first_progress_guard(self):
         class Sink:
             def __init__(self):
                 self.commands = []
@@ -36,13 +36,10 @@ class RoundGuardTests(unittest.IsolatedAsyncioTestCase):
             await controller._command_skip(player)
 
             self.assertTrue(controller.final_countdown_active)
-            self.assertEqual(
-                controller.sink.commands,
-                ["KILL_IDLE_PLAYERS 10"],
-            )
+            self.assertEqual(controller.sink.commands, [])
             controller.store.close()
 
-    async def test_end_immediately_kills_idle_players(self):
+    async def test_end_defers_to_warn_first_progress_guard(self):
         class Sink:
             def __init__(self):
                 self.commands = []
@@ -67,10 +64,7 @@ class RoundGuardTests(unittest.IsolatedAsyncioTestCase):
 
             await controller._command_end(player, access_level=0)
 
-            self.assertEqual(
-                controller.sink.commands,
-                ["KILL_IDLE_PLAYERS 10"],
-            )
+            self.assertEqual(controller.sink.commands, [])
             self.assertIsNotNone(controller.deadline_epoch)
             self.assertEqual(
                 controller.store.get_json("deadline_epoch", None),

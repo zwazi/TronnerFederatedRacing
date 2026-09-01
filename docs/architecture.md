@@ -24,6 +24,12 @@ the other followers. The leader is authoritative for map transitions and
 synchronized round release. Every region remains authoritative for its local
 client connections and sends personal-best deltas toward the leader.
 
+Final-countdown anti-grief enforcement is likewise regional: the leader owns
+the shared deadline, while each controller evaluates its local racers against
+the active map's route geometry. See the
+[final-countdown progress guard](final-countdown-guard.md) for its conservative
+fallback and warn-before-kill behavior.
+
 ## Trust boundaries
 
 - Public game and resource ports accept ordinary players and map downloads.
