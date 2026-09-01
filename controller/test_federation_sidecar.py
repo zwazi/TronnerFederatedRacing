@@ -1,15 +1,18 @@
 import asyncio
+import dataclasses
 import json
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
+import federation_sidecar
 from federation_protocol import Packet, ProtocolError, encode_packet
 from federation_sidecar import (
     ConfigurationError,
     ControllerPublishProtocol,
     FederationConfig,
+    FederationHealth,
     FollowerQueues,
     LadderlogProjection,
     LocalEventForwarder,
@@ -18,6 +21,7 @@ from federation_sidecar import (
     parse_engine_telemetry,
     publish_engine_telemetry,
     read_key,
+    should_relay_from_follower,
 )
 
 
@@ -346,8 +350,15 @@ class TelemetryTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ProtocolError, "cycle color"):
             parse_engine_telemetry(
-                b"CYCLE_V1 alice 12.5 1 2 0 1 30.25 0.042 1 0 5 0 0"
+                b"CYCLE_V1 alice 12.5 1 2 0 1 30.25 0.042 1 0 nan 0 0"
             )
+
+    def test_out_of_range_client_color_is_bounded_without_dropping_motion(self):
+        payload = parse_engine_telemetry(
+            b"CYCLE_V1 odd 12.5 1 2 0 1 30.25 0.042 1 0 503 1 58.4"
+        )
+        self.assertEqual(payload["cycle_rgb"], [4.0, 1.0, 4.0])
+        self.assertEqual(payload["x"], 1.0)
 
 
 class TelemetryPublisherTests(unittest.IsolatedAsyncioTestCase):
@@ -392,6 +403,52 @@ class TelemetryPublisherTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LocalForwarderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_engine_and_controller_consumers_use_independent_sockets(self):
+        forwarder = LocalEventForwarder(follower_config())
+        engine_socket = forwarder._socket_for(Path("/tmp/engine-import.sock"))
+        controller_socket = forwarder._socket_for(
+            Path("/tmp/controller-import.sock")
+        )
+
+        self.assertIsNot(engine_socket, controller_socket)
+        forwarder.close()
+
+    async def test_controller_event_retries_transient_local_backpressure(self):
+        forwarder = LocalEventForwarder(follower_config())
+        attempts = []
+
+        async def transient_send(path, data):
+            attempts.append((path, data))
+            return len(attempts) >= 3
+
+        forwarder._send = transient_send
+        await forwarder._send_control(Path("/tmp/controller.sock"), b"event")
+
+        self.assertEqual(len(attempts), 3)
+        forwarder.close()
+
+    async def test_controller_event_waits_past_previous_drop_deadline(self):
+        forwarder = LocalEventForwarder(follower_config())
+        attempts = []
+
+        async def delayed_send(path, data):
+            attempts.append((path, data))
+            return len(attempts) >= 60
+
+        forwarder._send = delayed_send
+        previous_delay = federation_sidecar.LOCAL_CONTROL_RETRY_SECONDS
+        federation_sidecar.LOCAL_CONTROL_RETRY_SECONDS = 0
+        try:
+            await asyncio.wait_for(
+                forwarder._send_control(Path("/tmp/controller.sock"), b"event"),
+                timeout=0.1,
+            )
+        finally:
+            federation_sidecar.LOCAL_CONTROL_RETRY_SECONDS = previous_delay
+
+        self.assertEqual(len(attempts), 60)
+        forwarder.close()
+
     async def test_backlogged_local_consumer_does_not_block_forwarding(self):
         class BackloggedSocket:
             def __init__(self):
@@ -475,6 +532,49 @@ class LocalForwarderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(flag_parts[-1], "1")
         forwarder.close()
 
+    async def test_unchanged_color_and_flags_are_not_sent_on_every_cycle(self):
+        forwarder = LocalEventForwarder(follower_config())
+        sent = []
+
+        async def capture(path, data):
+            sent.append(data.decode("ascii").split()[1])
+
+        forwarder._send = capture
+        payload = {
+            "player_id": "alice",
+            "observed_ns": time.time_ns(),
+            "game_time": 12.5,
+            "x": 1,
+            "y": 2,
+            "xdir": 1,
+            "ydir": 0,
+            "speed": 30,
+            "alive": True,
+            "chatting": False,
+            "cycle_rgb": [0.2, 0.4, 0.6],
+        }
+        packet = Packet(
+            version=1,
+            cluster_id="tronner-racing",
+            server_id="region-a",
+            boot_id="boot-a",
+            sequence=1,
+            sent_ns=time.time_ns(),
+            kind="cycle",
+            payload=payload,
+        )
+        await forwarder.engine(packet)
+        await forwarder.engine(
+            dataclasses.replace(
+                packet,
+                sequence=2,
+                payload={**payload, "observed_ns": time.time_ns(), "x": 2},
+            )
+        )
+        self.assertEqual(sent, ["COLOR", "STATE", "FLAGS", "STATE"])
+        forwarder.close()
+
+
     async def test_rename_removes_the_previous_engine_identity_first(self):
         forwarder = LocalEventForwarder(follower_config())
         sent = []
@@ -539,6 +639,75 @@ class LocalForwarderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent[1].startswith("GHOST_V1 CHAT "))
         self.assertEqual(bytes.fromhex(sent[1].split()[-1]).decode(), "hello")
         forwarder.close()
+
+
+class RelayPolicyTests(unittest.TestCase):
+    @staticmethod
+    def packet(kind, payload):
+        return Packet(
+            version=2,
+            cluster_id="tronner-racing",
+            server_id="region-b",
+            boot_id="boot-b",
+            sequence=1,
+            sent_ns=time.time_ns(),
+            kind=kind,
+            payload=payload,
+            sender_server_id="region-b",
+            destination_server_id="region-a",
+        )
+
+    def test_leader_only_events_stop_at_the_hub(self):
+        self.assertFalse(should_relay_from_follower(self.packet("command", {})))
+        self.assertFalse(should_relay_from_follower(self.packet("map_commit", {})))
+        self.assertFalse(
+            should_relay_from_follower(
+                self.packet("round_sync", {"action": "ready"})
+            )
+        )
+        self.assertFalse(
+            should_relay_from_follower(
+                self.packet("records_delta", {"operation": "snapshot_request"})
+            )
+        )
+
+    def test_shared_state_still_fans_out(self):
+        for kind in ("heartbeat", "player_snapshot", "player_event", "chat", "cycle"):
+            self.assertTrue(should_relay_from_follower(self.packet(kind, {})))
+
+
+class FederationHealthTests(unittest.TestCase):
+    def test_snapshot_records_authenticated_origin_and_kind(self):
+        config = follower_config()
+        health = FederationHealth(config)
+        packet = Packet(
+            version=1,
+            cluster_id="tronner-racing",
+            server_id="region-a",
+            boot_id="boot-a",
+            sequence=9,
+            sent_ns=time.time_ns(),
+            kind="heartbeat",
+            payload={},
+        )
+        health.observe(packet)
+        with tempfile.TemporaryDirectory() as directory:
+            previous = federation_sidecar.FEDERATION_HEALTH_FILE
+            federation_sidecar.FEDERATION_HEALTH_FILE = (
+                Path(directory) / "health.json"
+            )
+            try:
+                health.write()
+                saved = json.loads(
+                    federation_sidecar.FEDERATION_HEALTH_FILE.read_text("utf-8")
+                )
+            finally:
+                federation_sidecar.FEDERATION_HEALTH_FILE = previous
+        self.assertEqual(saved["server_id"], "region-b")
+        self.assertEqual(
+            saved["received"]["region-a"]["kinds"]["heartbeat"]["sequence"],
+            9,
+        )
 
 
 class ControllerPublishTests(unittest.TestCase):

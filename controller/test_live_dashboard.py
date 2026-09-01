@@ -7,6 +7,7 @@ from live_dashboard import (
     history_document_id,
     leaderboard_document_id,
     map_leaderboard,
+    map_rating_fields,
     overall_leaderboard,
 )
 
@@ -111,6 +112,20 @@ class LiveDashboardTest(unittest.TestCase):
         self.assertEqual(first, leaderboard_document_id("author/maps/name-version.aamap.xml"))
         self.assertRegex(first, r"^map_[0-9a-f]{64}$")
 
+    def test_rating_fields_reject_invalid_or_incomplete_averages(self):
+        self.assertEqual(
+            map_rating_fields({"rating": 4.333333, "ratingCount": 3}),
+            {"rating": 4.3333, "ratingCount": 3},
+        )
+        self.assertEqual(
+            map_rating_fields({"rating": None, "ratingCount": 0}),
+            {"rating": None, "ratingCount": 0},
+        )
+        self.assertEqual(
+            map_rating_fields({"rating": 6, "ratingCount": 1}),
+            {"rating": None, "ratingCount": 0},
+        )
+
     def test_catalog_carries_each_current_versions_record_count(self):
         firebase = LeaderboardFirebase()
         publisher = FirebaseLiveDashboardPublisher(
@@ -127,6 +142,42 @@ class LiveDashboardTest(unittest.TestCase):
         )
         counts = {entry["mapKey"]: entry["entryCount"] for entry in catalog["maps"]}
         self.assertEqual(counts, {"map-a": 2, "map-b": 2})
+
+    def test_catalog_includes_rated_map_without_a_finish(self):
+        firebase = LeaderboardFirebase()
+        publisher = FirebaseLiveDashboardPublisher(
+            firebase, "https://example.firebaseio.com", FakeStore()
+        )
+        publisher.publish_leaderboards([], {
+            "map-unfinished": {
+                "mapId": "map-id",
+                "name": "Unfinished",
+                "author": "Builder",
+                "version": "1",
+                "ratingKey": "builder/maps/unfinished",
+                "rating": 4.5,
+                "ratingCount": 2,
+            }
+        })
+
+        catalog = next(
+            payload for collection, document_id, payload in firebase.documents
+            if collection == "racingCatalog" and document_id == "current"
+        )
+        self.assertEqual(catalog["maps"], [{
+            "mapKey": "map-unfinished",
+            "mapId": "map-id",
+            "name": "Unfinished",
+            "author": "Builder",
+            "version": "1",
+            "storagePath": "",
+            "ratingKey": "builder/maps/unfinished",
+            "rating": 4.5,
+            "ratingCount": 2,
+            "leaderboardId": leaderboard_document_id("map-unfinished"),
+            "entryCount": 0,
+            "record": None,
+        }])
 
     def test_chat_retention_uses_shallow_global_keys(self):
         publisher = FirebaseLiveDashboardPublisher(

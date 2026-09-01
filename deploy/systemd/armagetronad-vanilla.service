@@ -1,0 +1,36 @@
+[Unit]
+Description=Unfederated vanilla Armagetron dedicated server
+Documentation=https://github.com/ArmagetronAd/armagetronad
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/armagetronad-vanilla/READY_TO_START
+
+[Service]
+Type=simple
+User=armagetron
+Group=armagetron
+WorkingDirectory=/var/lib/armagetronad-vanilla
+StateDirectory=armagetronad-vanilla
+RuntimeDirectory=armagetronad-vanilla
+RuntimeDirectoryMode=0770
+ExecStartPre=/usr/bin/touch /var/lib/armagetronad-vanilla/console.in
+ExecStart=/opt/armagetronad-vanilla/bin/armagetronad-dedicated --daemon --input /var/lib/armagetronad-vanilla/console.in --configdir /etc/armagetronad-vanilla --datadir /opt/armagetronad-vanilla/share/games/armagetronad-dedicated --userdatadir /var/lib/armagetronad-vanilla --vardir /var/lib/armagetronad-vanilla --extraconfig server.cfg
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/armagetronad-vanilla /run/armagetronad-vanilla
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

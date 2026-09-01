@@ -144,8 +144,12 @@ fi
 
 install -d -o root -g root -m 0755 /opt/TronnerRacing
 rsync -a --delete --exclude __pycache__ "$repository_dir/controller/" /opt/TronnerRacing/
+install -m 0755 "$repository_dir/tools/check_federation_health.py" \
+    /opt/TronnerRacing/check_federation_health.py
 chown -R root:root /opt/TronnerRacing
-chmod 0755 /opt/TronnerRacing/TronnerRacing.py /opt/TronnerRacing/federation_sidecar.py
+chmod 0755 /opt/TronnerRacing/TronnerRacing.py \
+    /opt/TronnerRacing/federation_sidecar.py \
+    /opt/TronnerRacing/check_federation_health.py
 
 game_config_dir=/opt/armagetronad/etc/games/armagetronad-dedicated
 install -d -o root -g armagetron -m 0755 "$game_config_dir"

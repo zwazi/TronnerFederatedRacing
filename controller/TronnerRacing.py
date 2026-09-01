@@ -67,13 +67,20 @@ MAX_FEDERATION_CONTROLLER_EVENT_BYTES = 16_384
 MAX_FEDERATION_PLAYER_NAME_CHARACTERS = 128
 MAX_FEDERATION_CHAT_CHARACTERS = 512
 MAX_FEDERATION_RECORDS_PER_BATCH = 20
+MAX_FEDERATION_PREFERENCES_PER_BATCH = 100
+MAX_FEDERATION_CATALOG_EXCLUSIONS = 256
 MAX_FEDERATION_RECORD_KEY_CHARACTERS = 1024
 MAX_FEDERATION_RECORD_IDENTITY_CHARACTERS = 256
+MAX_FEDERATION_MAP_BYTES = 4 * 1024 * 1024
 SERVER_CONSOLE_HISTORY_LINES = 250
 SERVER_CONSOLE_INITIAL_LINES = 100
 SERVER_CONSOLE_BATCH_SIZE = 25
 SERVER_CONSOLE_STREAM_SECONDS = 90.0
 SERVER_CONSOLE_MAX_FILE_BYTES = 8 * 1024 * 1024
+DEFAULT_START_COUNTDOWN_SECONDS = 3
+MIN_START_COUNTDOWN_SECONDS = 1
+MAX_START_COUNTDOWN_SECONDS = 60
+START_MODES = frozenset({"brake", "immediate", "countdown", "respawn"})
 SERVER_CONSOLE_SENSITIVE_RE = re.compile(
     r"(?i)\b(?:admin[_-]?pass|password|passphrase|secret|api[_-]?key|"
     r"authorization|bearer|private[_-]?key)\b"
@@ -132,6 +139,40 @@ SERVER_MANAGEMENT_ENGINE_OPTIONS = {
     "CYCLE_ACCEL": (0.0, 1_000.0),
     "CYCLE_BRAKE": (0.0, 1.0),
 }
+
+
+def normalize_start_preference(value: object) -> str | None:
+    """Return one canonical persisted start preference, including its timer."""
+    parts = str(value).strip().casefold().split()
+    if not parts or parts[0] not in START_MODES:
+        return None
+    mode = parts[0]
+    if mode != "countdown":
+        return mode if len(parts) == 1 else None
+    if len(parts) == 1:
+        return "countdown"
+    if len(parts) != 2 or not re.fullmatch(r"[0-9]+", parts[1]):
+        return None
+    seconds = int(parts[1])
+    if not MIN_START_COUNTDOWN_SECONDS <= seconds <= MAX_START_COUNTDOWN_SECONDS:
+        return None
+    return (
+        "countdown"
+        if seconds == DEFAULT_START_COUNTDOWN_SECONDS
+        else f"countdown {seconds}"
+    )
+
+
+def start_preference_details(value: object) -> tuple[str, int, str]:
+    """Return mode, countdown seconds, and canonical persisted preference."""
+    preference = normalize_start_preference(value) or "immediate"
+    parts = preference.split()
+    seconds = (
+        int(parts[1])
+        if parts[0] == "countdown" and len(parts) == 2
+        else DEFAULT_START_COUNTDOWN_SECONDS
+    )
+    return parts[0], seconds, preference
 
 
 def _ascii_compatible_encoding(value: object) -> str | None:
@@ -1185,8 +1226,8 @@ USER_COMMAND_HELP = (
         "Always use a spawn number; omit # for latest or use 0 to clear it.",
     ),
     (
-        "/start [brake|immediate|countdown|respawn]",
-        "Choose how your cycle begins moving after each respawn.",
+        "/start [brake|immediate|countdown [1-60]|respawn]",
+        "Choose how your cycle begins moving and optionally set its countdown.",
     ),
     (
         "/display_server_tags",
@@ -1619,6 +1660,7 @@ class Player:
     dead_since_monotonic: float | None = None
     suspended_votes: dict[str, int] = dataclasses.field(default_factory=dict)
     start_mode: str = "immediate"
+    start_countdown_seconds: int = DEFAULT_START_COUNTDOWN_SECONDS
     display_server_tags: bool = False
     pending_start_mode: str = "immediate"
     manual_restart_pending: bool = False
@@ -2795,6 +2837,17 @@ class StateStore:
         ).fetchone()
         return float(row[0]) if row and row[0] is not None else None
 
+    def rating_summaries(self) -> dict[str, tuple[float, int]]:
+        """Return every map rating using one bounded aggregate query."""
+        rows = self.current_connection().execute(
+            "SELECT map_key, AVG(rating), COUNT(*) FROM ratings GROUP BY map_key"
+        ).fetchall()
+        return {
+            str(row[0]): (float(row[1]), int(row[2]))
+            for row in rows
+            if row[1] is not None and int(row[2]) > 0
+        }
+
     def rating_for(self, map_key: str, identity_key: str) -> int | None:
         row = self.connection.execute(
             "SELECT rating FROM ratings WHERE map_key=? AND identity_key=?",
@@ -3956,6 +4009,75 @@ class MapRepository:
             if not cached_dtd.exists():
                 shutil.copy2(dtd, cached_dtd)
 
+    def install_federated_resource(
+        self,
+        key: str,
+        data: bytes,
+        expected_sha256: str,
+    ) -> MapEntry:
+        """Validate and immutably install one leader-selected map resource."""
+
+        if (
+            not isinstance(data, bytes)
+            or not data
+            or len(data) > MAX_FEDERATION_MAP_BYTES
+        ):
+            raise ValueError("invalid federated map size")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ValueError("invalid federated map digest")
+        actual_sha256 = hashlib.sha256(data).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValueError("federated map digest mismatch")
+
+        temporary_root = self.revision_dir / ".federation-incoming"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        temporary = temporary_root / f"{actual_sha256}.{os.getpid()}.tmp"
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            entry = self._parse_map(temporary, source_path=key)
+            if entry.key != key:
+                raise ValueError(
+                    f"federated map identity mismatch: expected {key}, got {entry.key}"
+                )
+            install_immutable_file(temporary, self.public_dir / key)
+            install_immutable_file(temporary, self.cache_dir / key)
+            for dtd in self.public_dir.glob("*.dtd"):
+                cached_dtd = self.cache_dir / dtd.name
+                if not cached_dtd.exists():
+                    shutil.copy2(dtd, cached_dtd)
+            return self._parse_external(self.cache_dir / key, key)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+    def fetch_federated_resource(
+        self,
+        base_url: str,
+        key: str,
+        expected_sha256: str,
+        timeout_seconds: float = 10.0,
+    ) -> MapEntry:
+        """Fetch one authenticated leader selection over the private overlay."""
+
+        parsed = urllib.parse.urlsplit(base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("invalid federation leader resource URL")
+        quoted_key = "/".join(
+            urllib.parse.quote(component, safe="-._~")
+            for component in key.split("/")
+        )
+        url = urllib.parse.urljoin(base_url.rstrip("/") + "/", quoted_key)
+        request = urllib.request.Request(
+            url,
+            headers={"Accept": "application/xml, text/xml, */*"},
+        )
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            data = response.read(MAX_FEDERATION_MAP_BYTES + 1)
+        return self.install_federated_resource(key, data, expected_sha256)
+
     def find_by_spec(self, spec: str) -> MapEntry | None:
         key = spec.split("(", 1)[0]
         if key in self.catalog:
@@ -4118,16 +4240,15 @@ class TronnerRacing:
         self.repository = MapRepository(config)
         self.store = StateStore(Path(config["database"]))
         saved_start_preferences = self.store.get_json("start_preferences", {})
-        self.start_preferences: dict[str, str] = {
-            str(identity_key): str(mode).casefold()
-            for identity_key, mode in (
-                saved_start_preferences.items()
-                if isinstance(saved_start_preferences, dict)
-                else ()
-            )
-            if str(mode).casefold()
-            in {"brake", "immediate", "countdown", "respawn"}
-        }
+        self.start_preferences: dict[str, str] = {}
+        for identity_key, raw_preference in (
+            saved_start_preferences.items()
+            if isinstance(saved_start_preferences, dict)
+            else ()
+        ):
+            preference = normalize_start_preference(raw_preference)
+            if preference is not None:
+                self.start_preferences[str(identity_key)] = preference
         saved_server_tag_preferences = self.store.get_json(
             "display_server_tag_preferences", {}
         )
@@ -4152,6 +4273,18 @@ class TronnerRacing:
         self.spawn_preferences: dict[str, dict[str, int]] = (
             loaded_preferences if isinstance(loaded_preferences, dict) else {}
         )
+        saved_preference_versions = self.store.get_json(
+            "federation_preference_versions", {}
+        )
+        self.federation_preference_versions: dict[str, list[object]] = (
+            saved_preference_versions
+            if isinstance(saved_preference_versions, dict)
+            else {}
+        )
+        self.federation_preference_pending: dict[str, dict[str, object]] = {}
+        self._federation_preference_snapshot_cache: dict[
+            str, tuple[float, list[dict[str, object]]]
+        ] = {}
         self.command_windows: dict[int, collections.deque[float]] = {}
         self.command_warning_times: dict[int, float] = {}
         saved_helpful_cycle = self.store.get_json("helpful_message_cycle", {})
@@ -4286,9 +4419,24 @@ class TronnerRacing:
         self.federation_role = str(federation.get("role", "off")).casefold()
         if self.federation_role not in {"off", "leader", "follower"}:
             raise ValueError("federation role must be off, leader, or follower")
-        self.federation_local_server_id = clean_console_text(
-            federation.get("local_server_id", "")
+        self.server_id = clean_console_text(
+            config.get(
+                "server_id",
+                federation.get(
+                    "local_server_id",
+                    config.get("firebase_server_id", "local"),
+                ),
+            )
         )
+        if not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", self.server_id
+        ):
+            raise ValueError("invalid server_id")
+        self.federation_local_server_id = clean_console_text(
+            federation.get("local_server_id", self.server_id)
+        )
+        if not self.federation_local_server_id:
+            self.federation_local_server_id = self.server_id
         self.federation_remote_server_id = clean_console_text(
             federation.get(
                 "remote_server_id",
@@ -4375,6 +4523,7 @@ class TronnerRacing:
             )
         if self.federation_role != "off" and not self.federation_local_server_id:
             raise ValueError("federation requires local_server_id")
+        self._seed_federation_preference_versions()
         self.federation_sync_chat = bool(federation.get("sync_chat", True))
         self.federation_sync_presence = bool(
             federation.get("sync_presence", True)
@@ -4403,6 +4552,7 @@ class TronnerRacing:
         self.federation_remote_round_ready_at = 0.0
         self.federation_round_last_release_at = 0.0
         self.federation_round_release_key = ""
+        self.federation_round_release_at = 0.0
         self.federation_remote_players: dict[str, dict[str, object]] = {}
         self.federation_remote_round_ready: dict[str, tuple[str, float]] = {}
         self.federation_remote_maps: dict[str, str] = {}
@@ -4425,6 +4575,30 @@ class TronnerRacing:
         self._federation_publish_transport: socket.socket | None = None
         self.federation_prepared_map_key: str | None = None
         self.federation_prepared_map_activate_ns = 0
+        self.federation_prepared_map_sha256 = ""
+        self.federation_map_prepare_lock = asyncio.Lock()
+        self.federation_leader_current_map_key = ""
+        self.federation_leader_next_map_key = ""
+        self._federation_server_state_last_publish_monotonic = 0.0
+        self.federation_leader_resource_base_url = str(
+            federation.get("leader_resource_base_url", "")
+        ).strip()
+        self.federation_resource_timeout_seconds = max(
+            1.0,
+            min(
+                30.0,
+                float(federation.get("resource_timeout_seconds", 10.0)),
+            ),
+        )
+        if self.federation_leader_resource_base_url:
+            parsed_leader_resources = urllib.parse.urlsplit(
+                self.federation_leader_resource_base_url
+            )
+            if (
+                parsed_leader_resources.scheme not in {"http", "https"}
+                or not parsed_leader_resources.netloc
+            ):
+                raise ValueError("invalid federation leader_resource_base_url")
         self.federation_catalog_refresh_after_monotonic = 0.0
         self._federation_event_tasks: set[asyncio.Task] = set()
         self._federation_record_wakeup = asyncio.Event()
@@ -4453,7 +4627,7 @@ class TronnerRacing:
         if (
             isinstance(live_config, dict)
             and live_config.get("enabled") is True
-            and self.federation_leader
+            and self.live_dashboard_authority
             and self.repository.firebase is not None
         ):
             self.live_dashboard = FirebaseLiveDashboardPublisher(
@@ -4480,6 +4654,10 @@ class TronnerRacing:
     @property
     def federation_leader(self) -> bool:
         return getattr(self, "federation_role", "off") == "leader"
+
+    @property
+    def live_dashboard_authority(self) -> bool:
+        return getattr(self, "federation_role", "off") != "follower"
 
     async def _start_federation_import(self) -> None:
         if self.federation_import_socket is None:
@@ -4546,15 +4724,23 @@ class TronnerRacing:
             self.federation_map_prepare_lead_seconds * 1_000_000_000
         )
         transition_id = f"{activation_at_ns:x}-{entry.key.encode('utf-8').hex()[:24]}"
-        published = await self._publish_federation_control(
-            "map_prepare",
-            {
-                "transition_id": transition_id,
-                "map_key": entry.key,
-                "size_factor": size_factor,
-                "activate_at_ns": activation_at_ns,
-            },
-        )
+        map_sha256 = hashlib.sha256(entry.local_path.read_bytes()).hexdigest()
+        payload = {
+            "transition_id": transition_id,
+            "map_key": entry.key,
+            "map_sha256": map_sha256,
+            "size_factor": size_factor,
+            "activate_at_ns": activation_at_ns,
+        }
+        published = False
+        # Map preparation is idempotent and immutable. Three compact copies
+        # avoid a second catalog synchronization protocol for UDP loss.
+        for attempt in range(3):
+            published = await self._publish_federation_control(
+                "map_prepare", payload
+            ) or published
+            if attempt < 2:
+                await asyncio.sleep(0.03)
         if not published:
             # Observed CURRENT_MAP remains the fail-safe synchronization path;
             # do not delay the live leader if its local sidecar is unavailable.
@@ -4671,6 +4857,11 @@ class TronnerRacing:
                 "countdown_state": "countdown",
                 "round_sync": "round_sync",
             }.get(kind)
+            if (
+                kind == "controller_message"
+                and payload.get("scope") == "server_state"
+            ):
+                state_bucket = "server_state"
             if kind == "player_event":
                 state_bucket = (
                     "round"
@@ -4701,7 +4892,16 @@ class TronnerRacing:
             elif kind == "command":
                 await self._handle_federation_command(server_id, payload)
             elif kind == "controller_message":
-                if server_id == self.federation_leader_server_id:
+                scope = str(payload.get("scope", ""))
+                if scope.startswith("federation_catalog_exclusion_"):
+                    await self._handle_federation_catalog_exclusion_message(
+                        server_id, payload
+                    )
+                elif scope.startswith("federation_preference_"):
+                    await self._handle_federation_preference_message(
+                        server_id, payload
+                    )
+                elif server_id == self.federation_leader_server_id:
                     await self._handle_federation_controller_message(payload)
             elif kind == "countdown_state":
                 if server_id == self.federation_leader_server_id:
@@ -5198,6 +5398,30 @@ class TronnerRacing:
         payload: dict[str, object],
     ) -> None:
         scope = str(payload.get("scope", ""))
+        if scope == "server_state":
+            if not self.federation_follower:
+                return
+            current_map_key = str(payload.get("current_map_key", ""))
+            next_map_key = str(payload.get("next_map_key", ""))
+            for map_key in (current_map_key, next_map_key):
+                if (
+                    len(map_key) > 512
+                    or "\x00" in map_key
+                    or "\r" in map_key
+                    or "\n" in map_key
+                ):
+                    return
+            changed = (
+                self.federation_leader_current_map_key != current_map_key
+                or self.federation_leader_next_map_key != next_map_key
+            )
+            self.federation_leader_current_map_key = current_map_key
+            self.federation_leader_next_map_key = next_map_key
+            if changed:
+                # Force the one-second refresher to replace any stale local
+                # SERVER_OPTIONS immediately after authoritative state lands.
+                self._server_options_last = None
+            return
         if scope not in {"broadcast", "broadcast_block", "private", "private_block", "center", "center_private"}:
             return
         target_server_id = str(payload.get("target_server_id", ""))
@@ -5585,6 +5809,7 @@ class TronnerRacing:
             return
         release_at = time.time() + self.federation_round_sync_release_lead_seconds
         self.federation_round_release_key = map_key
+        self.federation_round_release_at = release_at
         self.federation_round_last_release_at = release_at
         await self.sink.send(f"FEDERATION_ROUND_RELEASE_AT {release_at:.6f}")
         await self._publish_round_sync_reliably(
@@ -5661,7 +5886,17 @@ class TronnerRacing:
         now = time.time()
         if not math.isfinite(release_at) or release_at < now - 5 or release_at > now + 5:
             return
+        if (
+            self.federation_round_release_key == map_key
+            and math.isclose(
+                getattr(self, "federation_round_release_at", 0.0),
+                release_at,
+                abs_tol=0.000001,
+            )
+        ):
+            return
         self.federation_round_release_key = map_key
+        self.federation_round_release_at = release_at
         await self.sink.send(f"FEDERATION_ROUND_RELEASE_AT {release_at:.6f}")
         LOG.info(
             "accepted synchronized federation round release: map=%s at=%.6f",
@@ -5807,6 +6042,7 @@ class TronnerRacing:
             if self.federation_prepared_map_key == entry.key:
                 self.federation_prepared_map_key = None
                 self.federation_prepared_map_activate_ns = 0
+                self.federation_prepared_map_sha256 = ""
             return
         if self.transitioning and self.transition_target_key == entry.key:
             return
@@ -5819,6 +6055,7 @@ class TronnerRacing:
                 if self.federation_prepared_map_key == entry.key:
                     self.federation_prepared_map_key = None
                     self.federation_prepared_map_activate_ns = 0
+                    self.federation_prepared_map_sha256 = ""
                 return
             if self.transitioning and self.transition_target_key == entry.key:
                 return
@@ -5836,6 +6073,7 @@ class TronnerRacing:
             if self.federation_prepared_map_key == entry.key:
                 self.federation_prepared_map_key = None
                 self.federation_prepared_map_activate_ns = 0
+                self.federation_prepared_map_sha256 = ""
             self.round_started_epoch = None
             self.deadline_epoch = None
             self.store.set_json("current_key", entry.key)
@@ -5859,12 +6097,64 @@ class TronnerRacing:
                 federate=False,
             )
 
-    async def _find_federation_map(self, map_key: str) -> MapEntry | None:
-        """Resolve a leader map, refreshing Firebase once when it is new."""
+    async def _find_federation_map(
+        self,
+        map_key: str,
+        expected_sha256: str = "",
+    ) -> MapEntry | None:
+        """Resolve the exact leader map, using Firebase only as a fallback."""
+
         entry = self.repository.find_by_spec(map_key)
-        firebase = getattr(self.repository, "firebase", None)
-        if entry is not None or firebase is None:
+        if entry is not None and expected_sha256:
+            actual_sha256 = hashlib.sha256(entry.local_path.read_bytes()).hexdigest()
+            if actual_sha256 != expected_sha256:
+                LOG.error(
+                    "local immutable map differs from leader digest: "
+                    "map=%s local=%s leader=%s",
+                    map_key,
+                    actual_sha256,
+                    expected_sha256,
+                )
+                entry = None
+        if entry is not None:
             return entry
+
+        leader_base_url = getattr(
+            self, "federation_leader_resource_base_url", ""
+        )
+        if expected_sha256 and leader_base_url:
+            async with self.map_lock:
+                entry = self.repository.find_by_spec(map_key)
+                if entry is not None:
+                    actual_sha256 = hashlib.sha256(
+                        entry.local_path.read_bytes()
+                    ).hexdigest()
+                    if actual_sha256 == expected_sha256:
+                        return entry
+                try:
+                    entry = await asyncio.to_thread(
+                        self.repository.fetch_federated_resource,
+                        leader_base_url,
+                        map_key,
+                        expected_sha256,
+                        getattr(self, "federation_resource_timeout_seconds", 10.0),
+                    )
+                    LOG.info(
+                        "installed leader map over federation overlay: "
+                        "map=%s sha256=%s",
+                        map_key,
+                        expected_sha256,
+                    )
+                    return entry
+                except Exception:
+                    LOG.exception(
+                        "unable to fetch exact leader map over federation overlay: %s",
+                        map_key,
+                    )
+
+        firebase = getattr(self.repository, "firebase", None)
+        if firebase is None:
+            return None
         if time.monotonic() < getattr(
             self,
             "federation_catalog_refresh_after_monotonic",
@@ -5940,9 +6230,8 @@ class TronnerRacing:
             or "\n" in map_key
         ):
             return
-        entry = await self._find_federation_map(map_key)
-        if entry is None:
-            LOG.warning("leader prepared map is unavailable locally: %s", map_key)
+        map_sha256 = str(payload.get("map_sha256", ""))
+        if map_sha256 and not re.fullmatch(r"[0-9a-f]{64}", map_sha256):
             return
         try:
             size_factor = float(payload.get("size_factor", 0.0))
@@ -5950,14 +6239,28 @@ class TronnerRacing:
             return
         if not math.isfinite(size_factor) or abs(size_factor) > 1000:
             return
-        await asyncio.to_thread(self.repository.cache_for_server, entry)
-        self.federation_prepared_map_key = entry.key
-        self.federation_prepared_map_activate_ns = activate_at_ns
-        LOG.info(
-            "pre-cached leader map: map=%s leader_activate_at_ns=%d",
-            entry.key,
-            activate_at_ns,
-        )
+        async with self.federation_map_prepare_lock:
+            if (
+                self.federation_prepared_map_key == map_key
+                and self.federation_prepared_map_activate_ns == activate_at_ns
+                and self.federation_prepared_map_sha256 == map_sha256
+            ):
+                return
+            entry = await self._find_federation_map(map_key, map_sha256)
+            if entry is None:
+                LOG.warning(
+                    "leader prepared map is unavailable locally: %s", map_key
+                )
+                return
+            await asyncio.to_thread(self.repository.cache_for_server, entry)
+            self.federation_prepared_map_key = entry.key
+            self.federation_prepared_map_activate_ns = activate_at_ns
+            self.federation_prepared_map_sha256 = map_sha256
+            LOG.info(
+                "pre-cached leader map: map=%s leader_activate_at_ns=%d",
+                entry.key,
+                activate_at_ns,
+            )
 
     def _apply_advertised_game_encoding(self, advertised: object) -> None:
         current = getattr(
@@ -6390,6 +6693,781 @@ class TronnerRacing:
                 scheduled += 1
         return scheduled
 
+    @staticmethod
+    def _validated_federation_catalog_exclusions(value: object) -> set[str]:
+        if (
+            not isinstance(value, list)
+            or len(value) > MAX_FEDERATION_CATALOG_EXCLUSIONS
+        ):
+            raise ValueError("invalid federation catalog exclusions")
+        exclusions: set[str] = set()
+        for raw_key in value:
+            if not isinstance(raw_key, str):
+                raise ValueError("invalid federation catalog exclusion key")
+            key = raw_key.strip()
+            if (
+                not key
+                or len(key) > 512
+                or not key.endswith(MAP_SUFFIX)
+                or key.startswith("/")
+                or ".." in Path(key).parts
+                or any(ord(character) < 32 for character in key)
+            ):
+                raise ValueError("invalid federation catalog exclusion key")
+            exclusions.add(key)
+        if len(exclusions) != len(value):
+            raise ValueError("duplicate federation catalog exclusion key")
+        return exclusions
+
+    async def _publish_federation_catalog_exclusions(
+        self,
+        target_server_id: str = "",
+    ) -> bool:
+        if not getattr(self, "federation_leader", False):
+            return False
+        exclusions = sorted(getattr(self, "excluded_map_keys", set()))
+        if len(exclusions) > MAX_FEDERATION_CATALOG_EXCLUSIONS:
+            LOG.error(
+                "refusing to publish %d catalog exclusions; maximum is %d",
+                len(exclusions),
+                MAX_FEDERATION_CATALOG_EXCLUSIONS,
+            )
+            return False
+        payload: dict[str, object] = {
+            "scope": "federation_catalog_exclusion_snapshot",
+            "exclusions": exclusions,
+        }
+        if target_server_id:
+            payload["target_server_id"] = target_server_id
+        return await self._publish_federation_control(
+            "controller_message", payload
+        )
+
+    async def _apply_federation_catalog_exclusions(
+        self,
+        exclusions: set[str],
+    ) -> None:
+        if exclusions == getattr(self, "excluded_map_keys", set()):
+            return
+        self.excluded_map_keys = set(exclusions)
+        self.excluded_map_reasons = {}
+        self.repository.excluded_keys = self.excluded_map_keys
+        self.store.set_json(
+            "excluded_map_keys", sorted(self.excluded_map_keys)
+        )
+        self.store.set_json("excluded_map_reasons", {})
+        await asyncio.to_thread(self.repository.scan)
+        self._reconcile_rotation()
+        LOG.info(
+            "applied leader catalog exclusions: %d excluded, %d available",
+            len(self.excluded_map_keys),
+            len(self.repository.catalog),
+        )
+
+    async def _handle_federation_catalog_exclusion_message(
+        self,
+        server_id: str,
+        payload: dict[str, object],
+    ) -> None:
+        scope = str(payload.get("scope", ""))
+        if scope == "federation_catalog_exclusion_request":
+            if self.federation_leader:
+                await self._publish_federation_catalog_exclusions(server_id)
+            return
+        if scope != "federation_catalog_exclusion_snapshot":
+            raise ValueError("invalid federation catalog exclusion scope")
+        if (
+            not self.federation_follower
+            or server_id != self.federation_leader_server_id
+            or str(payload.get("target_server_id", ""))
+            not in {"", self.federation_local_server_id}
+        ):
+            return
+        exclusions = self._validated_federation_catalog_exclusions(
+            payload.get("exclusions")
+        )
+        map_lock = getattr(self, "map_lock", None)
+        if map_lock is None:
+            await self._apply_federation_catalog_exclusions(exclusions)
+        else:
+            async with map_lock:
+                await self._apply_federation_catalog_exclusions(exclusions)
+        complete = getattr(
+            self, "_federation_catalog_exclusion_complete", None
+        )
+        if complete is not None:
+            complete.set()
+
+    async def federation_catalog_exclusion_sync(self) -> None:
+        if self.federation_role == "off":
+            return
+        if self.federation_leader:
+            while True:
+                await self._publish_federation_catalog_exclusions()
+                await asyncio.sleep(30.0)
+        self._federation_catalog_exclusion_complete = asyncio.Event()
+        while not self._federation_catalog_exclusion_complete.is_set():
+            await self._publish_federation_control(
+                "controller_message",
+                {"scope": "federation_catalog_exclusion_request"},
+            )
+            try:
+                await asyncio.wait_for(
+                    self._federation_catalog_exclusion_complete.wait(),
+                    timeout=2.0,
+                )
+            except TimeoutError:
+                continue
+
+    @staticmethod
+    def _federation_preference_key(
+        preference_type: str,
+        identity_key: str,
+        map_key: str = "",
+    ) -> str:
+        preference_type = str(preference_type)
+        identity_key = str(identity_key)
+        map_key = str(map_key)
+        if preference_type not in {"start", "tags", "spawn"}:
+            raise ValueError("invalid federation preference type")
+        if (
+            not identity_key
+            or len(identity_key) > 256
+            or any(ord(character) < 32 for character in identity_key)
+        ):
+            raise ValueError("invalid federation preference identity")
+        if preference_type == "spawn":
+            if (
+                not map_key
+                or len(map_key) > 512
+                or any(ord(character) < 32 for character in map_key)
+            ):
+                raise ValueError("invalid federation preference map")
+        elif map_key:
+            raise ValueError("unexpected federation preference map")
+        return json.dumps(
+            [preference_type, map_key, identity_key],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def _parse_federation_preference_key(
+        cls,
+        key: object,
+    ) -> tuple[str, str, str]:
+        if not isinstance(key, str) or len(key) > 1024:
+            raise ValueError("invalid federation preference key")
+        try:
+            value = json.loads(key)
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid federation preference key") from exc
+        if not isinstance(value, list) or len(value) != 3:
+            raise ValueError("invalid federation preference key")
+        preference_type, map_key, identity_key = map(str, value)
+        canonical = cls._federation_preference_key(
+            preference_type,
+            identity_key,
+            map_key,
+        )
+        if canonical != key:
+            raise ValueError("non-canonical federation preference key")
+        return preference_type, map_key, identity_key
+
+    def _current_federation_preference_keys(self) -> set[str]:
+        keys = {
+            self._federation_preference_key("start", identity_key)
+            for identity_key in self.start_preferences
+        }
+        keys.update(
+            self._federation_preference_key("tags", identity_key)
+            for identity_key in self.display_server_tag_preferences
+        )
+        for map_key, preferences in self.spawn_preferences.items():
+            if not isinstance(preferences, dict):
+                continue
+            for identity_key in preferences:
+                with contextlib.suppress(ValueError):
+                    keys.add(
+                        self._federation_preference_key(
+                            "spawn", identity_key, map_key
+                        )
+                    )
+        return keys
+
+    def _seed_federation_preference_versions(self) -> None:
+        """Give legacy preferences a common baseline before versioned sync."""
+        cleaned: dict[str, list[object]] = {}
+        valid_server_ids = {
+            "standalone",
+            self.federation_local_server_id,
+            self.federation_leader_server_id,
+            *self.federation_remote_regions,
+        }
+        for key, raw_version in self.federation_preference_versions.items():
+            try:
+                self._parse_federation_preference_key(key)
+                if (
+                    not isinstance(raw_version, list)
+                    or len(raw_version) != 2
+                    or isinstance(raw_version[0], bool)
+                ):
+                    raise ValueError
+                updated_at_ns = int(raw_version[0])
+                server_id = str(raw_version[1])
+                if updated_at_ns < 1 or server_id not in valid_server_ids:
+                    raise ValueError
+            except (TypeError, ValueError):
+                continue
+            cleaned[key] = [updated_at_ns, server_id]
+        baseline_server_id = (
+            self.federation_leader_server_id
+            or self.federation_local_server_id
+            or "standalone"
+        )
+        for key in self._current_federation_preference_keys():
+            cleaned.setdefault(key, [1, baseline_server_id])
+        if cleaned != self.federation_preference_versions:
+            self.federation_preference_versions = cleaned
+            self._save_federation_preference_versions()
+
+    def _save_federation_preference_versions(self) -> None:
+        if not hasattr(self, "store"):
+            return
+        self.store.set_json(
+            "federation_preference_versions",
+            self.federation_preference_versions,
+        )
+
+    def _persist_federation_preferences(self) -> None:
+        if hasattr(self, "store") and hasattr(self, "start_preferences"):
+            self._save_start_preferences()
+        if (
+            hasattr(self, "store")
+            and hasattr(self, "display_server_tag_preferences")
+        ):
+            self._save_display_server_tag_preferences()
+        if (
+            hasattr(self, "spawn_preferences_path")
+            or "_save_spawn_preferences" in self.__dict__
+        ):
+            self._save_spawn_preferences()
+        self._save_federation_preference_versions()
+
+    def _federation_preference_value(
+        self,
+        preference_type: str,
+        map_key: str,
+        identity_key: str,
+    ) -> tuple[bool, object]:
+        if preference_type == "start":
+            preferences = getattr(self, "start_preferences", {})
+            return (
+                identity_key in preferences,
+                preferences.get(identity_key),
+            )
+        if preference_type == "tags":
+            preferences = getattr(
+                self, "display_server_tag_preferences", {}
+            )
+            return (
+                identity_key in preferences,
+                preferences.get(identity_key),
+            )
+        preferences = getattr(self, "spawn_preferences", {}).get(map_key)
+        if not isinstance(preferences, dict):
+            return False, None
+        return identity_key in preferences, preferences.get(identity_key)
+
+    def _federation_preference_entry(self, key: str) -> dict[str, object]:
+        preference_type, map_key, identity_key = (
+            self._parse_federation_preference_key(key)
+        )
+        version = self.federation_preference_versions.get(key)
+        if not isinstance(version, list) or len(version) != 2:
+            raise ValueError("missing federation preference version")
+        exists, value = self._federation_preference_value(
+            preference_type, map_key, identity_key
+        )
+        entry: dict[str, object] = {
+            "key": key,
+            "updated_at_ns": int(version[0]),
+            "source_server_id": str(version[1]),
+            "operation": "set" if exists else "delete",
+        }
+        if exists:
+            entry["value"] = value
+        return entry
+
+    def _validated_federation_preference_entry(
+        self,
+        value: object,
+    ) -> dict[str, object]:
+        if not isinstance(value, dict):
+            raise ValueError("invalid federation preference")
+        key = str(value.get("key", ""))
+        preference_type, map_key, identity_key = (
+            self._parse_federation_preference_key(key)
+        )
+        updated_value = value.get("updated_at_ns")
+        if (
+            isinstance(updated_value, bool)
+            or not isinstance(updated_value, int)
+            or updated_value < 1
+        ):
+            raise ValueError("invalid federation preference version")
+        source_server_id = str(value.get("source_server_id", ""))
+        if source_server_id not in {
+            "standalone",
+            getattr(self, "federation_local_server_id", ""),
+            getattr(self, "federation_leader_server_id", ""),
+            *getattr(self, "federation_remote_regions", {}),
+        }:
+            raise ValueError("invalid federation preference source")
+        operation = str(value.get("operation", ""))
+        if operation not in {"set", "delete"}:
+            raise ValueError("invalid federation preference operation")
+        result: dict[str, object] = {
+            "key": key,
+            "preference_type": preference_type,
+            "map_key": map_key,
+            "identity_key": identity_key,
+            "updated_at_ns": updated_value,
+            "source_server_id": source_server_id,
+            "operation": operation,
+        }
+        if operation == "delete":
+            return result
+        preference_value = value.get("value")
+        if preference_type == "start":
+            preference_value = normalize_start_preference(preference_value)
+            if preference_value is None:
+                raise ValueError("invalid federated start preference")
+        elif preference_type == "tags":
+            if not isinstance(preference_value, bool):
+                raise ValueError("invalid federated tag preference")
+        elif (
+            isinstance(preference_value, bool)
+            or not isinstance(preference_value, int)
+            or preference_value < 1
+            or preference_value > 100_000
+        ):
+            raise ValueError("invalid federated spawn preference")
+        result["value"] = preference_value
+        return result
+
+    def _apply_federation_preference_entry(
+        self,
+        raw_entry: object,
+        *,
+        authority_wins_ties: bool = False,
+        persist: bool = True,
+    ) -> tuple[bool, str, str]:
+        entry = self._validated_federation_preference_entry(raw_entry)
+        key = str(entry["key"])
+        incoming_version = (
+            int(entry["updated_at_ns"]),
+            str(entry["source_server_id"]),
+        )
+        current_raw = self.federation_preference_versions.get(key, [0, ""])
+        current_version = (int(current_raw[0]), str(current_raw[1]))
+        if incoming_version < current_version:
+            return False, str(entry["preference_type"]), str(entry["identity_key"])
+        if incoming_version == current_version:
+            current_exists, current_value = self._federation_preference_value(
+                str(entry["preference_type"]),
+                str(entry["map_key"]),
+                str(entry["identity_key"]),
+            )
+            incoming_exists = str(entry["operation"]) == "set"
+            if (
+                current_exists == incoming_exists
+                and (not incoming_exists or current_value == entry.get("value"))
+            ):
+                return (
+                    False,
+                    str(entry["preference_type"]),
+                    str(entry["identity_key"]),
+                )
+            if not authority_wins_ties:
+                return (
+                    False,
+                    str(entry["preference_type"]),
+                    str(entry["identity_key"]),
+                )
+
+        preference_type = str(entry["preference_type"])
+        map_key = str(entry["map_key"])
+        identity_key = str(entry["identity_key"])
+        operation = str(entry["operation"])
+        if preference_type == "start":
+            if not hasattr(self, "start_preferences"):
+                self.start_preferences = {}
+            if operation == "set":
+                self.start_preferences[identity_key] = str(entry["value"])
+            else:
+                self.start_preferences.pop(identity_key, None)
+        elif preference_type == "tags":
+            if not hasattr(self, "display_server_tag_preferences"):
+                self.display_server_tag_preferences = {}
+            if operation == "set":
+                self.display_server_tag_preferences[identity_key] = bool(
+                    entry["value"]
+                )
+            else:
+                self.display_server_tag_preferences.pop(identity_key, None)
+        else:
+            if not hasattr(self, "spawn_preferences"):
+                self.spawn_preferences = {}
+            preferences = self.spawn_preferences.get(map_key)
+            if not isinstance(preferences, dict):
+                preferences = {}
+            if operation == "set":
+                preferences[identity_key] = int(entry["value"])
+                self.spawn_preferences[map_key] = preferences
+            else:
+                preferences.pop(identity_key, None)
+                if preferences:
+                    self.spawn_preferences[map_key] = preferences
+                else:
+                    self.spawn_preferences.pop(map_key, None)
+        self.federation_preference_versions[key] = [
+            incoming_version[0], incoming_version[1]
+        ]
+        if persist:
+            self._persist_federation_preferences()
+        return True, preference_type, identity_key
+
+    def _set_local_federation_preference(
+        self,
+        preference_type: str,
+        identity_key: str,
+        value: object | None,
+        map_key: str = "",
+    ) -> str:
+        key = self._federation_preference_key(
+            preference_type, identity_key, map_key
+        )
+        if not hasattr(self, "federation_preference_versions"):
+            self.federation_preference_versions = {}
+        if not hasattr(self, "federation_preference_pending"):
+            self.federation_preference_pending = {}
+        if not hasattr(self, "_federation_preference_snapshot_cache"):
+            self._federation_preference_snapshot_cache = {}
+        previous = self.federation_preference_versions.get(key, [0, ""])
+        updated_at_ns = max(time.time_ns(), int(previous[0]) + 1)
+        entry: dict[str, object] = {
+            "key": key,
+            "updated_at_ns": updated_at_ns,
+            "source_server_id": (
+                getattr(self, "federation_local_server_id", "")
+                or "standalone"
+            ),
+            "operation": "delete" if value is None else "set",
+        }
+        if value is not None:
+            entry["value"] = value
+        self._apply_federation_preference_entry(entry)
+        if getattr(self, "federation_role", "off") != "off":
+            self.federation_preference_pending[key] = self._federation_preference_entry(
+                key
+            )
+            self._federation_preference_snapshot_cache.clear()
+        return key
+
+    async def _refresh_players_for_federation_preference(
+        self,
+        preference_type: str,
+        identity_key: str,
+    ) -> None:
+        players = {
+            id(player): player
+            for player in self.players.values()
+            if player.identity_key == identity_key
+        }.values()
+        for player in players:
+            if preference_type == "start":
+                self._start_mode_for(player)
+            elif preference_type == "tags":
+                await self._apply_display_server_tag_preference(player)
+
+    async def _publish_federation_preference_update(self, key: str) -> bool:
+        if getattr(self, "federation_role", "off") == "off":
+            return False
+        try:
+            entry = self._federation_preference_entry(key)
+        except ValueError:
+            self.federation_preference_pending.pop(key, None)
+            return False
+        published = await self._publish_federation_control(
+            "controller_message",
+            {"scope": "federation_preference_update", "entry": entry},
+        )
+        if published and self.federation_leader:
+            self.federation_preference_pending.pop(key, None)
+        return published
+
+    def _federation_preference_entries(self) -> list[dict[str, object]]:
+        entries = []
+        for key in sorted(self.federation_preference_versions):
+            with contextlib.suppress(ValueError):
+                entries.append(self._federation_preference_entry(key))
+        return entries
+
+    async def _publish_federation_preference_snapshot(
+        self,
+        target_server_id: str,
+        offset: int,
+    ) -> None:
+        cached = self._federation_preference_snapshot_cache.get(target_server_id)
+        if offset == 0 or cached is None or cached[0] < time.monotonic():
+            cached = (time.monotonic() + 30.0, self._federation_preference_entries())
+            self._federation_preference_snapshot_cache[target_server_id] = cached
+        entries = list(
+            cached[1][offset : offset + MAX_FEDERATION_PREFERENCES_PER_BATCH]
+        )
+        while len(entries) > 1:
+            candidate = {
+                "kind": "controller_message",
+                "payload": {
+                    "scope": "federation_preference_snapshot",
+                    "target_server_id": target_server_id,
+                    "snapshot_offset": offset,
+                    "snapshot_next_offset": offset + len(entries),
+                    "snapshot_complete": False,
+                    "entries": entries,
+                },
+            }
+            size = len(json.dumps(
+                candidate,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8"))
+            if size <= MAX_FEDERATION_CONTROLLER_EVENT_BYTES - 1024:
+                break
+            entries.pop()
+        next_offset = offset + len(entries)
+        complete = next_offset >= len(cached[1])
+        await self._publish_federation_control(
+            "controller_message",
+            {
+                "scope": "federation_preference_snapshot",
+                "target_server_id": target_server_id,
+                "snapshot_offset": offset,
+                "snapshot_next_offset": next_offset,
+                "snapshot_complete": complete,
+                "entries": entries,
+            },
+        )
+
+    async def _handle_federation_preference_message(
+        self,
+        server_id: str,
+        payload: dict[str, object],
+    ) -> None:
+        scope = str(payload.get("scope", ""))
+        if scope == "federation_preference_snapshot_request":
+            if not self.federation_leader:
+                return
+            offset = payload.get("offset", 0)
+            if (
+                isinstance(offset, bool)
+                or not isinstance(offset, int)
+                or offset < 0
+                or offset > 1_000_000
+            ):
+                raise ValueError("invalid federation preference snapshot offset")
+            await self._publish_federation_preference_snapshot(server_id, offset)
+            return
+        if scope == "federation_preference_update":
+            if self.federation_leader:
+                entry = self._validated_federation_preference_entry(
+                    payload.get("entry")
+                )
+                if str(entry["source_server_id"]) != server_id:
+                    raise ValueError("forged federation preference source")
+                changed, preference_type, identity_key = (
+                    self._apply_federation_preference_entry(entry)
+                )
+                if changed:
+                    self._federation_preference_snapshot_cache.clear()
+                    await self._refresh_players_for_federation_preference(
+                        preference_type, identity_key
+                    )
+                key = str(entry["key"])
+                authoritative = self._federation_preference_entry(key)
+                await self._publish_federation_control(
+                    "controller_message",
+                    {
+                        "scope": "federation_preference_update",
+                        "entry": authoritative,
+                    },
+                )
+                return
+            if server_id != self.federation_leader_server_id:
+                return
+            entry = self._validated_federation_preference_entry(
+                payload.get("entry")
+            )
+            key = str(entry["key"])
+            local_raw = self.federation_preference_versions.get(key, [0, ""])
+            local_version = (int(local_raw[0]), str(local_raw[1]))
+            incoming_version = (
+                int(entry["updated_at_ns"]),
+                str(entry["source_server_id"]),
+            )
+            changed, preference_type, identity_key = (
+                self._apply_federation_preference_entry(
+                    entry, authority_wins_ties=True
+                )
+            )
+            if local_version > incoming_version:
+                self.federation_preference_pending[key] = (
+                    self._federation_preference_entry(key)
+                )
+            pending = self.federation_preference_pending.get(key)
+            if pending is not None:
+                pending_version = (
+                    int(pending["updated_at_ns"]),
+                    str(pending["source_server_id"]),
+                )
+                incoming_version = (
+                    int(entry["updated_at_ns"]),
+                    str(entry["source_server_id"]),
+                )
+                if incoming_version >= pending_version:
+                    self.federation_preference_pending.pop(key, None)
+            if changed:
+                await self._refresh_players_for_federation_preference(
+                    preference_type, identity_key
+                )
+            return
+        if scope != "federation_preference_snapshot":
+            raise ValueError("invalid federation preference scope")
+        if not self.federation_follower or server_id != self.federation_leader_server_id:
+            raise ValueError("invalid federation preference snapshot authority")
+        if str(payload.get("target_server_id", "")) != self.federation_local_server_id:
+            return
+        offset = payload.get("snapshot_offset")
+        next_offset = payload.get("snapshot_next_offset")
+        complete = payload.get("snapshot_complete")
+        entries = payload.get("entries")
+        expected = getattr(self, "_federation_preference_snapshot_offset", 0)
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or isinstance(next_offset, bool)
+            or not isinstance(next_offset, int)
+            or offset < 0
+            or not isinstance(complete, bool)
+            or not isinstance(entries, list)
+            or len(entries) > MAX_FEDERATION_PREFERENCES_PER_BATCH
+            or next_offset != offset + len(entries)
+        ):
+            raise ValueError("invalid federation preference snapshot page")
+        if offset != expected:
+            return
+        if offset == 0:
+            self._federation_preference_snapshot_seen = set()
+        changed_players: set[tuple[str, str]] = set()
+        snapshot_changed = False
+        for raw_entry in entries:
+            entry = self._validated_federation_preference_entry(raw_entry)
+            key = str(entry["key"])
+            self._federation_preference_snapshot_seen.add(key)
+            local_raw = self.federation_preference_versions.get(key, [0, ""])
+            local_version = (int(local_raw[0]), str(local_raw[1]))
+            incoming_version = (
+                int(entry["updated_at_ns"]),
+                str(entry["source_server_id"]),
+            )
+            changed, preference_type, identity_key = (
+                self._apply_federation_preference_entry(
+                    entry,
+                    authority_wins_ties=True,
+                    persist=False,
+                )
+            )
+            if changed:
+                snapshot_changed = True
+                changed_players.add((preference_type, identity_key))
+            if local_version > incoming_version:
+                self.federation_preference_pending[key] = (
+                    self._federation_preference_entry(key)
+                )
+            pending = self.federation_preference_pending.get(key)
+            if pending is not None:
+                pending_version = (
+                    int(pending["updated_at_ns"]),
+                    str(pending["source_server_id"]),
+                )
+                incoming_version = (
+                    int(entry["updated_at_ns"]),
+                    str(entry["source_server_id"]),
+                )
+                if incoming_version >= pending_version:
+                    self.federation_preference_pending.pop(key, None)
+        if snapshot_changed:
+            self._persist_federation_preferences()
+        for preference_type, identity_key in changed_players:
+            await self._refresh_players_for_federation_preference(
+                preference_type, identity_key
+            )
+        self._federation_preference_snapshot_offset = next_offset
+        if complete:
+            for key in (
+                set(self.federation_preference_versions)
+                - self._federation_preference_snapshot_seen
+            ):
+                with contextlib.suppress(ValueError):
+                    self.federation_preference_pending[key] = (
+                        self._federation_preference_entry(key)
+                    )
+            complete_event = getattr(
+                self, "_federation_preference_snapshot_complete", None
+            )
+            if complete_event is not None:
+                complete_event.set()
+            LOG.info(
+                "federation preference snapshot completed with %d entries",
+                next_offset,
+            )
+        progress = getattr(self, "_federation_preference_snapshot_progress", None)
+        if progress is not None:
+            progress.set()
+
+    async def federation_preference_sync(self) -> None:
+        if self.federation_role == "off":
+            return
+        while True:
+            if self.federation_follower:
+                self._federation_preference_snapshot_offset = 0
+                self._federation_preference_snapshot_seen: set[str] = set()
+                self._federation_preference_snapshot_complete = asyncio.Event()
+                self._federation_preference_snapshot_progress = asyncio.Event()
+                while not self._federation_preference_snapshot_complete.is_set():
+                    self._federation_preference_snapshot_progress.clear()
+                    await self._publish_federation_control(
+                        "controller_message",
+                        {
+                            "scope": "federation_preference_snapshot_request",
+                            "offset": self._federation_preference_snapshot_offset,
+                        },
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            self._federation_preference_snapshot_progress.wait(),
+                            timeout=2.0,
+                        )
+                    except TimeoutError:
+                        continue
+            for _ in range(15):
+                for key in list(self.federation_preference_pending):
+                    await self._publish_federation_preference_update(key)
+                await asyncio.sleep(2.0)
+
     def _save_spawn_preferences(self) -> None:
         atomic_write_json(
             self.spawn_preferences_path,
@@ -6511,20 +7589,29 @@ class TronnerRacing:
             preferences.get(previous_identity, player.display_server_tags)
         )
         if player.identity_key not in preferences:
-            preferences[player.identity_key] = previous
-            self._save_display_server_tag_preferences()
+            self._set_local_federation_preference(
+                "tags", player.identity_key, previous
+            )
         player.display_server_tags = bool(
             preferences.get(player.identity_key, False)
         )
 
     def _start_mode_for(self, player: Player) -> str:
-        mode = getattr(player, "start_mode", "immediate").casefold()
+        mode = str(getattr(player, "start_mode", "immediate")).casefold()
+        fallback_value = (
+            "countdown "
+            f"{getattr(player, 'start_countdown_seconds', DEFAULT_START_COUNTDOWN_SECONDS)}"
+            if mode == "countdown"
+            else mode
+        )
+        _, _, fallback = start_preference_details(fallback_value)
         preferences = getattr(self, "start_preferences", {})
-        saved = str(preferences.get(player.identity_key, mode)).casefold()
-        if saved not in {"brake", "immediate", "countdown", "respawn"}:
-            saved = "immediate"
-        player.start_mode = saved
-        return saved
+        saved_mode, saved_seconds, _ = start_preference_details(
+            preferences.get(player.identity_key, fallback)
+        )
+        player.start_mode = saved_mode
+        player.start_countdown_seconds = saved_seconds
+        return saved_mode
 
     def _preferred_spawn_index(self, player: Player) -> int | None:
         if not self.current or not self.current.spawns:
@@ -6715,7 +7802,7 @@ class TronnerRacing:
                 partial.append(row)
         return exact or partial
 
-    def _exclude_map_key(self, key: str, reason: str = "") -> None:
+    async def _exclude_map_key(self, key: str, reason: str = "") -> None:
         """Persistently remove one canonical resource from every map selector."""
         self.excluded_map_keys.add(key)
         if not hasattr(self, "excluded_map_reasons"):
@@ -6734,6 +7821,7 @@ class TronnerRacing:
         self.queue = collections.deque(item for item in self.queue if item != key)
         self.cycle_played.discard(key)
         self._save_rotation()
+        await self._publish_federation_catalog_exclusions()
 
     def _reconcile_rotation(self) -> None:
         available = set(self.repository.catalog)
@@ -6777,11 +7865,29 @@ class TronnerRacing:
 
     def _server_options_text(self) -> str:
         current = self.current
-        next_entry = self._peek_next()
         current_name = self._display_map_name(current) if current else "Unknown"
         current_author = current.author if current else "Unknown"
-        next_name = self._display_map_name(next_entry) if next_entry else "Unknown"
-        next_author = next_entry.author if next_entry else "Unknown"
+        if getattr(self, "federation_follower", False):
+            next_key = ""
+            if (
+                current is not None
+                and getattr(self, "federation_leader_current_map_key", "")
+                == current.key
+            ):
+                next_key = getattr(self, "federation_leader_next_map_key", "")
+            next_entry = self.repository.catalog.get(next_key) if next_key else None
+            if next_entry is not None:
+                next_name = self._display_map_name(next_entry)
+                next_author = next_entry.author
+            elif next_key:
+                next_name, next_author, _version = self._excluded_key_parts(next_key)
+                next_name = next_name.replace("_", " ")
+            else:
+                next_name = next_author = "Unknown"
+        else:
+            next_entry = self._peek_next()
+            next_name = self._display_map_name(next_entry) if next_entry else "Unknown"
+            next_author = next_entry.author if next_entry else "Unknown"
         return clean_console_text(
             f"Current map: {current_name} by {current_author} | "
             f"Next Map: {next_name} by {next_author}"
@@ -6789,12 +7895,33 @@ class TronnerRacing:
 
     async def _refresh_server_options_once(self) -> None:
         options = self._server_options_text()
-        if options == self._server_options_last:
+        changed = options != self._server_options_last
+        if changed:
+            await self.sink.send(
+                f"SERVER_OPTIONS {readline_console_text(options)}"
+            )
+            self._server_options_last = options
+        if not getattr(self, "federation_leader", False):
             return
-        await self.sink.send(
-            f"SERVER_OPTIONS {readline_console_text(options)}"
+        now = time.monotonic()
+        last_publish = getattr(
+            self,
+            "_federation_server_state_last_publish_monotonic",
+            0.0,
         )
-        self._server_options_last = options
+        if not changed and now - last_publish < 10.0:
+            return
+        next_entry = self._peek_next()
+        published = await self._publish_federation_control(
+            "controller_message",
+            {
+                "scope": "server_state",
+                "current_map_key": self.current.key if self.current else "",
+                "next_map_key": next_entry.key if next_entry else "",
+            },
+        )
+        if published:
+            self._federation_server_state_last_publish_monotonic = now
 
     async def server_options_refresher(self) -> None:
         interval = max(
@@ -6990,7 +8117,7 @@ class TronnerRacing:
             # catalog. The durable local exclusion remains authoritative for
             # this server until a later admin/retry reconciles Firebase.
             LOG.exception("unable to publish failed-map exclusion to Firebase")
-        self._exclude_map_key(
+        await self._exclude_map_key(
             target_key,
             "Server automatically deactivated a map that failed to load",
         )
@@ -7825,10 +8952,13 @@ class TronnerRacing:
             if not message:
                 raise ValueError("Enter an announcement.")
             federate = command.get("scope") == "federation"
-            if federate and not self.federation_leader:
+            if federate and self.federation_follower:
                 raise ValueError("Federation-wide announcements must target the leader.")
-            await self.broadcast(message, federate=federate)
-            return "Announcement delivered.", {"scope": "federation" if federate else "local"}
+            federation_scope = bool(federate and self.federation_leader)
+            await self.broadcast(message, federate=federation_scope)
+            return "Announcement delivered.", {
+                "scope": "federation" if federation_scope else "local"
+            }
 
         if command_type == "start_console_stream":
             now = time.monotonic()
@@ -8075,6 +9205,7 @@ class TronnerRacing:
                 pass
 
     def _dashboard_maps_by_record_key(self) -> dict[str, dict[str, object]]:
+        ratings = self.store.rating_summaries()
         return {
             map_records_key(entry): {
                 "mapId": entry.map_id,
@@ -8082,6 +9213,9 @@ class TronnerRacing:
                 "author": entry.author,
                 "version": entry.version,
                 "storagePath": entry.storage_path,
+                "ratingKey": entry.rating_key,
+                "rating": ratings.get(entry.rating_key, (None, 0))[0],
+                "ratingCount": ratings.get(entry.rating_key, (None, 0))[1],
             }
             for entry in self.repository.catalog.values()
             if entry.storage_path
@@ -8303,12 +9437,7 @@ class TronnerRacing:
         player = self.aliases.get(name.casefold()) or self.players.get(name.casefold())
         if not player and create:
             player = Player(name, name)
-            player.start_mode = str(
-                getattr(self, "start_preferences", {}).get(
-                    player.identity_key,
-                    "immediate",
-                )
-            ).casefold()
+            self._start_mode_for(player)
             self.players[name.casefold()] = player
             self.aliases[name.casefold()] = player
         return player
@@ -8745,23 +9874,22 @@ class TronnerRacing:
             player.start_mode,
         )
         if player.identity_key not in getattr(self, "start_preferences", {}):
-            self.start_preferences[player.identity_key] = previous_start_mode
-            self._save_start_preferences()
-        player.start_mode = self.start_preferences.get(
-            player.identity_key,
-            "immediate",
-        )
-        preferences_changed = False
-        for map_preferences in self.spawn_preferences.values():
+            self._set_local_federation_preference(
+                "start", player.identity_key, previous_start_mode
+            )
+        self._start_mode_for(player)
+        for map_key, map_preferences in list(self.spawn_preferences.items()):
             if (
                 isinstance(map_preferences, dict)
                 and previous_identity in map_preferences
                 and player.identity_key not in map_preferences
             ):
-                map_preferences[player.identity_key] = map_preferences[previous_identity]
-                preferences_changed = True
-        if preferences_changed:
-            self._save_spawn_preferences()
+                self._set_local_federation_preference(
+                    "spawn",
+                    player.identity_key,
+                    map_preferences[previous_identity],
+                    map_key,
+                )
         if self.current:
             preferred = self._preferred_spawn_index(player)
             if preferred is not None:
@@ -9404,6 +10532,7 @@ class TronnerRacing:
         ):
             return
         start_mode = self._start_mode_for(player)
+        countdown_seconds = player.start_countdown_seconds
         manual_restart = player.manual_restart_pending
         if start_mode == "respawn" and not manual_restart:
             await self.center_private(player, "Type /restart to respawn")
@@ -9447,7 +10576,7 @@ class TronnerRacing:
             await self.sink.send(
                 *self._checkpoint_color_reset_commands(player),
                 f"RESPAWN_PLAYER_HELD {spawn_arguments}",
-                f"FREEZE_PLAYER {player.target} 3",
+                f"FREEZE_PLAYER {player.target} {countdown_seconds}",
             )
         else:
             await self.sink.send(
@@ -9458,12 +10587,14 @@ class TronnerRacing:
         if old_task:
             old_task.cancel()
         wait_for_start = (
-            self._wait_for_countdown_start
+            self._wait_for_countdown_start(
+                player, generation, countdown_seconds
+            )
             if start_mode == "countdown"
-            else self._wait_for_brake_start
+            else self._wait_for_brake_start(player, generation)
         )
         self.freeze_tasks[id(player)] = asyncio.create_task(
-            wait_for_start(player, generation)
+            wait_for_start
         )
 
     async def _respawn_from_checkpoint(self, player: Player) -> None:
@@ -9479,6 +10610,7 @@ class TronnerRacing:
         player.pending_respawn_kind = "checkpoint"
         player.attempt_started_game = None
         start_mode = self._start_mode_for(player)
+        countdown_seconds = player.start_countdown_seconds
         player.pending_start_mode = start_mode
         speed = (
             snapshot.speed
@@ -9498,7 +10630,7 @@ class TronnerRacing:
         if start_mode == "countdown":
             await self.sink.send(
                 f"RESPAWN_PLAYER_CHECKPOINT_HELD {spawn_arguments}",
-                f"FREEZE_PLAYER {player.target} 3",
+                f"FREEZE_PLAYER {player.target} {countdown_seconds}",
             )
         else:
             await self.sink.send(
@@ -9508,12 +10640,14 @@ class TronnerRacing:
         if old_task:
             old_task.cancel()
         wait_for_start = (
-            self._wait_for_countdown_start
+            self._wait_for_countdown_start(
+                player, generation, countdown_seconds
+            )
             if start_mode == "countdown"
-            else self._wait_for_brake_start
+            else self._wait_for_brake_start(player, generation)
         )
         self.freeze_tasks[id(player)] = asyncio.create_task(
-            wait_for_start(player, generation)
+            wait_for_start
         )
 
     async def _wait_for_brake_start(self, player: Player, generation: int) -> None:
@@ -9544,9 +10678,10 @@ class TronnerRacing:
         self,
         player: Player,
         generation: int,
+        countdown_seconds: int,
     ) -> None:
         try:
-            for number in (3, 2, 1):
+            for number in range(countdown_seconds, 0, -1):
                 if not (
                     generation == player.generation
                     and player.connected
@@ -11125,12 +12260,7 @@ class TronnerRacing:
             # controller restart.  Let them queue/query maps, but do not count
             # them as active voters until a grid/online event confirms it.
             player = Player(player_name, player_name, connected=True, active=False)
-            player.start_mode = str(
-                getattr(self, "start_preferences", {}).get(
-                    player.identity_key,
-                    "immediate",
-                )
-            ).casefold()
+            self._start_mode_for(player)
             player.display_server_tags = bool(
                 getattr(self, "display_server_tag_preferences", {}).get(
                     player.identity_key,
@@ -11670,7 +12800,15 @@ class TronnerRacing:
                 if not map_preferences:
                     self.spawn_preferences.pop(stable_key, None)
                 if removed is not None:
-                    self._save_spawn_preferences()
+                    preference_key = self._set_local_federation_preference(
+                        "spawn",
+                        player.identity_key,
+                        None,
+                        stable_key,
+                    )
+                    await self._publish_federation_preference_update(
+                        preference_key
+                    )
                 if (
                     player.last_spawn_index is not None
                     and 0 <= player.last_spawn_index < len(self.current.spawns)
@@ -11711,8 +12849,13 @@ class TronnerRacing:
             )
             return
         map_preferences = self._spawn_preferences_for(self.current, create=True)
-        map_preferences[player.identity_key] = number
-        self._save_spawn_preferences()
+        preference_key = self._set_local_federation_preference(
+            "spawn",
+            player.identity_key,
+            number,
+            map_spawn_preferences_key(self.current),
+        )
+        await self._publish_federation_preference_update(preference_key)
         player.spawn_cursor = number - 1
         await self.private(
             player,
@@ -11724,29 +12867,44 @@ class TronnerRacing:
     async def _command_start(self, player: Player, argument: str) -> None:
         requested = argument.strip().casefold()
         if not requested:
+            mode = self._start_mode_for(player)
+            timer = (
+                f" ({player.start_countdown_seconds} seconds)"
+                if mode == "countdown"
+                else ""
+            )
             await self.private(
                 player,
-                f"Start mode: {self._start_mode_for(player)}. "
-                "Usage: /start brake, /start immediate, /start countdown, "
-                "or /start respawn.",
+                f"Start mode: {mode}{timer}. "
+                "Usage: /start brake, /start immediate, "
+                "/start countdown [1-60], or /start respawn.",
             )
             return
-        if requested not in {"brake", "immediate", "countdown", "respawn"}:
+        preference = normalize_start_preference(requested)
+        if preference is None:
             await self.private(
                 player,
-                "Usage: /start brake, /start immediate, /start countdown, "
-                "or /start respawn.",
+                "Usage: /start brake, /start immediate, "
+                "/start countdown [1-60], or /start respawn. "
+                "Countdown seconds must be a whole number from 1 to 60.",
             )
             return
-        player.start_mode = requested
+        mode, countdown_seconds, preference = start_preference_details(preference)
+        player.start_mode = mode
+        player.start_countdown_seconds = countdown_seconds
         if not hasattr(self, "start_preferences"):
             self.start_preferences = {}
-        self.start_preferences[player.identity_key] = requested
-        self._save_start_preferences()
+        preference_key = self._set_local_federation_preference(
+            "start", player.identity_key, preference
+        )
+        await self._publish_federation_preference_update(preference_key)
         descriptions = {
             "brake": "Press brake to begin moving after each respawn.",
             "immediate": "Begin moving immediately after each automatic respawn.",
-            "countdown": "Wait for 3, 2, 1, Go! after each respawn.",
+            "countdown": (
+                f"Wait for a {countdown_seconds}-second countdown and Go!, "
+                "or press brake to start early."
+            ),
             "respawn": "Wait after a crash, then begin immediately when you use /restart.",
         }
         pending = (
@@ -11756,16 +12914,18 @@ class TronnerRacing:
         )
         await self.private(
             player,
-            f"Start mode set to {requested}. {descriptions[requested]}{pending}",
+            f"Start mode set to {mode}. {descriptions[mode]}{pending}",
         )
 
     async def _command_display_server_tags(self, player: Player) -> None:
         enabled = not self._display_server_tags_for(player)
         if not hasattr(self, "display_server_tag_preferences"):
             self.display_server_tag_preferences = {}
-        self.display_server_tag_preferences[player.identity_key] = enabled
+        preference_key = self._set_local_federation_preference(
+            "tags", player.identity_key, enabled
+        )
         player.display_server_tags = enabled
-        self._save_display_server_tag_preferences()
+        await self._publish_federation_preference_update(preference_key)
         await self.sink.send(
             f"FEDERATION_DISPLAY_SERVER_TAGS {player.target} "
             f"{1 if enabled else 0}"
@@ -12246,6 +13406,7 @@ class TronnerRacing:
                 LOG.exception("removing map exclusion failed for %s", key)
                 await self.private(player, f"Removing exclusion failed: {exc}")
                 return
+        await self._publish_federation_catalog_exclusions()
         await self.broadcast(
             f"{player.record_name} returned {selector} by {author} "
             f"[{version}] to the map pool."
@@ -12317,7 +13478,7 @@ class TronnerRacing:
             LOG.exception("publishing map exclusion failed for %s", key)
             await self.private(player, f"Excluding map failed: {exc}")
             return
-        self._exclude_map_key(key, status_reason)
+        await self._exclude_map_key(key, status_reason)
         await self.broadcast(
             f"{player.record_name} excluded {name} from the map pool."
             + (f" Reason: {reason}" if reason else "")
@@ -12748,7 +13909,7 @@ class TronnerRacing:
 
     async def catalog_state_monitor(self) -> None:
         """Watch one version document instead of polling full collections."""
-        if self.repository.firebase is None:
+        if self.repository.firebase is None or self.federation_follower:
             await self.stop_event.wait()
             return
         interval = max(
@@ -13131,6 +14292,14 @@ class TronnerRacing:
             asyncio.create_task(
                 self._federation_record_snapshot_sync(),
                 name="federation-record-snapshot-sync",
+            ),
+            asyncio.create_task(
+                self.federation_preference_sync(),
+                name="federation-preference-sync",
+            ),
+            asyncio.create_task(
+                self.federation_catalog_exclusion_sync(),
+                name="federation-catalog-exclusion-sync",
             ),
             asyncio.create_task(
                 self.helpful_message_announcer(),

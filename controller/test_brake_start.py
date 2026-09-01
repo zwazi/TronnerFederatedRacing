@@ -4,11 +4,15 @@ import unittest
 from pathlib import Path
 
 from TronnerRacing import (
+    DEFAULT_START_COUNTDOWN_SECONDS,
     MapEntry,
+    MAX_START_COUNTDOWN_SECONDS,
     Player,
     SpawnPoint,
     TronnerRacing,
+    normalize_start_preference,
     plain_console_text,
+    start_preference_details,
 )
 
 
@@ -166,6 +170,85 @@ class StartModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('CENTER_PLAYER_MESSAGE racer "3"', controller.sink.commands)
         await cancel_player_tasks(controller, player)
 
+    async def test_custom_countdown_drives_engine_and_visible_timer(self):
+        controller, player = start_controller("brake")
+
+        await controller._command_start(player, "countdown 7")
+        await controller._respawn_player(player)
+        await asyncio.sleep(0)
+
+        self.assertEqual(player.start_mode, "countdown")
+        self.assertEqual(player.start_countdown_seconds, 7)
+        self.assertEqual(
+            controller.start_preferences[player.identity_key],
+            "countdown 7",
+        )
+        self.assertEqual(
+            controller.store.values["start_preferences"],
+            {player.identity_key: "countdown 7"},
+        )
+        self.assertIn(
+            "RESPAWN_PLAYER_HELD racer false 3 4 0 1",
+            controller.sink.commands,
+        )
+        self.assertIn(
+            "FREEZE_PLAYER racer 7",
+            controller.sink.commands,
+        )
+        self.assertIn(
+            'CENTER_PLAYER_MESSAGE racer "7"',
+            [plain_console_text(command) for command in controller.sink.commands],
+        )
+        self.assertTrue(
+            any(
+                "7-second countdown" in plain_console_text(command)
+                for command in controller.sink.commands
+            )
+        )
+        await controller._handle_cycle_released("racer 57.25")
+        self.assertEqual(player.attempt_started_game, 57.25)
+        self.assertFalse(player.pending_respawn)
+        await cancel_player_tasks(controller, player)
+
+    async def test_plain_countdown_keeps_three_second_default(self):
+        controller, player = start_controller("brake")
+
+        await controller._command_start(player, "countdown")
+
+        self.assertEqual(
+            player.start_countdown_seconds,
+            DEFAULT_START_COUNTDOWN_SECONDS,
+        )
+        self.assertEqual(
+            controller.start_preferences[player.identity_key],
+            "countdown",
+        )
+
+    async def test_countdown_rejects_invalid_seconds_without_changing_mode(self):
+        invalid = (
+            "countdown 0",
+            "countdown 61",
+            "countdown 1.5",
+            "countdown 5 extra",
+        )
+        for argument in invalid:
+            with self.subTest(argument=argument):
+                controller, player = start_controller("brake")
+
+                await controller._command_start(player, argument)
+
+                self.assertEqual(player.start_mode, "brake")
+                self.assertEqual(
+                    controller.start_preferences[player.identity_key],
+                    "brake",
+                )
+                self.assertTrue(
+                    any(
+                        "whole number from 1 to 60" in plain_console_text(command)
+                        for command in controller.sink.commands
+                    )
+                )
+
     async def test_start_command_persists_preference(self):
         controller, player = start_controller("brake")
 
@@ -186,6 +269,19 @@ class StartModeTests(unittest.IsolatedAsyncioTestCase):
 
     def test_new_player_defaults_to_immediate(self):
         self.assertEqual(Player("racer", "Racer").start_mode, "immediate")
+
+    def test_start_preference_parser_is_bounded_and_backward_compatible(self):
+        self.assertEqual(normalize_start_preference("countdown"), "countdown")
+        self.assertEqual(normalize_start_preference("countdown 3"), "countdown")
+        self.assertEqual(
+            normalize_start_preference(f"countdown {MAX_START_COUNTDOWN_SECONDS}"),
+            f"countdown {MAX_START_COUNTDOWN_SECONDS}",
+        )
+        self.assertIsNone(normalize_start_preference("countdown -1"))
+        self.assertEqual(
+            start_preference_details("countdown 12"),
+            ("countdown", 12, "countdown 12"),
+        )
 
 
 if __name__ == "__main__":

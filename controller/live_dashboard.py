@@ -76,6 +76,17 @@ def inferred_map_metadata(map_key: str) -> dict[str, object]:
     }
 
 
+def map_rating_fields(metadata: dict[str, object]) -> dict[str, object]:
+    try:
+        rating = float(metadata.get("rating"))
+        count = int(metadata.get("ratingCount", 0))
+    except (TypeError, ValueError):
+        return {"rating": None, "ratingCount": 0}
+    if not math.isfinite(rating) or not 1 <= rating <= 5 or count < 1:
+        return {"rating": None, "ratingCount": 0}
+    return {"rating": round(rating, 4), "ratingCount": count}
+
+
 def public_player_id(identity_key: str) -> str:
     return hashlib.sha256(("racing:" + identity_key).encode("utf-8")).hexdigest()[:24]
 
@@ -423,6 +434,8 @@ class FirebaseLiveDashboardPublisher:
                 "author": str(metadata.get("author", "")),
                 "version": str(metadata.get("version", "")),
                 "storagePath": str(metadata.get("storagePath", "")),
+                "ratingKey": str(metadata.get("ratingKey", "")),
+                **map_rating_fields(metadata),
                 "entryCount": len(map_rows),
                 "entries": entries,
             }
@@ -435,6 +448,9 @@ class FirebaseLiveDashboardPublisher:
                 "author": stable["author"],
                 "version": stable["version"],
                 "storagePath": stable["storagePath"],
+                "ratingKey": stable["ratingKey"],
+                "rating": stable["rating"],
+                "ratingCount": stable["ratingCount"],
                 "leaderboardId": document_id,
                 "entryCount": len(map_rows),
                 "record": entries[0] if entries else None,
@@ -450,6 +466,28 @@ class FirebaseLiveDashboardPublisher:
             })
             self.leaderboard_hashes[document_id] = digest
             writes += 1
+
+        # A map can receive ratings before anyone finishes it. Keep every
+        # active repository map in the bounded catalog even when it has no
+        # leaderboard rows yet, so repository clients can still show its vote
+        # state without scanning another collection.
+        for map_key, supplied_metadata in maps_by_record_key.items():
+            if map_key in grouped:
+                continue
+            metadata = {**inferred_map_metadata(map_key), **supplied_metadata}
+            self.map_catalog[map_key] = {
+                "mapKey": map_key,
+                "mapId": str(metadata.get("mapId", "")),
+                "name": str(metadata.get("name", "")),
+                "author": str(metadata.get("author", "")),
+                "version": str(metadata.get("version", "")),
+                "storagePath": str(metadata.get("storagePath", "")),
+                "ratingKey": str(metadata.get("ratingKey", "")),
+                **map_rating_fields(metadata),
+                "leaderboardId": leaderboard_document_id(map_key),
+                "entryCount": 0,
+                "record": None,
+            }
 
         overall = overall_leaderboard(rows)
         stable_overall = {

@@ -16,6 +16,7 @@
     "enabled": true,
     "listen_host": "10.77.0.2",
     "port": 4540,
+    "leader_resource_base_url": "http://10.77.0.1:8080/",
     "peers": [
       {
         "server_id": "region-a",

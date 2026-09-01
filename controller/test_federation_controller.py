@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import json
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -62,6 +64,13 @@ def follower_controller():
     controller.federation_peer_timeout_seconds = 7.0
     controller.federation_prepared_map_key = None
     controller.federation_prepared_map_activate_ns = 0
+    controller.federation_prepared_map_sha256 = ""
+    controller.federation_map_prepare_lock = asyncio.Lock()
+    controller.federation_leader_current_map_key = ""
+    controller.federation_leader_next_map_key = ""
+    controller._federation_server_state_last_publish_monotonic = 0.0
+    controller.federation_leader_resource_base_url = ""
+    controller.federation_resource_timeout_seconds = 10.0
     controller.players = {}
     controller.aliases = {}
     controller.start_preferences = {}
@@ -84,6 +93,217 @@ def event(kind, payload, sent_ns=None, server_id="region-a"):
 
 
 class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def preference_controller(role="follower"):
+        controller = follower_controller()
+        controller.federation_role = role
+        if role == "leader":
+            controller.federation_local_server_id = "region-a"
+            controller.federation_leader_server_id = "region-a"
+            controller.federation_remote_server_id = "region-b"
+            controller.federation_remote_regions = {"region-b": "B"}
+        controller.start_preferences = {}
+        controller.display_server_tag_preferences = {}
+        controller.spawn_preferences = {}
+        controller.federation_preference_versions = {}
+        controller.federation_preference_pending = {}
+        controller._federation_preference_snapshot_cache = {}
+        controller._persist_federation_preferences = lambda: None
+        controller._publish_federation_control = AsyncMock(return_value=True)
+        return controller
+
+    @staticmethod
+    def catalog_exclusion_controller(role="follower"):
+        controller = follower_controller()
+        controller.federation_role = role
+        if role == "leader":
+            controller.federation_local_server_id = "region-a"
+            controller.federation_leader_server_id = "region-a"
+            controller.federation_remote_server_id = "region-b"
+            controller.federation_remote_regions = {"region-b": "B"}
+        controller.excluded_map_keys = set()
+        controller.excluded_map_reasons = {}
+        controller.store = MemoryStore()
+        controller.repository = SimpleNamespace(
+            excluded_keys=set(),
+            catalog={"existing": object()},
+            scan=Mock(),
+        )
+        controller._reconcile_rotation = Mock()
+        controller.map_lock = asyncio.Lock()
+        controller._publish_federation_control = AsyncMock(return_value=True)
+        return controller
+
+    async def test_leader_answers_catalog_exclusion_request_for_origin(self):
+        controller = self.catalog_exclusion_controller("leader")
+        controller.excluded_map_keys = {
+            "Tester/maps/Second-v2.aamap.xml",
+            "Tester/maps/First-v1.aamap.xml",
+        }
+
+        await controller._handle_federation_catalog_exclusion_message(
+            "region-b",
+            {"scope": "federation_catalog_exclusion_request"},
+        )
+
+        controller._publish_federation_control.assert_awaited_once_with(
+            "controller_message",
+            {
+                "scope": "federation_catalog_exclusion_snapshot",
+                "exclusions": [
+                    "Tester/maps/First-v1.aamap.xml",
+                    "Tester/maps/Second-v2.aamap.xml",
+                ],
+                "target_server_id": "region-b",
+            },
+        )
+
+    async def test_follower_replaces_local_exclusions_with_leader_snapshot(self):
+        controller = self.catalog_exclusion_controller()
+        controller.excluded_map_keys = {"Stale/maps/Local-v1.aamap.xml"}
+        controller._federation_catalog_exclusion_complete = asyncio.Event()
+        expected = {
+            "Tester/maps/First-v1.aamap.xml",
+            "Tester/maps/Second-v2.aamap.xml",
+        }
+
+        await controller._handle_federation_catalog_exclusion_message(
+            "region-a",
+            {
+                "scope": "federation_catalog_exclusion_snapshot",
+                "target_server_id": "region-b",
+                "exclusions": sorted(expected),
+            },
+        )
+
+        self.assertEqual(controller.excluded_map_keys, expected)
+        self.assertEqual(controller.repository.excluded_keys, expected)
+        self.assertEqual(
+            controller.store.values["excluded_map_keys"], sorted(expected)
+        )
+        self.assertEqual(controller.store.values["excluded_map_reasons"], {})
+        controller.repository.scan.assert_called_once_with()
+        controller._reconcile_rotation.assert_called_once_with()
+        self.assertTrue(
+            controller._federation_catalog_exclusion_complete.is_set()
+        )
+
+    async def test_follower_preference_update_is_applied_and_echoed_by_leader(self):
+        controller = self.preference_controller("leader")
+        key = controller._federation_preference_key(
+            "spawn", "auth:racer@forums", "map-id:map-1"
+        )
+        entry = {
+            "key": key,
+            "updated_at_ns": 123,
+            "source_server_id": "region-b",
+            "operation": "set",
+            "value": 4,
+        }
+
+        await controller._handle_federation_preference_message(
+            "region-b",
+            {"scope": "federation_preference_update", "entry": entry},
+        )
+
+        self.assertEqual(
+            controller.spawn_preferences["map-id:map-1"]["auth:racer@forums"],
+            4,
+        )
+        echoed = controller._publish_federation_control.await_args.args[1]
+        self.assertEqual(echoed["scope"], "federation_preference_update")
+        self.assertEqual(echoed["entry"], entry)
+
+    async def test_follower_snapshot_repairs_equal_version_value(self):
+        controller = self.preference_controller()
+        key = controller._federation_preference_key(
+            "start", "auth:racer@forums"
+        )
+        controller.start_preferences["auth:racer@forums"] = "brake"
+        controller.federation_preference_versions[key] = [1, "region-a"]
+        controller._federation_preference_snapshot_offset = 0
+        controller._federation_preference_snapshot_seen = set()
+        controller._federation_preference_snapshot_complete = asyncio.Event()
+        controller._federation_preference_snapshot_progress = asyncio.Event()
+
+        await controller._handle_federation_preference_message(
+            "region-a",
+            {
+                "scope": "federation_preference_snapshot",
+                "target_server_id": "region-b",
+                "snapshot_offset": 0,
+                "snapshot_next_offset": 1,
+                "snapshot_complete": True,
+                "entries": [
+                    {
+                        "key": key,
+                        "updated_at_ns": 1,
+                        "source_server_id": "region-a",
+                        "operation": "set",
+                        "value": "countdown 12",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(
+            controller.start_preferences["auth:racer@forums"], "countdown 12"
+        )
+        self.assertTrue(controller._federation_preference_snapshot_complete.is_set())
+
+    async def test_newer_offline_follower_preference_is_queued_after_snapshot(self):
+        controller = self.preference_controller()
+        key = controller._federation_preference_key(
+            "tags", "auth:racer@forums"
+        )
+        controller.display_server_tag_preferences["auth:racer@forums"] = True
+        controller.federation_preference_versions[key] = [200, "region-b"]
+        controller._federation_preference_snapshot_offset = 0
+        controller._federation_preference_snapshot_seen = set()
+        controller._federation_preference_snapshot_complete = asyncio.Event()
+        controller._federation_preference_snapshot_progress = asyncio.Event()
+
+        await controller._handle_federation_preference_message(
+            "region-a",
+            {
+                "scope": "federation_preference_snapshot",
+                "target_server_id": "region-b",
+                "snapshot_offset": 0,
+                "snapshot_next_offset": 1,
+                "snapshot_complete": True,
+                "entries": [
+                    {
+                        "key": key,
+                        "updated_at_ns": 100,
+                        "source_server_id": "region-a",
+                        "operation": "set",
+                        "value": False,
+                    }
+                ],
+            },
+        )
+
+        self.assertTrue(
+            controller.display_server_tag_preferences["auth:racer@forums"]
+        )
+        self.assertEqual(
+            controller.federation_preference_pending[key]["updated_at_ns"],
+            200,
+        )
+
+    async def test_preference_delete_is_retained_as_versioned_tombstone(self):
+        controller = self.preference_controller()
+        identity = "auth:racer@forums"
+        controller.start_preferences[identity] = "countdown"
+        key = controller._set_local_federation_preference(
+            "start", identity, None
+        )
+
+        self.assertNotIn(identity, controller.start_preferences)
+        entry = controller._federation_preference_entry(key)
+        self.assertEqual(entry["operation"], "delete")
+        self.assertIn(key, controller.federation_preference_pending)
+
     async def test_three_region_release_waits_for_both_healthy_followers(self):
         controller = follower_controller()
         controller.federation_role = "leader"
@@ -298,6 +518,18 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             f"FEDERATION_ROUND_RELEASE_AT {release_at:.6f}",
             controller.sink.commands,
+        )
+
+        await controller._handle_federation_round_sync("region-a", {
+            "action": "release",
+            "map_key": controller.current.key,
+            "release_at": release_at,
+        })
+        self.assertEqual(
+            controller.sink.commands.count(
+                f"FEDERATION_ROUND_RELEASE_AT {release_at:.6f}"
+            ),
+            1,
         )
 
     async def test_repeated_map_waits_for_fresh_ready_from_both_engines(self):
@@ -798,6 +1030,29 @@ class FederationChatAndPresenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("PLAYER_MESSAGE bob", controller.sink.commands[-1])
         self.assertIn("Skip vote:", controller.sink.commands[-1])
 
+    async def test_follower_accepts_authoritative_server_map_state(self):
+        controller = follower_controller()
+        controller._server_options_last = "stale"
+        await controller.handle_federation_datagram(
+            event(
+                "controller_message",
+                {
+                    "scope": "server_state",
+                    "current_map_key": "Tester/maps/Race-v1.aamap.xml",
+                    "next_map_key": "Tester/maps/Next-v2.aamap.xml",
+                },
+            )
+        )
+        self.assertEqual(
+            controller.federation_leader_current_map_key,
+            "Tester/maps/Race-v1.aamap.xml",
+        )
+        self.assertEqual(
+            controller.federation_leader_next_map_key,
+            "Tester/maps/Next-v2.aamap.xml",
+        )
+        self.assertIsNone(controller._server_options_last)
+
     async def test_follower_broadcast_is_shared_without_echoing_imports(self):
         controller = follower_controller()
         controller._publish_federation_control = AsyncMock(return_value=True)
@@ -850,12 +1105,23 @@ class FederationMapTests(unittest.IsolatedAsyncioTestCase):
             return True
 
         controller._publish_federation_control = publish
-        entry = SimpleNamespace(key="Tester/maps/Race-v1.aamap.xml")
-        before = time.time_ns()
-        await controller._prepare_federated_leader_map(entry, 0.5)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Race-v1.aamap.xml"
+            path.write_bytes(b"exact map")
+            entry = SimpleNamespace(
+                key="Tester/maps/Race-v1.aamap.xml",
+                local_path=path,
+            )
+            before = time.time_ns()
+            await controller._prepare_federated_leader_map(entry, 0.5)
         self.assertEqual(captured[0][0], "map_prepare")
         self.assertEqual(captured[0][1]["map_key"], entry.key)
+        self.assertEqual(
+            captured[0][1]["map_sha256"],
+            hashlib.sha256(b"exact map").hexdigest(),
+        )
         self.assertGreaterEqual(captured[0][1]["activate_at_ns"], before)
+        self.assertEqual(len(captured), 3)
 
     async def test_follower_precaches_and_waits_for_observed_commit(self):
         controller = follower_controller()
@@ -886,6 +1152,40 @@ class FederationMapTests(unittest.IsolatedAsyncioTestCase):
             activate_at_ns,
         )
         self.assertEqual(controller.sink.commands, [])
+
+    async def test_follower_prepare_reliability_copies_are_idempotent(self):
+        controller = follower_controller()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Race-v1.aamap.xml"
+            path.write_bytes(b"exact map")
+            entry = SimpleNamespace(
+                key="Tester/maps/Race-v1.aamap.xml",
+                local_path=path,
+            )
+
+            class Repository:
+                cached = []
+
+                def find_by_spec(self, spec):
+                    return entry if spec == entry.key else None
+
+                def cache_for_server(self, selected):
+                    self.cached.append(selected.key)
+
+            controller.repository = Repository()
+            payload = {
+                "map_key": entry.key,
+                "map_sha256": hashlib.sha256(b"exact map").hexdigest(),
+                "size_factor": 0.5,
+                "activate_at_ns": time.time_ns() + 10_000_000,
+            }
+            await asyncio.gather(
+                *(
+                    controller._handle_federation_map_prepare(payload)
+                    for _ in range(3)
+                )
+            )
+            self.assertEqual(controller.repository.cached, [entry.key])
 
     async def test_follower_refreshes_new_leader_map_without_waiting_for_poll(self):
         controller = follower_controller()
@@ -938,6 +1238,48 @@ class FederationMapTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(controller.repository.firebase.calls, 1)
         controller._reconcile_rotation.assert_called_once_with()
+
+    async def test_follower_fetches_exact_map_from_leader_before_firebase(self):
+        controller = follower_controller()
+        entry = SimpleNamespace(
+            key="Tester/maps/New-v2.aamap.xml",
+            local_path=Path("/tmp/New-v2.aamap.xml"),
+        )
+        digest = "a" * 64
+
+        class Firebase:
+            calls = 0
+
+            def get_catalog_state(self):
+                self.calls += 1
+                raise AssertionError("Firebase should not be needed")
+
+        class Repository:
+            def __init__(self):
+                self.firebase = Firebase()
+                self.available = False
+                self.fetches = []
+
+            def find_by_spec(self, spec):
+                return entry if self.available and spec == entry.key else None
+
+            def fetch_federated_resource(self, base_url, key, expected, timeout):
+                self.fetches.append((base_url, key, expected, timeout))
+                self.available = True
+                return entry
+
+        controller.repository = Repository()
+        controller.map_lock = asyncio.Lock()
+        controller.federation_leader_resource_base_url = "http://10.77.0.1:8080/"
+
+        selected = await controller._find_federation_map(entry.key, digest)
+
+        self.assertIs(selected, entry)
+        self.assertEqual(controller.repository.firebase.calls, 0)
+        self.assertEqual(
+            controller.repository.fetches,
+            [("http://10.77.0.1:8080/", entry.key, digest, 10.0)],
+        )
 
     async def test_missing_leader_map_refresh_is_rate_limited(self):
         controller = follower_controller()

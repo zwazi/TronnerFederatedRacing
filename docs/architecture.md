@@ -1,6 +1,6 @@
 # Architecture
 
-## Data path
+## Two data paths
 
 Each region runs three processes:
 
@@ -12,15 +12,16 @@ Armagetron engine <-> Unix datagrams <-> federation sidecar <-> authenticated UD
 
 The engine owns simulation and client networking. The controller owns map
 rotation, timing, respawn behavior, records, and optional external publishing.
-The sidecar keeps federation traffic off the game thread and rejects malformed,
-stale, replayed, incorrectly identified, or incorrectly signed datagrams before
-forwarding normalized local events.
+The sidecar has only two jobs: authenticate/route low-rate shared state, and
+relay best-effort cycle motion without blocking control state. It rejects
+malformed, stale, replayed, incorrectly identified, or incorrectly signed
+datagrams before forwarding normalized local events.
 
 Protocol v2 uses a bounded leader hub. Every follower has an independently
 authenticated link to the configured leader; followers do not connect directly
 to each other. The leader verifies a follower's transport identity, preserves
-the event's origin while re-signing it for each destination, and fans it out to
-the other followers. The leader is authoritative for map transitions and
+the event's origin while re-signing it for each destination, and fans shared
+events out to the other followers. The leader is authoritative for map transitions and
 synchronized round release. Every region remains authoritative for its local
 client connections and sends personal-best deltas toward the leader.
 
@@ -29,6 +30,29 @@ the shared deadline, while each controller evaluates its local racers against
 the active map's route geometry. See the
 [final-countdown progress guard](final-countdown-guard.md) for its conservative
 fallback and warn-before-kill behavior.
+
+Follower commands, observed follower maps, round-ready notices, and PB snapshot
+requests terminate at the leader. They are not fanned out to other followers.
+Presence, chat, motion, and accepted PB deltas are shared. This keeps one hub
+without pretending every event is global.
+
+## Ownership
+
+| State | Authority | Distribution |
+| --- | --- | --- |
+| Map choice, timer, queue, global commands | leader controller | authenticated control packets |
+| Rotation exclusions | leader controller | requested snapshot on follower start, immediate and periodic authenticated snapshots |
+| Exact selected map XML | leader immutable mirror | follower fetch over the private overlay, authenticated SHA-256 in `map_prepare` |
+| Local players, finishes, respawns | each local engine/controller | normalized edges and snapshots |
+| Remote cycle visuals | each local engine | best-effort coalesced UDP telemetry |
+| Authenticated personal bests | node that observed the finish, merged idempotently | PB deltas through the leader |
+| Start mode, saved spawn, server-tag display | latest versioned user change, reconciled by leader | retried deltas and periodic authenticated snapshots; no Firebase |
+| Public website state | leader unless explicitly documented otherwise | external publisher |
+
+Only the leader continuously watches Firebase catalog invalidation. Followers
+load their last catalog at startup, then obtain the exact selected immutable
+map from the leader. Firebase remains the publishing authority, but is no
+longer a timing dependency between regions during a map change.
 
 ## Trust boundaries
 
@@ -51,6 +75,13 @@ and downloaded catalog data are runtime state beneath `/var/lib` or the system
 journal. They are not required to reproduce the software and must not enter the
 source repository.
 
+The sidecar keeps high-rate cycle traffic separate from low-rate controller
+delivery. Cycle positions may be coalesced or dropped and refreshed by the next
+sample. Controller events use an independent local socket and a bounded FIFO;
+the forwarder waits through a local controller reload instead of discarding the
+front event. A busy engine import queue therefore cannot block or discard a
+command reply, preference update, or catalog-authority snapshot.
+
 ## Failure behavior
 
 The leader releases a round after every currently healthy follower is ready.
@@ -60,3 +91,8 @@ engine player IDs in two regions cannot collide. Record deltas are idempotent
 and acknowledgements name their destination. Protocol v1 and v2 envelopes have
 strict, separate schemas; an older receiver rejects v2 instead of accepting
 ambiguous authority.
+
+The sidecar writes `/run/tronner-federation/health.json` once per second. It
+contains no credentials or player addresses; it records the last authenticated
+packet of each kind from every semantic origin. `tools/check_federation_health.py`
+combines that evidence with local socket readiness and current-map hashes.
