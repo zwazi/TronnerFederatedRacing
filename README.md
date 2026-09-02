@@ -1,7 +1,7 @@
 # Tronner Racing
 
 Tronner Racing is one standalone Armagetron Advanced racing server in New
-York. It combines a patched dedicated server, the Python race controller, the
+York. It combines a patched dedicated server, the Python server script, the
 Firebase map catalog, live status, records, replays, and the tronner.io admin
 controls.
 
@@ -11,7 +11,7 @@ explicit product decision.
 
 ## Repository contents
 
-- `controller/` — racing, maps, respawns, records, ratings, live publishing,
+- `controller/` — server-script source for racing, maps, respawns, records, ratings, live publishing,
   admin commands, and tests;
 - `engine/` — the pinned upstream revision and Tronner gameplay patch;
 - `config/` — inert standalone examples;

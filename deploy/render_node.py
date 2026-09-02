@@ -202,7 +202,9 @@ def render(cluster: dict[str, Any], node: dict[str, Any], *, production: bool) -
         "repository_git_url": repository_url,
         "repository_branch": repository_branch,
         "repository_checkout": "/var/lib/tronner-racing/repository",
-        "repository_auto_sync": True,
+        # Firebase uses its version document as a background invalidation signal.
+        # Startup should use the already-validated immutable local snapshot.
+        "repository_auto_sync": repository_source != "firebase",
         "repository_refresh_seconds": 300,
         "public_dir": "/var/lib/tronner-racing/public",
         "public_bind": resource_bind,

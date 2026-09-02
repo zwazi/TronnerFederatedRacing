@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Tronner Racing controller for an Armagetron sty+ct+ap dedicated server.
+"""Tronner Racing server script for an Armagetron sty+ct+ap dedicated server.
 
-The controller follows ladderlog.txt, writes commands to the server's input
+The server script follows ladderlog.txt, writes commands to the server's input
 stream, mirrors maps from the configured Git repository over plain HTTP for
 legacy clients, and stores race records in SQLite.
 """
@@ -96,6 +96,8 @@ SERVER_MANAGEMENT_COMMANDS = frozenset(
         "restart_server",
         "console_command",
         "set_engine_option",
+        "reload_server_script",
+        # Compatibility for commands queued by an older web release.
         "reload_controller",
         "start_console_stream",
     }
@@ -3037,6 +3039,8 @@ class CommandSink:
 
 
 class MapRepository:
+    PARSED_CATALOG_CACHE_SCHEMA = 1
+
     def __init__(self, config: dict):
         self.source = str(config.get("repository_source", "git")).strip().casefold()
         if self.source not in {"git", "firebase"}:
@@ -3085,6 +3089,158 @@ class MapRepository:
         self.catalog: dict[str, MapEntry] = {}
         self.source_to_key: dict[str, str] = {}
         self.issues: list[str] = []
+
+    def _parsed_catalog_cache_path(self) -> Path | None:
+        generation = self.firebase_generation
+        if self.firebase is None or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", generation):
+            return None
+        return self.firebase_root / "parsed-catalog" / f"{generation}.json"
+
+    @staticmethod
+    def _cached_entry(entry: MapEntry) -> dict[str, object]:
+        return {
+            "key": entry.key,
+            "name": entry.name,
+            "author": entry.author,
+            "version": entry.version,
+            "category": entry.category,
+            "sourcePath": entry.source_path,
+            "spawns": [dataclasses.asdict(spawn) for spawn in entry.spawns],
+            "axes": entry.axes,
+            "mapId": entry.map_id,
+            "revisionId": entry.revision_id,
+            "storagePath": entry.storage_path,
+            "recordKey": entry.record_key,
+            "ratingKey": entry.rating_key_override,
+            "checkpointIds": list(entry.checkpoint_ids),
+            "checkpointMode": entry.checkpoint_mode,
+            "timeDecimals": entry.time_decimals,
+        }
+
+    def _write_parsed_catalog_cache(self) -> None:
+        path = self._parsed_catalog_cache_path()
+        if path is None:
+            return
+        payload = {
+            "schemaVersion": self.PARSED_CATALOG_CACHE_SCHEMA,
+            "generation": self.firebase_generation,
+            "catalogVersion": self.firebase_catalog_version,
+            "excludedKeys": sorted(self.excluded_keys),
+            "entries": [
+                self._cached_entry(entry)
+                for entry in sorted(self.catalog.values(), key=lambda item: item.key)
+            ],
+            "sourceToKey": self.source_to_key,
+            "issues": self.issues,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            with temporary.open("x", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+    def _load_parsed_catalog_cache(self) -> bool:
+        path = self._parsed_catalog_cache_path()
+        if path is None or not path.is_file():
+            return False
+        try:
+            payload = json.loads(path.read_text("utf-8"))
+            if (
+                payload.get("schemaVersion") != self.PARSED_CATALOG_CACHE_SCHEMA
+                or payload.get("generation") != self.firebase_generation
+                or int(payload.get("catalogVersion") or 0)
+                != self.firebase_catalog_version
+                or payload.get("excludedKeys") != sorted(self.excluded_keys)
+                or not isinstance(payload.get("entries"), list)
+            ):
+                return False
+            catalog: dict[str, MapEntry] = {}
+            for item in payload["entries"]:
+                source_path = str(item["sourcePath"])
+                local_path = self.checkout / source_path
+                key = str(item["key"])
+                if not local_path.is_file() or not (self.public_dir / key).is_file():
+                    return False
+                entry = MapEntry(
+                    key=key,
+                    name=str(item["name"]),
+                    author=str(item["author"]),
+                    version=str(item["version"]),
+                    category=str(item.get("category") or ""),
+                    source_path=source_path,
+                    local_path=local_path,
+                    spawns=tuple(
+                        SpawnPoint(
+                            float(spawn["x"]),
+                            float(spawn["y"]),
+                            float(spawn["xdir"]),
+                            float(spawn["ydir"]),
+                        )
+                        for spawn in item["spawns"]
+                    ),
+                    axes=(int(item["axes"]) if item.get("axes") is not None else None),
+                    map_id=str(item.get("mapId") or ""),
+                    revision_id=str(item.get("revisionId") or ""),
+                    storage_path=str(item.get("storagePath") or ""),
+                    record_key=str(item.get("recordKey") or ""),
+                    rating_key_override=str(item.get("ratingKey") or ""),
+                    checkpoint_ids=tuple(int(value) for value in item.get("checkpointIds", [])),
+                    checkpoint_mode=str(item.get("checkpointMode") or ""),
+                    time_decimals=int(item.get("timeDecimals", 3)),
+                )
+                if entry.key in catalog or not entry.spawns:
+                    return False
+                catalog[entry.key] = entry
+            source_to_key = payload.get("sourceToKey")
+            issues = payload.get("issues")
+            if not catalog or not isinstance(source_to_key, dict) or not isinstance(issues, list):
+                return False
+            self.catalog = catalog
+            self.source_to_key = {
+                str(source): str(key) for source, key in source_to_key.items()
+            }
+            self.issues = [str(issue) for issue in issues]
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            LOG.exception("unable to load parsed Firebase catalog cache %s", path)
+            return False
+        LOG.info(
+            "loaded %d maps from local parsed catalog cache (generation %s)",
+            len(self.catalog),
+            self.firebase_generation,
+        )
+        return True
+
+    def load_local_snapshot(self) -> None:
+        """Load the already-validated immutable Firebase snapshot without networking."""
+        if self.firebase is None:
+            self.scan()
+            return
+        self._load_firebase_manifest()
+        if not self._load_parsed_catalog_cache():
+            self.scan()
+
+    def local_catalog_signature(self) -> tuple[int, str, str] | None:
+        if self.firebase is None:
+            return None
+        try:
+            manifest = json.loads(
+                (self.checkout / ".catalog.json").read_text("utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            return None
+        signature = (
+            int(manifest.get("catalogVersion") or 0),
+            str(manifest.get("generation") or ""),
+            str(manifest.get("sourceManifestSha256") or ""),
+        )
+        return signature if all(signature) else None
 
     def sync(
         self,
@@ -3364,6 +3520,10 @@ class MapRepository:
         self.source_to_key = source_to_key
         self.issues = issues
         self._build_public_mirror()
+        try:
+            self._write_parsed_catalog_cache()
+        except OSError:
+            LOG.exception("unable to persist parsed Firebase catalog cache")
         LOG.info(
             "loaded %d maps from repository (%d issue(s))",
             len(catalog),
@@ -4079,7 +4239,7 @@ class TronnerRacing:
         if not getattr(self, "game_text_encoding_auto", True):
             if encoding != current:
                 LOG.warning(
-                    "Armagetron advertised %s but controller encoding is locked to %s",
+                    "Armagetron advertised %s but server-script encoding is locked to %s",
                     encoding,
                     current,
                 )
@@ -4105,7 +4265,24 @@ class TronnerRacing:
 
     async def initialize(self, start_http: bool = True) -> None:
         LOG.info("using Armagetron text encoding %s", self.game_text_encoding)
-        if (
+        if self.repository.firebase is not None:
+            local_manifest = self.repository.checkout / ".catalog.json"
+            use_local_snapshot = (
+                local_manifest.is_file()
+                and (
+                    not self.config.get("repository_auto_sync", True)
+                    or bool(self.controller_reload_state.get("pending"))
+                )
+            )
+            if use_local_snapshot:
+                await asyncio.to_thread(self.repository.load_local_snapshot)
+            else:
+                await asyncio.to_thread(self.repository.sync)
+            # The background invalidation watcher owns Firebase reconciliation.
+            # Seeding its signature prevents it from downloading and scanning the
+            # same immutable generation immediately after a fast local startup.
+            self.catalog_state_signature = self.repository.local_catalog_signature()
+        elif (
             self.config.get("repository_auto_sync", True)
             or not (self.repository.checkout / ".git").is_dir()
         ):
@@ -4113,37 +4290,6 @@ class TronnerRacing:
         else:
             await asyncio.to_thread(self.repository.scan)
         self._migrate_spawn_preferences()
-        if self.repository.firebase is not None:
-            reviews = await asyncio.to_thread(self.repository.list_map_reviews)
-            review_keys = {
-                str(item.get("sourceResourcePath") or "")
-                for item in reviews
-            }
-            catalog_keys = set(self.repository.firebase_maps_by_key)
-            retained_exclusions = {
-                key
-                for key in self.excluded_map_keys
-                if key in catalog_keys and key not in review_keys
-            }
-            if retained_exclusions != self.excluded_map_keys:
-                removed = self.excluded_map_keys - retained_exclusions
-                LOG.info(
-                    "removed %d stale/reviewed key(s) from permanent exclusions",
-                    len(removed),
-                )
-                self.excluded_map_keys = retained_exclusions
-                self.repository.excluded_keys = self.excluded_map_keys
-                self.store.set_json(
-                    "excluded_map_keys", sorted(self.excluded_map_keys)
-                )
-                self.excluded_map_reasons = {
-                    key: reason
-                    for key, reason in self.excluded_map_reasons.items()
-                    if key in self.excluded_map_keys
-                }
-                self.store.set_json(
-                    "excluded_map_reasons", self.excluded_map_reasons
-                )
         self._reconcile_rotation()
         self._restore_runtime_context()
         if self.transitioning:
@@ -4164,6 +4310,49 @@ class TronnerRacing:
         ]
         await self.sink.send(*initialization_commands)
         await self._resume_controller_reload()
+
+    async def reconcile_map_reviews_once(self) -> None:
+        """Reconcile legacy local exclusions after startup is already usable."""
+        if self.repository.firebase is None or not self.excluded_map_keys:
+            return
+        try:
+            reviews = await asyncio.to_thread(self.repository.list_map_reviews)
+            review_keys = {
+                str(item.get("sourceResourcePath") or "") for item in reviews
+            }
+            catalog_keys = set(self.repository.firebase_maps_by_key)
+            retained_exclusions = {
+                key
+                for key in self.excluded_map_keys
+                if key in catalog_keys and key not in review_keys
+            }
+            if retained_exclusions == self.excluded_map_keys:
+                return
+            removed = self.excluded_map_keys - retained_exclusions
+            async with self.map_lock:
+                self.excluded_map_keys = retained_exclusions
+                self.repository.excluded_keys = retained_exclusions
+                self.store.set_json(
+                    "excluded_map_keys", sorted(self.excluded_map_keys)
+                )
+                self.excluded_map_reasons = {
+                    key: reason
+                    for key, reason in self.excluded_map_reasons.items()
+                    if key in self.excluded_map_keys
+                }
+                self.store.set_json(
+                    "excluded_map_reasons", self.excluded_map_reasons
+                )
+                await asyncio.to_thread(self.repository.load_local_snapshot)
+                self._reconcile_rotation()
+            LOG.info(
+                "removed %d stale/reviewed key(s) from permanent exclusions",
+                len(removed),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.exception("background map-review reconciliation failed")
 
     def _restore_runtime_context(self) -> None:
         """Recover non-record state when the controller restarts mid-round."""
@@ -4461,7 +4650,7 @@ class TronnerRacing:
         alive = self._controller_reload_alive_players()
         if alive:
             await self.broadcast(
-                "Controller reload pending. Respawns are paused; "
+                "Server script reload pending. Respawns are paused; "
                 f"waiting for {len(alive)} active "
                 f"{'run' if len(alive) == 1 else 'runs'} to finish.",
             )
@@ -4469,7 +4658,7 @@ class TronnerRacing:
             await asyncio.sleep(0.05)
 
         await self.broadcast(
-            "Active runs are complete. Reloading the controller; "
+            "Active runs are complete. Reloading the server script; "
             "respawns will resume shortly.",
         )
         await asyncio.sleep(0.1)
@@ -4482,7 +4671,7 @@ class TronnerRacing:
             recovered = self._schedule_startup_respawns()
             if recovered:
                 LOG.info(
-                    "scheduled %d dead racer(s) after controller startup",
+                    "scheduled %d dead racer(s) after server-script startup",
                     recovered,
                 )
             return
@@ -4523,11 +4712,11 @@ class TronnerRacing:
             recovered = self._schedule_startup_respawns(resume_identity_keys)
         if recovered:
             LOG.info(
-                "scheduled %d dead racer(s) after graceful controller reload",
+                "scheduled %d dead racer(s) after graceful server-script reload",
                 recovered,
             )
         await self.broadcast(
-            "Controller reload complete. Respawning resumed.",
+            "Server script reload complete. Respawning resumed.",
         )
 
     def _schedule_startup_respawns(
@@ -5239,7 +5428,7 @@ class TronnerRacing:
     async def activate_next_map(self, reason: str) -> None:
         if getattr(self, "controller_reload_draining", False):
             LOG.info(
-                "deferring map advance during controller reload drain: %s",
+                "deferring map advance during server-script reload drain: %s",
                 reason,
             )
             return
@@ -5781,6 +5970,8 @@ class TronnerRacing:
             "serverRestartActive": bool(
                 getattr(self, "server_restart_active", False)
             ),
+            "serverScriptReloadPending": bool(self.controller_reload_state.get("pending")),
+            # Compatibility for a web release still open during deployment.
             "controllerReloadPending": bool(self.controller_reload_state.get("pending")),
             "respawnsPaused": bool(self.respawns_paused),
             "timeRemainingSeconds": max(
@@ -6133,10 +6324,10 @@ class TronnerRacing:
             await self.sink.send(f"{option} {rendered}")
             return f"Set {option} to {rendered} until the server is restarted or reconfigured.", {"option": option, "value": value}
 
-        if command_type == "reload_controller":
+        if command_type in {"reload_server_script", "reload_controller"}:
             if not self.request_controller_reload(actor.record_name):
-                raise ValueError("A graceful controller reload is already pending.")
-            return "Graceful controller reload scheduled after active runs finish.", {}
+                raise ValueError("A graceful server script reload is already pending.")
+            return "Graceful server script reload scheduled after active runs finish.", {}
 
         raise ValueError("That server-management command is not implemented.")
 
@@ -10625,7 +10816,7 @@ class TronnerRacing:
         if getattr(self, "respawns_paused", False):
             await self.private(
                 player,
-                "Respawns are paused for a controller reload; your run will resume shortly.",
+                "Respawns are paused for a server script reload; your run will resume shortly.",
             )
             return
         if self.final_countdown_active:
@@ -10685,7 +10876,7 @@ class TronnerRacing:
         if getattr(self, "respawns_paused", False):
             await self.private(
                 player,
-                "Respawns are paused for a controller reload; your run will resume shortly.",
+                "Respawns are paused for a server script reload; your run will resume shortly.",
             )
             return
         if self.final_countdown_active:
@@ -10714,7 +10905,7 @@ class TronnerRacing:
         if getattr(self, "respawns_paused", False):
             await self.private(
                 player,
-                "Respawns are paused for a controller reload; your run will resume shortly.",
+                "Respawns are paused for a server script reload; your run will resume shortly.",
             )
             return
         if self.final_countdown_active:
@@ -11162,6 +11353,9 @@ class TronnerRacing:
             asyncio.create_task(self.map_timer(), name="map-timer"),
             asyncio.create_task(self.repository_refresher(), name="repository-refresh"),
             asyncio.create_task(self.catalog_state_monitor(), name="catalog-state"),
+            asyncio.create_task(
+                self.reconcile_map_reviews_once(), name="map-review-reconciliation"
+            ),
             asyncio.create_task(self.bootstrap_players(), name="player-bootstrap"),
             asyncio.create_task(
                 self.helpful_message_announcer(),
@@ -11211,7 +11405,7 @@ def load_config(path: Path) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tronner Racing server controller")
+    parser = argparse.ArgumentParser(description="Tronner Racing server script")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--check", action="store_true", help="sync and validate maps, then exit")
     return parser.parse_args()

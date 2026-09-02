@@ -1,5 +1,5 @@
 [Unit]
-Description=Tronner Racing controller and map mirror
+Description=Tronner Racing server script and map mirror
 Documentation=https://github.com/zwazi/TronnerRacing
 Requires=armagetronad.service
 Wants=network-online.target
@@ -14,8 +14,9 @@ RuntimeDirectory=tronner-racing
 RuntimeDirectoryMode=0770
 RuntimeDirectoryPreserve=yes
 ExecStart=/usr/bin/python3 /opt/TronnerRacing/TronnerRacing.py --config /etc/tronner-racing/config.json
+ExecReload=/usr/local/sbin/tronner-racing-reload $MAINPID
 Restart=always
-RestartSec=3s
+RestartSec=250ms
 Nice=10
 CPUWeight=25
 IOSchedulingClass=idle

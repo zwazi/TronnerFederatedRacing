@@ -149,6 +149,8 @@ ln -sfn "$game_config_dir" /etc/armagetronad-dedicated
 install -d -o root -g armagetron -m 0750 /etc/tronner-racing
 install -m 0640 -o root -g armagetron "$render_dir/controller.json" /etc/tronner-racing/config.json
 install -m 0644 -o root -g root "$repository_dir/config/helpful_messages.txt" /etc/tronner-racing/helpful_messages.txt
+install -m 0755 -o root -g root "$repository_dir/deploy/tronner-racing-reload" \
+    /usr/local/sbin/tronner-racing-reload
 
 if ((firebase_enabled)); then
     install -m 0640 -o root -g armagetron \
