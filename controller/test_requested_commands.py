@@ -196,7 +196,7 @@ class RequestedBehaviorTests(unittest.IsolatedAsyncioTestCase):
             route_started = asyncio.Event()
             release_route = asyncio.Event()
 
-            async def slow_route_build(duration, *, map_key, map_path):
+            async def slow_route_build(*, map_key, map_path):
                 route_started.set()
                 await release_route.wait()
 
@@ -225,6 +225,26 @@ class RequestedBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 if controller.final_countdown_route_tasks:
                     await asyncio.gather(*controller.final_countdown_route_tasks)
                 controller.store.close()
+
+    def test_countdown_reuses_preloaded_route_model(self):
+        controller = object.__new__(TronnerRacing)
+        controller.config = {"final_countdown_progress_guard_enabled": True}
+        controller.current = SimpleNamespace(
+            key="cached-map",
+            local_path=Path("cached-map.xml"),
+        )
+        preloaded = object()
+        controller.final_countdown_route_model = preloaded
+        controller.final_countdown_route_map_key = "cached-map"
+        controller.final_countdown_route_building = False
+        controller.final_countdown_route_prepared = True
+        controller.final_countdown_progress_states = {1: object()}
+
+        controller._schedule_final_countdown_guard(30)
+
+        self.assertIs(controller.final_countdown_route_model, preloaded)
+        self.assertEqual(controller.final_countdown_progress_states, {})
+        self.assertEqual(controller.final_countdown_duration_seconds, 30)
 
 
 if __name__ == "__main__":
