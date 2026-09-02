@@ -554,7 +554,9 @@ class ProgressAssessment:
     ground_speed: float
     route_speed: float
     required_speed: float
-    route_efficiency: float
+    projected_seconds: float
+    can_finish: bool
+    making_progress: bool
 
 
 @dataclasses.dataclass
@@ -577,15 +579,6 @@ def assess_progress(
     samples: Sequence[TimedProgressSample],
     *,
     remaining_seconds: float,
-    total_seconds: float,
-    reference_distance: float,
-    reference_seconds: float,
-    early_required_fraction: float = 0.30,
-    late_required_fraction: float = 0.90,
-    early_minimum_ground_fraction: float = 0.12,
-    late_minimum_ground_fraction: float = 0.35,
-    early_minimum_efficiency: float = 0.03,
-    late_minimum_efficiency: float = 0.15,
     route_slack_distance: float = 2.0,
 ) -> ProgressAssessment | None:
     if len(samples) < 2:
@@ -593,9 +586,6 @@ def assess_progress(
     duration = samples[-1][0] - samples[0][0]
     if duration <= 0:
         return None
-    total_seconds = max(remaining_seconds, total_seconds, 1e-6)
-    elapsed_fraction = min(1.0, max(0.0, 1.0 - remaining_seconds / total_seconds))
-
     path_distance = sum(
         math.hypot(current[1] - previous[1], current[2] - previous[2])
         for previous, current in zip(samples, samples[1:])
@@ -615,48 +605,46 @@ def assess_progress(
         -distance_covariance / time_variance if time_variance > 1e-9 else 0.0
     )
     net_progress = samples[0][3] - samples[-1][3]
-    route_efficiency = net_progress / max(path_distance, 1e-9)
-
-    required_fraction = early_required_fraction + (
-        late_required_fraction - early_required_fraction
-    ) * elapsed_fraction
+    slack_distance = max(0.0, route_slack_distance)
+    remaining_distance = max(0.0, samples[-1][3] - slack_distance)
+    available_seconds = max(0.0, remaining_seconds)
     required_speed = (
-        max(0.0, samples[-1][3])
-        / max(1.0, remaining_seconds)
-        * max(0.0, required_fraction)
+        remaining_distance / available_seconds
+        if available_seconds > 1e-9
+        else math.inf
     )
-    nominal_speed = (
-        reference_distance / reference_seconds
-        if reference_distance > 0 and reference_seconds > 0
-        else required_speed
+    projected_seconds = (
+        remaining_distance / ground_speed if ground_speed > 1e-9 else math.inf
     )
-    minimum_ground_fraction = early_minimum_ground_fraction + (
-        late_minimum_ground_fraction - early_minimum_ground_fraction
-    ) * elapsed_fraction
-    minimum_ground_speed = max(0.0, nominal_speed * minimum_ground_fraction)
-    minimum_efficiency = early_minimum_efficiency + (
-        late_minimum_efficiency - early_minimum_efficiency
-    ) * elapsed_fraction
-    slack_speed = max(0.0, route_slack_distance) / duration
 
-    if route_speed < -slack_speed:
-        reason = "driving away from the winzone route"
-    elif (
-        ground_speed >= max(minimum_ground_speed * 1.5, nominal_speed * 0.25)
-        and route_speed < max(slack_speed, required_speed * 0.25)
-        and route_efficiency < minimum_efficiency
-    ):
-        reason = "moving without making route progress"
-    elif ground_speed + slack_speed < minimum_ground_speed:
-        reason = "moving too slowly"
-    elif route_speed + slack_speed < required_speed:
-        reason = "not progressing fast enough to finish"
-    else:
+    # Reachability is intentionally optimistic: it uses the racer's measured
+    # ground speed over the wall-aware remaining route. Direction is evaluated
+    # independently below, so a fast circle cannot pass merely by moving fast.
+    can_finish = projected_seconds <= available_seconds
+    making_progress = (
+        net_progress > slack_distance
+        and route_speed > slack_distance / duration
+    )
+
+    if can_finish and making_progress:
         return None
+    if not can_finish and not making_progress:
+        reason = (
+            "your current speed is too low to reach the winzone before time "
+            "expires and you are not making consistent progress toward it"
+        )
+    elif not can_finish:
+        reason = (
+            "your current speed is too low to reach the winzone before time expires"
+        )
+    else:
+        reason = "you are not making consistent progress toward the winzone"
     return ProgressAssessment(
         reason=reason,
         ground_speed=ground_speed,
         route_speed=route_speed,
         required_speed=required_speed,
-        route_efficiency=route_efficiency,
+        projected_seconds=projected_seconds,
+        can_finish=can_finish,
+        making_progress=making_progress,
     )

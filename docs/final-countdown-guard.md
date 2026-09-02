@@ -35,23 +35,26 @@ required checkpoint, the winzone field is not used to judge that player.
 
 ## Enforcement
 
-The rolling trajectory supplies ground speed, route-progress speed, and route
-efficiency. The server script detects four sustained conditions:
+The rolling trajectory supplies two independent answers:
 
-1. movement below a map-relative minimum speed;
-2. insufficient progress to finish in the remaining time;
-3. increasing route distance, meaning the racer is driving away; and
-4. substantial movement with little route progress, such as a fast circle.
+1. **Can the racer finish in time?** The server script divides the wall-aware
+   distance from the racer's current position by their measured ground speed.
+   The resulting projected travel time must fit inside the countdown time that
+   remains.
+2. **Is the racer making consistent progress?** The wall-aware distance must
+   trend downward by more than the route field's small raster-noise allowance
+   over the rolling observation window. Fast circles and sustained movement
+   away from the valid route therefore fail even when ground speed is high.
 
-The minimum pace, efficiency requirement, observation window, and post-warning
-grace period become stricter as the countdown approaches zero. Thresholds are
-calibrated with the map's median spawn-to-finish route distance and record time,
-so maps with different coordinate scales do not share one arbitrary speed.
+The observation window and post-warning grace period become shorter as the
+countdown approaches zero. A single sample, route-field jitter, or one brief
+wrong turn does not trigger enforcement.
 
-The first sustained violation sends a private warning. If the rolling window
-recovers, the warning state is cleared. If the violation continues through the
-time-dependent grace period, the server script sends `KILL_SILENT` once and logs
-the measured ground speed, route speed, required speed, reason, map, stable
+If either answer is false for a complete observation window, the racer receives
+a private warning. If both answers recover, the warning state is cleared. If
+either condition remains false through the time-dependent grace period, the
+server script sends `KILL_SILENT` once and logs both decisions, projected travel
+time, measured ground and route speeds, required speed, reason, map, stable
 player identity, and remaining time.
 
 The standalone server script evaluates the guard and, if necessary, kills only
