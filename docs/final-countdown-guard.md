@@ -5,9 +5,10 @@ allowed to finish. A moving cycle is not necessarily an active racer: an
 unattended cycle keeps driving, and a player can deliberately circle or drive
 away from the finish to delay the map transition.
 
-The server script therefore requests one-second player activity snapshots during
-the final countdown and evaluates each local finalist over a rolling window.
-It never treats one sample or one wrong turn as griefing.
+The **Final Countdown Progress Guard** therefore requests one-second player
+activity snapshots and tracks every local finalist from the beginning of the
+countdown. It uses a cumulative wrong-way allowance rather than trying to judge
+whether a player is fast enough to finish.
 
 ## Route model
 
@@ -30,18 +31,22 @@ boundaries. Walls therefore cannot disappear between cell centers, while real
 narrow wall-to-wall, wall-to-zone, and zone-to-zone passages are not erased by
 artificially widening every obstacle to the raster-cell size.
 
-If a real passage is narrower than a bounded raster cell, the high-resolution
-retry merges a sparse sub-cell graph into the distance field. Exact-collision
-rings around wall endpoints and centerlines through nearby wall/wall,
-wall/death-zone, and death-zone/death-zone boundaries preserve those passages
-without allocating a microscopic grid across the whole arena.
+The primary field is allowed up to 250,000 cells with a 0.5-unit minimum cell
+size. A disconnected field retries with up to 500,000 cells and a 0.1-unit
+minimum. In addition, every field—not only a fully disconnected one—merges a
+sparse sub-cell graph. Exact-collision rings around wall endpoints and
+centerlines through nearby wall/wall, wall/death-zone, and
+death-zone/death-zone boundaries preserve alternate tight passages without
+allocating a microscopic grid across the whole arena.
+The supplemental graph is capped by both point count and obstacle complexity;
+very large maps retain the higher-resolution raster without allowing auxiliary
+collision checks to occupy the controller CPU indefinitely.
 
-Route distance, rather than straight-line distance, permits a player to move
-away from the winzone temporarily when a wall or death zone makes that detour
-necessary. A higher-resolution retry is used for narrow maps. If the bounded
-field still cannot certify a spawn-to-winzone route, the server script disables
-route judgments for that map and retains the native input-idle fallback. It
-does not substitute straight-line distance.
+Route distance, rather than straight-line distance, recognizes a necessary
+detour around a wall or death zone as progress along the real route. If the
+bounded field still cannot certify a spawn-to-winzone route, the server script
+disables route judgments for that map and retains the native input-idle
+fallback. It does not substitute straight-line distance.
 
 Teleport destinations use the same `abs`, `rel`, and `cycle` formulas as the
 patched game engine. The route field can chain multiple teleports. Teleport
@@ -53,31 +58,29 @@ required checkpoint, the winzone field is not used to judge that player.
 
 ## Enforcement
 
-The rolling trajectory supplies two independent answers:
+Each player starts the countdown with five seconds of cumulative wrong-way
+allowance. Whenever the wall-aware remaining route distance increases, elapsed
+sample time is deducted from that allowance. Moving toward the winzone pauses
+the deduction but never restores time already used. Small distance-field jitter
+is neutral and does not consume the allowance.
 
-1. **Can the racer finish in time?** The server script projects travel over the
-   wall-aware distance from the racer's current position using recent measured
-   ground speed and the active engine settings snapshot. The projection includes
-   recovery toward `CYCLE_SPEED`, the configured below/above-base decay rates,
-   the maximum wall-acceleration envelope, the real cycle-speed multiplier, and
-   any configured speed cap. It deliberately assumes maximum available
-   acceleration so a run is not ended when the player could still accelerate
-   enough to finish.
-2. **Is the racer making consistent progress?** The wall-aware distance must
-   trend downward by more than the route field's small raster-noise allowance
-   over the rolling observation window. Fast circles and sustained movement
-   away from the valid route therefore fail even when ground speed is high.
+A sustained wrong-way episode produces a private warning after one second. If
+the player resumes progress and later starts another sustained wrong-way
+episode, another warning is sent with the remaining allowance. When the
+cumulative total reaches five seconds, the server script sends `KILL_SILENT`
+once and records the removal in the controller log.
 
-The observation window and post-warning grace period become shorter as the
-countdown approaches zero. A single sample, route-field jitter, or one brief
-wrong turn does not trigger enforcement.
+The server script no longer kills a player merely because an ETA projection
+says the player is too slow. Cycle acceleration therefore needs no special
+estimate for this rule: actual movement through the wall- and teleport-aware
+route field is authoritative. The ordinary countdown expiry still ends runs
+that do not finish in time.
 
-If either answer is false for a complete observation window, the racer receives
-a private warning. If both answers recover, the warning state is cleared. If
-either condition remains false through the time-dependent grace period, the
-server script sends `KILL_SILENT` once and logs both decisions, projected travel
-time, measured ground and route speeds, required speed, reason, map, stable
-player identity, and remaining time.
+Field construction runs in a worker thread. Positions received while it is
+building are retained and replayed through the completed field, so tracking
+still begins at countdown start. A route sample that is not represented by the
+field is never replaced with a straight-line guess; that map uses the existing
+input-idle fallback instead.
 
 The standalone server script evaluates the guard and, if necessary, kills only
 the stalled local cycle.

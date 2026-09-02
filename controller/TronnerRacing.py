@@ -47,7 +47,6 @@ from final_countdown_guard import (
     AccelerationCapability,
     PlayerProgressState,
     RouteModel,
-    assess_progress,
     build_route_model,
 )
 from live_dashboard import FirebaseLiveDashboardPublisher, public_player_id
@@ -8377,7 +8376,7 @@ class TronnerRacing:
         idle_seconds = float(
             getattr(self, "config", {}).get("final_countdown_idle_seconds", 10)
         )
-        if idle_seconds > 0 and not self._final_countdown_grief_detection_enabled():
+        if idle_seconds > 0 and not self._final_countdown_progress_guard_enabled():
             await self.sink.send(f"KILL_IDLE_PLAYERS {idle_seconds:.9g}")
         return True
 
@@ -8662,10 +8661,12 @@ class TronnerRacing:
             player, now, position, native_idle_seconds
         )
 
-    def _final_countdown_grief_detection_enabled(self) -> bool:
+    def _final_countdown_progress_guard_enabled(self) -> bool:
+        config = getattr(self, "config", {})
         return bool(
-            getattr(self, "config", {}).get(
-                "final_countdown_grief_detection_enabled", True
+            config.get(
+                "final_countdown_progress_guard_enabled",
+                config.get("final_countdown_grief_detection_enabled", True),
             )
         )
 
@@ -8699,14 +8700,12 @@ class TronnerRacing:
     def _schedule_final_countdown_guard(self, duration: float) -> None:
         self.final_countdown_progress_states = {}
         self.final_countdown_duration_seconds = max(1.0, float(duration))
-        self.final_countdown_acceleration_capability = None
-        self.final_countdown_acceleration_identifier = None
         self.final_countdown_route_model = None
         self.final_countdown_route_map_key = self.current.key if self.current else None
         self.final_countdown_route_building = False
         map_path = getattr(self.current, "local_path", None) if self.current else None
         if (
-            not self._final_countdown_grief_detection_enabled()
+            not self._final_countdown_progress_guard_enabled()
             or not self.current
             or not map_path
         ):
@@ -8755,42 +8754,20 @@ class TronnerRacing:
         ):
             self._finish_final_countdown_route_build(map_key)
             return
-        self.final_countdown_acceleration_capability = (
-            self._active_acceleration_capability()
-        )
-        self.final_countdown_acceleration_identifier = getattr(
-            self, "active_replay_settings_identifier", None
-        )
-        capability = self.final_countdown_acceleration_capability
-        if capability is None:
-            LOG.warning(
-                "active cycle acceleration settings unavailable; final-countdown "
-                "reachability will use measured speed until the engine snapshot arrives"
-            )
-        else:
-            LOG.info(
-                "final-countdown acceleration base=%.3f decay_below=%.3f "
-                "decay_above=%.3f external=%.3f maximum=%.3f",
-                capability.base_speed,
-                capability.decay_below,
-                capability.decay_above,
-                capability.external_acceleration,
-                capability.maximum_speed,
-            )
         maximum_cells = min(
             500_000,
             max(
                 1_000,
                 int(
                     self.config.get(
-                        "final_countdown_route_maximum_cells", 100_000
+                        "final_countdown_route_maximum_cells", 250_000
                     )
                 ),
             ),
         )
         minimum_cell_size = max(
             0.1,
-            float(self.config.get("final_countdown_route_minimum_cell_size", 1.0)),
+            float(self.config.get("final_countdown_route_minimum_cell_size", 0.5)),
         )
         wall_clearance = max(
             0.0,
@@ -8812,6 +8789,7 @@ class TronnerRacing:
                 minimum_cell_size=minimum_cell_size,
                 wall_clearance_cells=wall_clearance,
                 size_multiplier=size_multiplier,
+                narrow_passage_guides=True,
             )
         except asyncio.CancelledError:
             self._finish_final_countdown_route_build(map_key)
@@ -8836,7 +8814,7 @@ class TronnerRacing:
                     maximum_cells,
                     int(
                         self.config.get(
-                            "final_countdown_route_retry_maximum_cells", 250_000
+                            "final_countdown_route_retry_maximum_cells", 500_000
                         )
                     ),
                 ),
@@ -8847,7 +8825,7 @@ class TronnerRacing:
                     0.1,
                     float(
                         self.config.get(
-                            "final_countdown_route_retry_minimum_cell_size", 0.5
+                            "final_countdown_route_retry_minimum_cell_size", 0.1
                         )
                     ),
                 ),
@@ -8913,7 +8891,7 @@ class TronnerRacing:
     ) -> None:
         model = getattr(self, "final_countdown_route_model", None)
         if (
-            not self._final_countdown_grief_detection_enabled()
+            not self._final_countdown_progress_guard_enabled()
             or not getattr(self, "final_countdown_active", False)
             or not getattr(self, "final_countdown_end_epoch", None)
             or not self.current
@@ -8926,174 +8904,162 @@ class TronnerRacing:
             or player.is_ai
         ):
             return
+        state = getattr(self, "final_countdown_progress_states", {}).setdefault(
+            id(player), PlayerProgressState()
+        )
+        if state.killed:
+            return
         required_checkpoints = set(getattr(self.current, "checkpoint_ids", ()))
         if required_checkpoints.difference(player.checkpoints_collected):
             # The current field targets the winzone.  Until a checkpoint-aware
             # field is available, do not mistake a required checkpoint detour
-            # for griefing on maps that use the newer checkpoint mode.
+            # for wrong-way travel on maps that use the newer checkpoint mode.
+            state.pending_positions.clear()
+            state.clear_route_baseline()
             await self._record_final_countdown_idle_fallback(
                 player, now, position, native_idle_seconds
             )
             return
         if model is None:
             if getattr(self, "final_countdown_route_building", False):
+                state.pending_positions.append((now, position[0], position[1]))
+                history_seconds = max(
+                    10.0,
+                    float(
+                        getattr(
+                            self, "final_countdown_duration_seconds", 0.0
+                        )
+                        or 0.0
+                    ),
+                )
+                while (
+                    state.pending_positions
+                    and now - state.pending_positions[0][0] > history_seconds
+                ):
+                    state.pending_positions.popleft()
                 return
+            state.pending_positions.clear()
+            state.clear_route_baseline()
             await self._record_final_countdown_idle_fallback(
                 player, now, position, native_idle_seconds
             )
             return
-        route_distance = model.distance_at(position)
-        if not math.isfinite(route_distance):
-            await self._record_final_countdown_idle_fallback(
-                player, now, position, native_idle_seconds
-            )
-            return
-        state = getattr(self, "final_countdown_progress_states", {}).setdefault(
-            id(player), PlayerProgressState()
-        )
-        if state.killed:
-            return
-        if state.samples and state.samples[-1][3] <= 0:
-            state.samples.clear()
-            state.travel_distance = 0.0
-            state.clear_violation()
-        if state.samples:
-            state.travel_distance += model.observed_travel_distance(
-                (state.samples[-1][1], state.samples[-1][2]),
-                position,
-            )
-        state.samples.append(
-            (
-                now,
-                position[0],
-                position[1],
-                route_distance,
-                state.travel_distance,
-            )
-        )
+        state.samples.clear()
+        state.travel_distance = 0.0
+        state.clear_violation()
+        pending = list(state.pending_positions)
+        state.pending_positions.clear()
+        if not pending or abs(pending[-1][0] - now) > 1e-9:
+            pending.append((now, position[0], position[1]))
 
-        remaining = max(
-            0.0, float(self.final_countdown_end_epoch) - time.time()
-        )
-        total = max(
-            remaining,
-            float(getattr(self, "final_countdown_duration_seconds", 0.0) or 0.0),
-            1.0,
-        )
-        elapsed_fraction = min(1.0, max(0.0, 1.0 - remaining / total))
-        early_window = max(
-            2.0,
-            float(self.config.get("final_countdown_grief_early_window_seconds", 8.0)),
-        )
-        late_window = max(
-            1.0,
-            float(self.config.get("final_countdown_grief_late_window_seconds", 3.0)),
-        )
-        window = early_window + (late_window - early_window) * elapsed_fraction
-        while state.samples and now - state.samples[0][0] > window * 1.15:
-            state.samples.popleft()
-        if (
-            len(state.samples) < 2
-            or state.samples[-1][0] - state.samples[0][0] < window * 0.75
-        ):
-            return
-        # Inside or immediately beside a winzone is never a griefing signal;
-        # the authoritative finish event may simply be one ladderlog tick late.
-        if route_distance <= max(model.cell_size * 1.5, 0.5):
-            state.clear_violation()
-            return
-
-        acceleration_capability = getattr(
-            self, "final_countdown_acceleration_capability", None
-        )
-        active_settings_identifier = getattr(
-            self, "active_replay_settings_identifier", None
-        )
-        if (
-            acceleration_capability is None
-            or active_settings_identifier
-            != getattr(self, "final_countdown_acceleration_identifier", None)
-        ):
-            acceleration_capability = self._active_acceleration_capability()
-            self.final_countdown_acceleration_capability = acceleration_capability
-            self.final_countdown_acceleration_identifier = active_settings_identifier
-        assessment = assess_progress(
-            tuple(state.samples),
-            remaining_seconds=remaining,
-            route_slack_distance=max(
-                model.cell_size * 1.5,
-                float(
-                    self.config.get(
-                        "final_countdown_grief_route_slack_distance", 2.0
-                    )
-                ),
+        allowance = max(
+            0.1,
+            float(
+                self.config.get(
+                    "final_countdown_progress_wrong_way_allowance_seconds", 5.0
+                )
             ),
-            acceleration_capability=acceleration_capability,
         )
-        if assessment is None:
-            state.clear_violation()
-            return
-        if state.violation_started_at is None:
-            state.violation_started_at = now
-        state.last_reason = assessment.reason
+        warning_delay = max(
+            0.0,
+            float(
+                self.config.get(
+                    "final_countdown_progress_warning_delay_seconds", 1.0
+                )
+            ),
+        )
+        direction_slack = max(
+            model.cell_size * 0.35,
+            float(
+                self.config.get(
+                    "final_countdown_progress_direction_slack_distance",
+                    self.config.get(
+                        "final_countdown_grief_route_slack_distance", 0.25
+                    ),
+                )
+            ),
+        )
+        maximum_sample_gap = max(
+            0.1,
+            float(
+                self.config.get(
+                    "final_countdown_progress_max_sample_gap_seconds", 2.0
+                )
+            ),
+        )
+        latest_update = None
+        warnings_due = 0
+        current_route_distance = math.inf
+        winzone_margin = max(model.cell_size * 1.5, 0.5)
+        for sample_time, sample_x, sample_y in pending:
+            route_distance = model.distance_at((sample_x, sample_y))
+            if sample_time == pending[-1][0]:
+                current_route_distance = route_distance
+            if not math.isfinite(route_distance):
+                # Never bridge an unmodelled interval with a guessed straight
+                # line. Preserve the already-used allowance and wait for two
+                # consecutive route-aware samples.
+                state.clear_route_baseline()
+                latest_update = None
+                continue
+            if route_distance <= winzone_margin:
+                state.last_route_sample = (sample_time, route_distance)
+                state.clear_wrong_way_episode()
+                latest_update = None
+                continue
+            latest_update = state.observe_route_distance(
+                sample_time,
+                route_distance,
+                allowance_seconds=allowance,
+                warning_delay_seconds=warning_delay,
+                direction_slack_distance=direction_slack,
+                maximum_sample_gap_seconds=maximum_sample_gap,
+            )
+            if latest_update.warning_due:
+                warnings_due += 1
 
-        early_grace = max(
-            1.0,
-            float(self.config.get("final_countdown_grief_early_grace_seconds", 6.0)),
-        )
-        late_grace = max(
-            1.0,
-            float(self.config.get("final_countdown_grief_late_grace_seconds", 2.0)),
-        )
-        grace = early_grace + (late_grace - early_grace) * elapsed_fraction
-        if state.warned_at is None:
-            state.warned_at = now
+        if not math.isfinite(current_route_distance):
+            await self._record_final_countdown_idle_fallback(
+                player, now, position, native_idle_seconds
+            )
+            return
+        if latest_update is None:
+            return
+        if warnings_due:
             await self.private(
                 player,
-                f"Final countdown warning: {assessment.reason}. "
-                f"Your run will be ended if this continues for "
-                f"{math.ceil(grace)} seconds.",
+                "Countdown progress warning: you are heading away from the "
+                f"winzone. You have {latest_update.remaining_allowance_seconds:.1f} "
+                f"of {allowance:.1f} wrong-way seconds left.",
             )
             LOG.info(
-                "final-countdown warning map=%s player=%s reason=%s "
-                "ground=%.3f route=%.3f required=%.3f projected=%.3f "
-                "can_finish=%s making_progress=%s remaining=%.3f",
+                "countdown-progress-guard warning map=%s player=%s "
+                "wrong_way=%.3f allowance=%.3f remaining=%.3f route=%.3f",
                 self.current.key if self.current else "",
                 player.identity_key,
-                assessment.reason,
-                assessment.ground_speed,
-                assessment.route_speed,
-                assessment.required_speed,
-                assessment.projected_seconds,
-                assessment.can_finish,
-                assessment.making_progress,
-                remaining,
+                latest_update.total_wrong_way_seconds,
+                allowance,
+                latest_update.remaining_allowance_seconds,
+                current_route_distance,
             )
-            return
-        if now - state.warned_at < grace:
+        if not latest_update.exhausted:
             return
 
         state.killed = True
         await self.private(
             player,
-            f"Your final-countdown run was ended because {assessment.reason} "
-            "after you were warned.",
+            "Your final-countdown run was ended after you used all "
+            f"{allowance:.1f} seconds of your wrong-way allowance.",
         )
         await self.sink.send(f"KILL_SILENT {player.target}")
         LOG.warning(
-            "final-countdown griefer removed map=%s player=%s reason=%s "
-            "ground=%.3f route=%.3f required=%.3f projected=%.3f "
-            "can_finish=%s making_progress=%s remaining=%.3f",
+            "countdown-progress-guard removed map=%s player=%s "
+            "wrong_way=%.3f allowance=%.3f route=%.3f",
             self.current.key if self.current else "",
             player.identity_key,
-            assessment.reason,
-            assessment.ground_speed,
-            assessment.route_speed,
-            assessment.required_speed,
-            assessment.projected_seconds,
-            assessment.can_finish,
-            assessment.making_progress,
-            remaining,
+            latest_update.total_wrong_way_seconds,
+            allowance,
+            current_route_distance,
         )
 
     async def _record_final_countdown_idle_fallback(
@@ -9243,7 +9209,7 @@ class TronnerRacing:
             if (
                 getattr(self, "final_countdown_active", False)
                 and getattr(self, "final_countdown_end_epoch", None)
-                and not self._final_countdown_grief_detection_enabled()
+                and not self._final_countdown_progress_guard_enabled()
                 and fallback_idle_seconds > 0
                 and now - last_final_countdown_idle_check >= 1.0
             ):
@@ -10288,7 +10254,7 @@ class TronnerRacing:
         idle_seconds = float(
             self.config.get("final_countdown_idle_seconds", 10)
         )
-        if idle_seconds > 0 and not self._final_countdown_grief_detection_enabled():
+        if idle_seconds > 0 and not self._final_countdown_progress_guard_enabled():
             # Clear racers who were already idle at the instant /end was
             # submitted. The final-countdown loop keeps rechecking afterward.
             await self.sink.send(
@@ -10488,7 +10454,7 @@ class TronnerRacing:
             )
             if (
                 idle_seconds > 0
-                and not self._final_countdown_grief_detection_enabled()
+                and not self._final_countdown_progress_guard_enabled()
             ):
                 await self.sink.send(f"KILL_IDLE_PLAYERS {idle_seconds:.9g}")
 
@@ -10943,7 +10909,7 @@ class TronnerRacing:
             )
             if (
                 idle_seconds > 0
-                and not self._final_countdown_grief_detection_enabled()
+                and not self._final_countdown_progress_guard_enabled()
             ):
                 await self.sink.send(f"KILL_IDLE_PLAYERS {idle_seconds:.9g}")
             await self.broadcast(

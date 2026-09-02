@@ -948,33 +948,33 @@ def build_route_model(
         blocked=blocked,
         distances=distances,
     )
-    if (
-        model.reference_distance <= 0
-        and narrow_passage_guides
-        and maximum_cells < 500_000
-    ):
-        projected_cell_size = max(
-            0.1,
-            min(minimum_cell_size, 0.1),
-            math.sqrt(extent_x * extent_y / 500_000),
-        )
-        if projected_cell_size <= cell_size * 0.5:
-            return build_route_model(
-                path,
-                maximum_cells=500_000,
-                minimum_cell_size=min(minimum_cell_size, 0.1),
-                wall_clearance_cells=wall_clearance_cells,
-                size_multiplier=size_multiplier,
-                narrow_passage_guides=True,
-            )
-    if model.reference_distance <= 0 and narrow_passage_guides:
+    if narrow_passage_guides:
+        # A spawn can be reachable through one broad route while a second,
+        # legitimate sub-cell route is absent from the raster. Enrich every
+        # requested model, not only wholly disconnected ones, so tight maps
+        # with multiple route choices retain each real passage.
         _bridge_narrow_passages(
             model,
             moves=moves,
             grid_point=grid_point,
             segment_is_clear=segment_is_clear,
             clear_grid_edge=clear_grid_edge,
+            include_zone_portals=True,
+            include_circle_rings=False,
         )
+        if model.reference_distance <= 0:
+            # Full rings around every death circle are substantially more
+            # expensive. Reserve them for the maps that remain disconnected
+            # after targeted wall/zone passage guides have been merged.
+            _bridge_narrow_passages(
+                model,
+                moves=moves,
+                grid_point=grid_point,
+                segment_is_clear=segment_is_clear,
+                clear_grid_edge=clear_grid_edge,
+                include_zone_portals=True,
+                include_circle_rings=True,
+            )
     return model
 
 
@@ -995,6 +995,7 @@ def _bridge_narrow_passages(
     guide_epsilon = max(cell_size * 0.02, 1e-7)
     guide_spacing = max(cell_size * 0.45, guide_epsilon * 4)
     guide_radius = cell_size * 0.8
+    guide_limit = 6_000
     raw_guides: list[Point] = [*geometry.spawns]
     raw_guides.extend(circle.center for circle in geometry.win_circles)
     raw_guides.extend(
@@ -1008,13 +1009,32 @@ def _bridge_narrow_passages(
     obstacle_segments = list(geometry.wall_segments)
     for polygon in geometry.death_polygons:
         obstacle_segments.extend(zip(polygon, (*polygon[1:], polygon[0])))
-    if len(obstacle_segments) > 1_000 or len(geometry.death_circles) > 500:
+    obstacle_complexity = len(obstacle_segments) + 2 * len(geometry.death_circles)
+    if obstacle_complexity > 1_000:
         return
+    # Only sub-cell and near-sub-cell gaps need supplemental samples. Wider
+    # passages are represented by the ordinary raster already.
+    portal_limit = cell_size * 1.25
     obstacle_vertices = {
         point for segment in obstacle_segments for point in segment
     }
-    endpoint_samples = 24
-    for point in obstacle_vertices:
+    narrow_vertices = {
+        point
+        for point in obstacle_vertices
+        if any(
+            point != start
+            and point != end
+            and guide_epsilon * 2
+            < _point_segment_distance(point, start, end)
+            < portal_limit
+            for start, end in obstacle_segments
+        )
+    }
+    endpoint_samples = 16
+    endpoint_guide_budget = min(2_000, guide_limit // 3)
+    for point in sorted(narrow_vertices):
+        if len(raw_guides) + endpoint_samples > endpoint_guide_budget:
+            break
         for sample in range(endpoint_samples):
             angle = 2 * math.pi * sample / endpoint_samples
             raw_guides.append(
@@ -1025,7 +1045,7 @@ def _bridge_narrow_passages(
             )
 
     def add_portal_line(center: Point, direction: Point, half_length: float) -> None:
-        if len(raw_guides) >= 60_000:
+        if len(raw_guides) >= guide_limit:
             return
         length = math.hypot(*direction)
         if length <= 1e-12:
@@ -1033,37 +1053,14 @@ def _bridge_narrow_passages(
         unit = direction[0] / length, direction[1] / length
         samples = max(1, int(math.ceil(half_length / guide_spacing)))
         for sample in range(-samples, samples + 1):
-            if len(raw_guides) >= 60_000:
+            if len(raw_guides) >= guide_limit:
                 break
             amount = half_length * sample / samples
             raw_guides.append(
                 (center[0] + unit[0] * amount, center[1] + unit[1] * amount)
             )
 
-    # Only sub-cell and near-sub-cell gaps need supplemental samples. Wider
-    # passages are represented by the ordinary raster already.
-    portal_limit = cell_size * 1.25
     circles = geometry.death_circles if include_zone_portals else ()
-    if include_circle_rings:
-        for circle in geometry.death_circles:
-            guide_radius_value = circle.radius + guide_epsilon
-            if circle.radius <= 1e-12:
-                continue
-            maximum_angle = 2 * math.acos(
-                min(1.0, circle.radius / guide_radius_value)
-            )
-            samples = max(
-                12,
-                int(math.ceil(2 * math.pi / max(maximum_angle * 0.8, 1e-4))),
-            )
-            for sample in range(samples):
-                angle = 2 * math.pi * sample / samples
-                raw_guides.append(
-                    (
-                        circle.center[0] + guide_radius_value * math.cos(angle),
-                        circle.center[1] + guide_radius_value * math.sin(angle),
-                    )
-                )
     for first_id, first in enumerate(circles):
         for second in circles[first_id + 1 :]:
             center_distance = math.dist(first.center, second.center)
@@ -1154,6 +1151,33 @@ def _bridge_narrow_passages(
                 (overlap_high - overlap_low) / 2 + cell_size * 2,
             )
 
+    # Targeted gap centerlines are more useful than complete obstacle rings,
+    # so add the latter last and only within the bounded supplemental graph.
+    if include_circle_rings:
+        for circle in geometry.death_circles:
+            if len(raw_guides) >= guide_limit:
+                break
+            guide_radius_value = circle.radius + guide_epsilon
+            if circle.radius <= 1e-12:
+                continue
+            maximum_angle = 2 * math.acos(
+                min(1.0, circle.radius / guide_radius_value)
+            )
+            samples = max(
+                12,
+                int(math.ceil(2 * math.pi / max(maximum_angle * 0.8, 1e-4))),
+            )
+            for sample in range(samples):
+                if len(raw_guides) >= guide_limit:
+                    break
+                angle = 2 * math.pi * sample / samples
+                raw_guides.append(
+                    (
+                        circle.center[0] + guide_radius_value * math.cos(angle),
+                        circle.center[1] + guide_radius_value * math.sin(angle),
+                    )
+                )
+
     unique_guides: dict[tuple[int, int], Point] = {}
     quantization = max(guide_epsilon * 0.1, 1e-9)
     for point in raw_guides:
@@ -1182,17 +1206,24 @@ def _bridge_narrow_passages(
     for guide_id, point in enumerate(guide_points):
         bin_x = int(math.floor(point[0] / guide_radius))
         bin_y = int(math.floor(point[1] / guide_radius))
+        candidates: list[tuple[float, int]] = []
         for near_y in range(bin_y - 1, bin_y + 2):
             for near_x in range(bin_x - 1, bin_x + 2):
                 for other_id in guide_bins.get((near_x, near_y), ()):
                     if other_id <= guide_id:
                         continue
                     cost = math.dist(point, guide_points[other_id])
-                    if cost <= guide_radius and segment_is_clear(
-                        point, guide_points[other_id]
-                    ):
-                        guide_edges[guide_id].append((other_id, cost))
-                        guide_edges[other_id].append((guide_id, cost))
+                    if cost <= guide_radius:
+                        candidates.append((cost, other_id))
+        connected = 0
+        for cost, other_id in sorted(candidates):
+            if not segment_is_clear(point, guide_points[other_id]):
+                continue
+            guide_edges[guide_id].append((other_id, cost))
+            guide_edges[other_id].append((guide_id, cost))
+            connected += 1
+            if connected >= 8:
+                break
 
     guide_grid_edges: list[list[tuple[int, float]]] = [
         [] for _ in guide_points
@@ -1203,6 +1234,7 @@ def _bridge_narrow_passages(
     cross_radius = cell_size * 4.5
     for guide_id, point in enumerate(guide_points):
         center_x, center_y = model._nearest_cell(point)
+        candidates: list[tuple[float, int, Point]] = []
         for y in range(max(0, center_y - 4), min(model.height, center_y + 5)):
             for x in range(max(0, center_x - 4), min(model.width, center_x + 5)):
                 grid_id = model._index(x, y)
@@ -1210,9 +1242,20 @@ def _bridge_narrow_passages(
                     continue
                 grid_position = grid_point(x, y)
                 cost = math.dist(point, grid_position)
-                if cost <= cross_radius and segment_is_clear(point, grid_position):
-                    guide_grid_edges[guide_id].append((grid_id, cost))
-                    grid_guide_edges[grid_id].append((guide_id, cost))
+                if cost <= cross_radius:
+                    candidates.append((cost, grid_id, grid_position))
+        # A guide only needs a small number of nearby anchors to join the
+        # raster. Testing all 81 cells against every wall made complex maps
+        # spend most of a countdown on redundant collision checks.
+        connected = 0
+        for cost, grid_id, grid_position in sorted(candidates):
+            if not segment_is_clear(point, grid_position):
+                continue
+            guide_grid_edges[guide_id].append((grid_id, cost))
+            grid_guide_edges[grid_id].append((guide_id, cost))
+            connected += 1
+            if connected >= 8:
+                break
 
     grid_count = model.width * model.height
     guide_distances = [math.inf] * len(guide_points)
@@ -1282,25 +1325,6 @@ def _bridge_narrow_passages(
 
     model.guide_points = guide_points
     model.guide_distances = tuple(guide_distances)
-    if model.reference_distance <= 0 and not include_zone_portals:
-        _bridge_narrow_passages(
-            model,
-            moves=moves,
-            grid_point=grid_point,
-            segment_is_clear=segment_is_clear,
-            clear_grid_edge=clear_grid_edge,
-            include_zone_portals=True,
-        )
-    elif model.reference_distance <= 0 and not include_circle_rings:
-        _bridge_narrow_passages(
-            model,
-            moves=moves,
-            grid_point=grid_point,
-            segment_is_clear=segment_is_clear,
-            clear_grid_edge=clear_grid_edge,
-            include_zone_portals=True,
-            include_circle_rings=True,
-        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1521,6 +1545,17 @@ class ProgressAssessment:
     making_progress: bool
 
 
+@dataclasses.dataclass(frozen=True)
+class WrongWayProgressUpdate:
+    heading_away: bool
+    heading_toward: bool
+    charged_seconds: float
+    total_wrong_way_seconds: float
+    remaining_allowance_seconds: float
+    warning_due: bool
+    exhausted: bool
+
+
 @dataclasses.dataclass
 class PlayerProgressState:
     samples: collections.deque[TimedProgressSample] = dataclasses.field(
@@ -1531,11 +1566,77 @@ class PlayerProgressState:
     last_reason: str = ""
     killed: bool = False
     travel_distance: float = 0.0
+    pending_positions: collections.deque[tuple[float, float, float]] = (
+        dataclasses.field(default_factory=collections.deque)
+    )
+    last_route_sample: tuple[float, float] | None = None
+    wrong_way_seconds: float = 0.0
+    wrong_way_episode_seconds: float = 0.0
+    wrong_way_episode_warned: bool = False
 
     def clear_violation(self) -> None:
         self.warned_at = None
         self.violation_started_at = None
         self.last_reason = ""
+
+    def clear_wrong_way_episode(self) -> None:
+        self.wrong_way_episode_seconds = 0.0
+        self.wrong_way_episode_warned = False
+
+    def clear_route_baseline(self) -> None:
+        self.last_route_sample = None
+        self.clear_wrong_way_episode()
+
+    def observe_route_distance(
+        self,
+        now: float,
+        route_distance: float,
+        *,
+        allowance_seconds: float = 5.0,
+        warning_delay_seconds: float = 1.0,
+        direction_slack_distance: float = 0.5,
+        maximum_sample_gap_seconds: float = 2.0,
+    ) -> WrongWayProgressUpdate:
+        """Charge cumulative time only while route distance is increasing."""
+        allowance = max(0.1, float(allowance_seconds))
+        warning_delay = max(0.0, float(warning_delay_seconds))
+        direction_slack = max(0.0, float(direction_slack_distance))
+        maximum_gap = max(0.1, float(maximum_sample_gap_seconds))
+        previous = self.last_route_sample
+        self.last_route_sample = (float(now), float(route_distance))
+        heading_away = False
+        heading_toward = False
+        charged = 0.0
+        warning_due = False
+        if previous is not None:
+            interval = max(0.0, float(now) - previous[0])
+            distance_change = float(route_distance) - previous[1]
+            heading_away = distance_change > direction_slack
+            heading_toward = distance_change < -direction_slack
+            if heading_away and interval > 0:
+                charged = min(interval, maximum_gap)
+                self.wrong_way_seconds += charged
+                self.wrong_way_episode_seconds += charged
+                if (
+                    not self.wrong_way_episode_warned
+                    and self.wrong_way_episode_seconds >= warning_delay
+                ):
+                    self.wrong_way_episode_warned = True
+                    warning_due = True
+            elif heading_toward:
+                # Forward progress pauses the cumulative allowance; it never
+                # refunds wrong-way time already used.
+                self.clear_wrong_way_episode()
+        remaining = max(0.0, allowance - self.wrong_way_seconds)
+        return WrongWayProgressUpdate(
+            heading_away=heading_away,
+            heading_toward=heading_toward,
+            charged_seconds=charged,
+            total_wrong_way_seconds=self.wrong_way_seconds,
+            remaining_allowance_seconds=remaining,
+            warning_due=warning_due,
+            exhausted=self.wrong_way_seconds >= allowance,
+        )
 
 
 def assess_progress(
