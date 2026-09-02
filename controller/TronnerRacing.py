@@ -191,12 +191,22 @@ def detect_game_text_encoding(
     ladderlog: Path,
     fallback: object = DEFAULT_GAME_TEXT_ENCODING,
 ) -> str:
-    """Return the most recently advertised ladderlog ENCODING codec."""
+    """Return the newest encoding visible at the bounded edges of ladderlog."""
     fallback_encoding = canonical_game_text_encoding(fallback)
     advertised: bytes | None = None
     try:
         with ladderlog.open("rb") as handle:
-            for raw_line in handle:
+            size = os.fstat(handle.fileno()).st_size
+            head_bytes = 64 * 1024
+            tail_bytes = 1024 * 1024
+            if size <= head_bytes + tail_bytes:
+                chunks = (handle.read(),)
+            else:
+                chunks = [handle.read(head_bytes)]
+                handle.seek(max(0, size - tail_bytes))
+                handle.readline()  # Discard the partial line at the tail boundary.
+                chunks.append(handle.read(tail_bytes))
+            for raw_line in b"\n".join(chunks).splitlines():
                 if raw_line.startswith(b"ENCODING "):
                     fields = raw_line[len(b"ENCODING "):].strip().split()
                     if fields:
