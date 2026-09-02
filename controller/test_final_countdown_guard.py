@@ -41,6 +41,7 @@ class RouteModelTests(unittest.TestCase):
             maximum_cells=30_000,
             minimum_cell_size=1.0,
             size_multiplier=size_multiplier,
+            narrow_passage_guides=True,
         )
         self.assertIsNotNone(model)
         return model
@@ -84,6 +85,94 @@ class RouteModelTests(unittest.TestCase):
 
         self.assertTrue(math.isinf(model.distance_at((80.0, 50.0))))
 
+    def test_every_spawn_must_have_a_certified_route(self):
+        model = self.build(
+            '''
+            <Spawn x="30" y="50" xdir="1" ydir="0"/>
+            <Zone effect="win"><ShapeCircle radius="3"><Point x="20" y="50"/></ShapeCircle></Zone>
+            <Wall><Point x="0" y="0"/><Point x="100" y="0"/><Point x="100" y="100"/><Point x="0" y="100"/><Point x="0" y="0"/></Wall>
+            <Wall><Point x="50" y="0"/><Point x="50" y="100"/></Wall>
+            '''
+        )
+
+        self.assertTrue(math.isfinite(model.distance_at((30.0, 50.0))))
+        self.assertTrue(math.isinf(model.distance_at((80.0, 50.0))))
+        self.assertEqual(model.reference_distance, 0.0)
+
+    def test_narrow_wall_to_wall_corridor_remains_reachable(self):
+        model = self.build(
+            '''
+            <Zone effect="win"><ShapeCircle radius="3"><Point x="20" y="50"/></ShapeCircle></Zone>
+            <Wall><Point x="0" y="0"/><Point x="100" y="0"/><Point x="100" y="100"/><Point x="0" y="100"/><Point x="0" y="0"/></Wall>
+            <Wall><Point x="0" y="49.4"/><Point x="100" y="49.4"/></Wall>
+            <Wall><Point x="0" y="50.6"/><Point x="100" y="50.6"/></Wall>
+            '''
+        )
+
+        self.assertTrue(math.isfinite(model.distance_at((80.0, 50.0))))
+
+    def test_subcell_wall_to_wall_corridor_uses_sparse_passage_guide(self):
+        model = self.build(
+            '''
+            <Spawn x="250" y="0.137" xdir="-1" ydir="0"/>
+            <Zone effect="win"><ShapeCircle radius="0.01"><Point x="-250" y="0.137"/></ShapeCircle></Zone>
+            <Wall><Point x="-320" y="-160"/><Point x="320" y="-160"/><Point x="320" y="160"/><Point x="-320" y="160"/><Point x="-320" y="-160"/></Wall>
+            <Wall><Point x="-300" y="0.087"/><Point x="300" y="0.087"/></Wall>
+            <Wall><Point x="-300" y="0.187"/><Point x="300" y="0.187"/></Wall>
+            '''
+        )
+
+        self.assertTrue(math.isfinite(model.distance_at((250.0, 0.137))))
+        self.assertTrue(model.guide_points)
+
+    def test_narrow_zone_to_zone_corridor_remains_reachable(self):
+        model = self.build(
+            '''
+            <Zone effect="win"><ShapeCircle radius="3"><Point x="20" y="50"/></ShapeCircle></Zone>
+            <Zone effect="death"><ShapeCircle radius="3.5"><Point x="50" y="46"/></ShapeCircle></Zone>
+            <Zone effect="death"><ShapeCircle radius="3.5"><Point x="50" y="54"/></ShapeCircle></Zone>
+            <Wall><Point x="0" y="0"/><Point x="100" y="0"/><Point x="100" y="100"/><Point x="0" y="100"/><Point x="0" y="0"/></Wall>
+            '''
+        )
+
+        self.assertTrue(math.isfinite(model.distance_at((80.0, 50.0))))
+
+    def test_subcell_zone_to_zone_corridor_uses_sparse_passage_guide(self):
+        model = self.build(
+            '''
+            <Zone effect="win"><ShapeCircle radius="0.05"><Point x="20" y="50.137"/></ShapeCircle></Zone>
+            <Zone effect="death"><ShapeCircle radius="3.85"><Point x="50" y="46.137"/></ShapeCircle></Zone>
+            <Zone effect="death"><ShapeCircle radius="3.85"><Point x="50" y="54.137"/></ShapeCircle></Zone>
+            <Wall><Point x="0" y="42.287"/><Point x="100" y="42.287"/></Wall>
+            <Wall><Point x="0" y="57.987"/><Point x="100" y="57.987"/></Wall>
+            '''
+        )
+
+        self.assertTrue(math.isfinite(model.distance_at((80.0, 50.137))))
+
+    def test_narrow_wall_to_zone_corridor_remains_reachable(self):
+        model = self.build(
+            '''
+            <Zone effect="win"><ShapeCircle radius="3"><Point x="20" y="50"/></ShapeCircle></Zone>
+            <Zone effect="death"><ShapeCircle radius="3"><Point x="50" y="53.2"/></ShapeCircle></Zone>
+            <Wall><Point x="0" y="0"/><Point x="100" y="0"/><Point x="100" y="100"/><Point x="0" y="100"/><Point x="0" y="0"/></Wall>
+            <Wall><Point x="0" y="49.5"/><Point x="100" y="49.5"/></Wall>
+            '''
+        )
+
+        self.assertTrue(math.isfinite(model.distance_at((80.0, 50.0))))
+
+    def test_subcell_wall_to_zone_corridor_uses_sparse_passage_guide(self):
+        model = self.build(
+            '''
+            <Zone effect="win"><ShapeCircle radius="0.05"><Point x="20" y="50"/></ShapeCircle></Zone>
+            <Zone effect="death"><ShapeCircle radius="3.85"><Point x="50" y="54"/></ShapeCircle></Zone>
+            <Wall><Point x="0" y="49.85"/><Point x="100" y="49.85"/></Wall>
+            '''
+        )
+
+        self.assertTrue(math.isfinite(model.distance_at((80.0, 50.0))))
+
     def test_death_zone_is_treated_as_route_obstacle(self):
         model = self.build(
             '''
@@ -96,6 +185,14 @@ class RouteModelTests(unittest.TestCase):
         route_distance = model.distance_at((80.0, 50.0))
         direct_distance = model.direct_distance((80.0, 50.0))
         self.assertGreater(route_distance, direct_distance + 5)
+
+    def test_target_zone_is_treated_as_finish_goal(self):
+        model = self.build(
+            '<Zone effect="target"><ShapeCircle radius="3"><Point x="20" y="50"/></ShapeCircle></Zone>'
+        )
+
+        self.assertTrue(math.isfinite(model.distance_at((80.0, 50.0))))
+        self.assertEqual(len(model.geometry.win_circles), 1)
 
     def test_custom_axes_are_used_by_navigation_field(self):
         model = self.build(

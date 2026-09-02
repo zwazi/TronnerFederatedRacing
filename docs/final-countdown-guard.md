@@ -21,9 +21,20 @@ bounded distance-to-finish field. The field:
 - accepts every circular or polygonal winzone as a goal; and
 - is built in a worker thread with a configured cell limit.
 
-Walls use a conservative raster supercover: every grid cell intersected by a
-zero-width XML wall is blocked. This prevents a wall that happens to fall
-between cell centers from disappearing from the navigation field.
+Armagetron target zones are also finish goals because `TARGET_DECLARE_WINNER`
+is enabled by default. Every declared spawn must have a certified route; one
+reachable spawn cannot hide another disconnected spawn.
+
+Navigation edges are checked against the exact XML wall segments and death-zone
+boundaries. Walls therefore cannot disappear between cell centers, while real
+narrow wall-to-wall, wall-to-zone, and zone-to-zone passages are not erased by
+artificially widening every obstacle to the raster-cell size.
+
+If a real passage is narrower than a bounded raster cell, the high-resolution
+retry merges a sparse sub-cell graph into the distance field. Exact-collision
+rings around wall endpoints and centerlines through nearby wall/wall,
+wall/death-zone, and death-zone/death-zone boundaries preserve those passages
+without allocating a microscopic grid across the whole arena.
 
 Route distance, rather than straight-line distance, permits a player to move
 away from the winzone temporarily when a wall or death zone makes that detour

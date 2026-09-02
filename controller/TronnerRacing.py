@@ -8751,7 +8751,7 @@ class TronnerRacing:
             0.0,
             float(
                 self.config.get(
-                    "final_countdown_route_wall_clearance_cells", 0.72
+                    "final_countdown_route_wall_clearance_cells", 0.0
                 )
             ),
         )
@@ -8820,6 +8820,7 @@ class TronnerRacing:
                         minimum_cell_size=retry_minimum_cell_size,
                         wall_clearance_cells=wall_clearance,
                         size_multiplier=size_multiplier,
+                        narrow_passage_guides=True,
                     )
                 except asyncio.CancelledError:
                     self.final_countdown_route_building = False
@@ -8842,13 +8843,14 @@ class TronnerRacing:
             return
         LOG.info(
             "final-countdown route model map=%s grid=%dx%d cell=%.3f "
-            "reference_distance=%.3f teleports=%d",
+            "reference_distance=%.3f teleports=%d subcell_guides=%d",
             map_key,
             model.width,
             model.height,
             model.cell_size,
             model.reference_distance,
             len(model.geometry.teleports),
+            len(model.guide_points),
         )
 
     async def _record_final_countdown_progress(
