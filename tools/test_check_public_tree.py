@@ -53,6 +53,15 @@ class PublicTreeTests(unittest.TestCase):
         self.assertTrue(any("public IPv4 literal" in failure for failure in failures))
         self.assertTrue(any("operator home path" in failure for failure in failures))
 
+    def test_removed_multi_server_architecture_is_rejected(self):
+        retired_term = "feder" + "ation"
+        failures = self.scan_files(
+            {"controller.py": f"enable_{retired_term} = True\n"}
+        )
+        self.assertTrue(
+            any("removed multi-server architecture" in failure for failure in failures)
+        )
+
     def test_symbolic_links_are_rejected_without_following_them(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

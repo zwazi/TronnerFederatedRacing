@@ -152,7 +152,7 @@ class ControllerReloadTests(unittest.IsolatedAsyncioTestCase):
         await task
         self.assertTrue(controller.stop_event.is_set())
         self.assertEqual(len(announcements), 2)
-        self.assertTrue(all(item[1].get("federate") is False for item in announcements))
+        self.assertTrue(all(item[1] == {} for item in announcements))
 
     async def test_reload_resume_restores_remaining_time_and_respawns_players(self):
         controller = object.__new__(TronnerRacing)
@@ -199,7 +199,7 @@ class ControllerReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scheduled, [(player, 0.1)])
         self.assertEqual(stored["controller_reload"], {})
         self.assertEqual(len(announcements), 1)
-        self.assertIs(announcements[0][1].get("federate"), False)
+        self.assertEqual(announcements[0][1], {})
 
     async def test_ordinary_mid_round_startup_recovers_dead_racers(self):
         controller = object.__new__(TronnerRacing)

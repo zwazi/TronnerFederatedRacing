@@ -1,347 +1,11 @@
 diff --git a/src/engine/ePlayer.cpp b/src/engine/ePlayer.cpp
-index ee4880e9..cdeedf59 100644
+index ee4880e..5abb6a8 100644
 --- a/src/engine/ePlayer.cpp
 +++ b/src/engine/ePlayer.cpp
-@@ -61,6 +61,17 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
- #include "eGrid.h"
- #include <time.h>
- #include <climits>
-+#include <cerrno>
-+#include <cstring>
-+#include <limits>
-+#include <sstream>
-+
-+#ifndef WIN32
-+#include <fcntl.h>
-+#include <sys/socket.h>
-+#include <sys/un.h>
-+#include <unistd.h>
-+#endif
- 
- //!RACE FILE
- #include "../tron/gRace.h"
-@@ -70,6 +81,54 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
- 
- int se_lastSaidMaxEntries = 8;
- 
-+// Optional server-owned display prefix for native players.  Keep it out of
-+// name_, userName_, authentication, command lookup, and ladderlog identity;
-+// only colored display output and the server-to-client wire name are tagged.
-+static tString se_federationLocalLabel( "" );
-+static tConfItemLine se_federationLocalLabelConf(
-+    "FEDERATION_LOCAL_LABEL", se_federationLocalLabel );
-+
-+static std::string se_FederationSafeLocalLabel()
-+{
-+    std::string raw( static_cast<char const *>( se_federationLocalLabel ) );
-+    std::string safe;
-+    for ( std::string::const_iterator character = raw.begin();
-+          character != raw.end() && safe.size() < 12; ++character )
-+    {
-+        if ( (*character >= 'A' && *character <= 'Z') ||
-+             (*character >= 'a' && *character <= 'z') ||
-+             (*character >= '0' && *character <= '9') ||
-+             *character == '_' || *character == '-' )
-+            safe.push_back( *character );
-+    }
-+    return safe;
-+}
-+
-+static void se_CutString( tColoredString & string, int maxLen );
-+
-+static tColoredString se_FederationTaggedName(
-+    tColoredString const &name,
-+    std::string const &label )
-+{
-+    if ( label.empty() )
-+        return name;
-+
-+    // Keep the region tag visually separate while preserving every color
-+    // transition supplied by the player. WriteSync provides a plain bounded
-+    // fallback for the legacy 0.2.9 protocol that counts color bytes toward
-+    // its 16-byte name limit.
-+    tColoredString tagged;
-+    tagged << "0x66ccff[" << label.c_str() << "] 0xffffff" << name;
-+    return tagged;
-+}
-+
-+static tColoredString se_FederationLegacyName( tColoredString const &name )
-+{
-+    tColoredString tagged( tColoredString::RemoveColorsLoose( name ) );
-+    se_CutString( tagged, 16 );
-+    return tagged;
-+}
-+
- // call on commands that only work on the server; quit if it returns true
- bool se_NeedsServer(char const * command, std::istream & s, bool strict )
- {
-@@ -1043,7 +1102,7 @@ void ePlayerNetID::SilenceMenu()
-     for ( i = size-1; i>=0; --i )
-     {
-         ePlayerNetID* player = se_PlayerNetIDs[ i ];
--        if ( player->IsHuman() )
-+        if ( player->IsHuman() || player->IsFederationGhost() )
-         {
-             items[i] = tNEW( eMenuItemSilence )( &menu, player );
-         }
-@@ -4819,6 +4878,12 @@ void ePlayerNetID::Chat(const tString &s_orig)
+@@ -8519,6 +8519,50 @@ void ePlayerNetID::GridPosLadderLog()
      }
  }
  
-+void ePlayerNetID::FederationChat( tString const & message )
-+{
-+    if ( IsFederationGhost() && sn_GetNetState() == nSERVER )
-+        se_BroadcastChat( this, message );
-+}
-+
- //return the playernetid for a given name
- /*
- static ePlayerNetID* identifyPlayer(tString inname)
-@@ -5800,7 +5865,7 @@ void se_ListPastChatters(ePlayerNetID * receiver)
-     }
- }
- 
--ePlayerNetID::ePlayerNetID(int p):nNetObject(),listID(-1), teamListID(-1), timeCreated_( tSysTimeFloat() ), allowTeamChange_(false), registeredMachine_(0), pID(p)
-+ePlayerNetID::ePlayerNetID(int p):nNetObject(),listID(-1), teamListID(-1), timeCreated_( tSysTimeFloat() ), allowTeamChange_(false), registeredMachine_(0), pID(p), federationGhost_(false), displayServerTags_(false)
- {
-     flagOverrideChat = false;
-     flagChatState = false;
-@@ -5878,7 +5943,7 @@ ePlayerNetID::ePlayerNetID(int p):nNetObject(),listID(-1), teamListID(-1), timeC
- 
- 
- ePlayerNetID::ePlayerNetID(nMessage &m):nNetObject(m),listID(-1), teamListID(-1), timeCreated_( tSysTimeFloat() )
--    , allowTeamChange_(false), registeredMachine_(0)
-+    , allowTeamChange_(false), registeredMachine_(0), federationGhost_(false), displayServerTags_(false)
- {
-     flagOverrideChat = false;
-     flagChatState = false;
-@@ -6329,7 +6394,11 @@ void ePlayerNetID::RemoveFromGame()
-             }
-             */
- 
--            if( IsHuman() )
-+            if( IsFederationGhost() )
-+            {
-+                // Imported visual proxies are not federation source events.
-+            }
-+            else if( IsHuman() )
-             {
-                 se_playerLeftWriter << userName_ << nMachine::GetMachine(Owner()).GetIP();
-                 se_playerLeftWriter << GetName();
-@@ -7296,7 +7365,42 @@ void ePlayerNetID::WriteSync(nMessage &m)
-     }
-     else
-     {
--        m << nameFromServer_;
-+        int syncedUser = SyncedUser();
-+        bool displayServerTags = false;
-+        if ( syncedUser > 0 && syncedUser != Owner() )
-+        {
-+            for ( int i = se_PlayerNetIDs.Len() - 1; i >= 0; --i )
-+            {
-+                ePlayerNetID const *viewer = se_PlayerNetIDs(i);
-+                if ( viewer && viewer->IsHuman() &&
-+                     viewer->Owner() == syncedUser &&
-+                     viewer->DisplayServerTags() )
-+                {
-+                    displayServerTags = true;
-+                    break;
-+                }
-+            }
-+        }
-+
-+        // Name formatting is a preference of the receiving player. Keep the
-+        // server's canonical names untagged, then add the local or peer label
-+        // only while serializing this object to a viewer who opted in.
-+        tColoredString wireName( nameFromServer_ );
-+        if ( displayServerTags )
-+        {
-+            std::string label = IsFederationGhost()
-+                ? std::string( static_cast<char const *>( FederationLabel() ) )
-+                : se_FederationSafeLocalLabel();
-+            wireName = se_FederationTaggedName( wireName, label );
-+        }
-+        if ( syncedUser > 0 )
-+        {
-+            int version = sn_Connections[syncedUser].version.Max();
-+            bool richColoredNames = version == 18 || version >= 21;
-+            if ( !richColoredNames )
-+                wireName = se_FederationLegacyName( wireName );
-+        }
-+        m << wireName;
-     }
- 
-     //if(sn_GetNetState()==nSERVER)
-@@ -7309,8 +7413,11 @@ void ePlayerNetID::WriteSync(nMessage &m)
-         tempChat = flagChatState;
-     }
- 
--    // pack chat, spectator and stealth status together
--    unsigned short flags = ( tempChat ? 1 : 0 ) | ( spectating_ ? 2 : 0 ) | ( stealth_ ? 4 : 0 );
-+    // Pack chat, spectator, stealth and federation status together.  Older
-+    // clients safely ignore the extra bit.  New clients use it to keep remote
-+    // projections out of the kick menu while still offering local silencing.
-+    unsigned short flags = ( tempChat ? 1 : 0 ) | ( spectating_ ? 2 : 0 ) |
-+                           ( stealth_ ? 4 : 0 ) | ( federationGhost_ ? 8 : 0 );
-     m << flags;
- 
-     m << score;
-@@ -7630,6 +7737,11 @@ void ePlayerNetID::ReadSync(nMessage &m)
-             bool newSpectate = ( ( flags & 2 ) != 0 );
-             bool newStealth = ( ( flags & 4 ) != 0 );
- 
-+            // Only trust this server-authored marker on clients.  A client
-+            // must not be able to label its own player as a federation ghost.
-+            if ( sn_GetNetState() != nSERVER )
-+                federationGhost_ = ( ( flags & 8 ) != 0 );
-+
-             if ( chatting_ != newChat || spectating_ != newSpectate || newStealth != stealth_ )
-                 lastActivity_ = tSysTimeFloat();
- 
-@@ -8395,6 +8507,8 @@ void ePlayerNetID::RankingLadderLog()
-         ePlayerNetID *p = se_PlayerNetIDs(i);
-         if (p)
-         {
-+            if ( p->IsFederationGhost() )
-+                continue;
-             bool isHuman = p->IsHuman();
-             if (isHuman)
-             {
-@@ -8464,6 +8578,8 @@ void ePlayerNetID::RankingLadderLog()
-         ePlayerNetID *p = se_PlayerNetIDs[i];
-         if (p)
-         {
-+            if ( p->IsFederationGhost() )
-+                continue;
-             tColoredString colouredName;
-             colouredName << p->GetColoredName();
-             se_playerColoredNameWriter << p->GetUserName() << colouredName;
-@@ -8489,7 +8605,7 @@ void ePlayerNetID::GridPosLadderLog()
-         for(int i=0; i<max; i++)
-         {
-             ePlayerNetID *p=se_PlayerNetIDs(i);
--            if (p->IsActive() && p->Object() && p->Object()->Alive() )
-+            if (!p->IsFederationGhost() && p->IsActive() && p->Object() && p->Object()->Alive() )
-             {
-                 gCycle *pCycle = dynamic_cast<gCycle *>(p->Object());
- 
-@@ -8519,6 +8635,163 @@ void ePlayerNetID::GridPosLadderLog()
-     }
- }
- 
-+// Federation telemetry leaves the game process only through a nonblocking
-+// local Unix datagram.  The network/Firebase sidecar is allowed to disappear,
-+// stall, or restart without ever delaying the simulation thread.
-+static bool se_federationExportEnabled = false;
-+static tSettingItem<bool> se_federationExportEnabledConf(
-+    "FEDERATION_EXPORT_ENABLED", se_federationExportEnabled );
-+static tString se_federationExportSocket(
-+    "/run/tronner-federation/engine-export.sock" );
-+static tConfItemLine se_federationExportSocketConf(
-+    "FEDERATION_EXPORT_SOCKET", se_federationExportSocket );
-+
-+#ifndef WIN32
-+static int se_federationExportFD = -1;
-+
-+static void se_CloseFederationExportSocket()
-+{
-+    if ( se_federationExportFD >= 0 )
-+    {
-+        close( se_federationExportFD );
-+        se_federationExportFD = -1;
-+    }
-+}
-+
-+static bool se_OpenFederationExportSocket()
-+{
-+    if ( se_federationExportFD >= 0 )
-+        return true;
-+
-+    int fd = socket( AF_UNIX, SOCK_DGRAM, 0 );
-+    if ( fd < 0 )
-+        return false;
-+
-+    int flags = fcntl( fd, F_GETFL, 0 );
-+    if ( flags < 0 || fcntl( fd, F_SETFL, flags | O_NONBLOCK ) < 0 )
-+    {
-+        close( fd );
-+        return false;
-+    }
-+    int descriptorFlags = fcntl( fd, F_GETFD, 0 );
-+    if ( descriptorFlags >= 0 )
-+        fcntl( fd, F_SETFD, descriptorFlags | FD_CLOEXEC );
-+    se_federationExportFD = fd;
-+    return true;
-+}
-+#endif
-+
-+void ePlayerNetID::FederationExport()
-+{
-+#ifdef WIN32
-+    return;
-+#else
-+    if ( !se_federationExportEnabled || sn_GetNetState() != nSERVER )
-+    {
-+        se_CloseFederationExportSocket();
-+        return;
-+    }
-+    if ( !se_OpenFederationExportSocket() )
-+        return;
-+
-+    std::string socketPath(
-+        static_cast<char const *>( se_federationExportSocket ) );
-+    sockaddr_un address;
-+    std::memset( &address, 0, sizeof(address) );
-+    if ( socketPath.empty() || socketPath.size() >= sizeof(address.sun_path) )
-+        return;
-+    address.sun_family = AF_UNIX;
-+    std::memcpy( address.sun_path, socketPath.c_str(), socketPath.size() + 1 );
-+
-+    for ( int index = se_PlayerNetIDs.Len() - 1; index >= 0; --index )
-+    {
-+        ePlayerNetID * player = se_PlayerNetIDs(index);
-+        if ( !player || !player->IsHuman() )
-+            continue;
-+
-+        gCycle * cycle = dynamic_cast<gCycle *>( player->Object() );
-+        bool alive = cycle && cycle->Alive();
-+        eCoord position( 0, 0 );
-+        eCoord direction( 0, 0 );
-+        REAL speed = 0;
-+        gRealColor cycleColor;
-+        if ( cycle )
-+            cycleColor = cycle->color_;
-+        if ( alive )
-+        {
-+            position = cycle->MapPosition();
-+            direction = cycle->Direction();
-+            speed = cycle->Speed();
-+        }
-+
-+        std::ostringstream message;
-+        message.precision( std::numeric_limits<REAL>::max_digits10 );
-+        message << "CYCLE_V1 " << player->GetLogName() << ' '
-+                << se_GameTime() << ' '
-+                << position.x << ' ' << position.y << ' '
-+                << direction.x << ' ' << direction.y << ' '
-+                << speed << ' ' << player->ping << ' '
-+                << ( alive ? 1 : 0 ) << ' '
-+                << ( player->IsChatting() ? 1 : 0 ) << ' '
-+                << cycleColor.r << ' ' << cycleColor.g << ' '
-+                << cycleColor.b;
-+        std::string payload = message.str();
-+        sendto(
-+            se_federationExportFD,
-+            payload.data(),
-+            payload.size(),
-+            MSG_DONTWAIT,
-+            reinterpret_cast<sockaddr *>( &address ),
-+            sizeof(address)
-+        );
-+    }
-+#endif
-+}
-+
 +// Controller-facing activity snapshot. The native activity clock covers
 +// controls, chat, and team-menu input; position samples additionally prove
 +// that an automatically moving cycle is not AFK even on a long straightaway.
@@ -389,7 +53,7 @@ index ee4880e9..cdeedf59 100644
  static eLadderLogWriter se_OnlinePlayersAliveWriter("ONLINE_PLAYERS_ALIVE", true);
  static eLadderLogWriter se_OnlinePlayersDeadWriter("ONLINE_PLAYERS_DEAD", true);
  static eLadderLogWriter se_OnlinePlayersCountWriter("ONLINE_PLAYERS_COUNT", true);
-@@ -9747,9 +10020,12 @@ void ePlayerNetID::CreateNewTeam()
+@@ -9747,9 +9791,12 @@ void ePlayerNetID::CreateNewTeam()
          return;
      }
  
@@ -405,55 +69,7 @@ index ee4880e9..cdeedf59 100644
      {
          tOutput message;
          message.SetTemplateParameter(1, GetName() );
-@@ -10261,6 +10537,47 @@ static ePlayerNetID * ReadPlayer( std::istream & s )
-     return ePlayerNetID::ReadPlayer( s );
- }
- 
-+static void se_FederationDisplayServerTagsConf( std::istream &s )
-+{
-+    if ( se_NeedsServer( "FEDERATION_DISPLAY_SERVER_TAGS", s, false ) )
-+        return;
-+
-+    ePlayerNetID *viewer = ReadPlayer( s );
-+    int enabled = -1;
-+    s >> enabled;
-+    if ( !viewer || !viewer->IsHuman() || viewer->Owner() <= 0 ||
-+         ( enabled != 0 && enabled != 1 ) )
-+    {
-+        con << "Usage: FEDERATION_DISPLAY_SERVER_TAGS <player> <0|1>\n";
-+        return;
-+    }
-+
-+    int viewerUser = viewer->Owner();
-+    for ( int i = se_PlayerNetIDs.Len() - 1; i >= 0; --i )
-+    {
-+        ePlayerNetID *localPlayer = se_PlayerNetIDs(i);
-+        if ( localPlayer && localPlayer->IsHuman() &&
-+             localPlayer->Owner() == viewerUser )
-+            localPlayer->SetDisplayServerTags( enabled != 0 );
-+    }
-+
-+    // Only the toggling client needs new player-name syncs. WriteSync formats
-+    // each local and federated player name specifically for this recipient.
-+    for ( int i = se_PlayerNetIDs.Len() - 1; i >= 0; --i )
-+    {
-+        ePlayerNetID *visiblePlayer = se_PlayerNetIDs(i);
-+        if ( visiblePlayer )
-+            visiblePlayer->RequestSync( viewerUser, true );
-+    }
-+}
-+
-+static tConfItemFunc se_federationDisplayServerTagsConf(
-+    "FEDERATION_DISPLAY_SERVER_TAGS",
-+    &se_FederationDisplayServerTagsConf );
-+static tAccessLevelSetter se_federationDisplayServerTagsConfLevel(
-+    se_federationDisplayServerTagsConf,
-+    tAccessLevel_Owner );
-+
- static void Kill_conf(std::istream &s)
- {
-     if ( se_NeedsServer( "KILL", s, false ) )
-@@ -10288,6 +10605,80 @@ static void Kill_conf(std::istream &s)
+@@ -10288,6 +10335,80 @@ static void Kill_conf(std::istream &s)
  static tConfItemFunc kill_conf("KILL",&Kill_conf);
  static tAccessLevelSetter se_killConfLevel( kill_conf, tAccessLevel_Moderator );
  
@@ -534,237 +150,8 @@ index ee4880e9..cdeedf59 100644
  static void Kill_ID_conf(std::istream &s)
  {
      if ( se_NeedsServer( "KILL_ID", s, false ) )
-@@ -10682,6 +11073,18 @@ public:
-     gServerInfoAdmin() {}
- 
- private:
-+    virtual int GetUserCount() const
-+    {
-+        int count = 0;
-+        for ( int i = se_PlayerNetIDs.Len()-1; i >= 0; --i )
-+        {
-+            ePlayerNetID* player = se_PlayerNetIDs(i);
-+            if ( player && ( player->IsHuman() || player->IsFederationGhost() ) )
-+                ++count;
-+        }
-+        return count;
-+    }
-+
-     virtual tString GetUsers() const
-     {
-         tString ret;
-@@ -10689,7 +11092,7 @@ private:
-         for ( int i = se_PlayerNetIDs.Len()-1; i>=0; --i )
-         {
-             ePlayerNetID* p = se_PlayerNetIDs(i);
--            if ( p->IsHuman() )
-+            if ( p->IsHuman() || p->IsFederationGhost() )
-             {
-                 ret << p->GetName() << "\n";
-             }
-@@ -10707,15 +11110,30 @@ private:
-         for ( int i = se_PlayerNetIDs.Len()-1; i>=0; --i )
-         {
-             ePlayerNetID* p = se_PlayerNetIDs(i);
--            if ( p->IsHuman() )
-+            // This list is positional: its newline slots must line up exactly
-+            // with GetUsers(). A federation ghost may carry the remote
-+            // authenticated ID; an unauthenticated ghost still needs an empty
-+            // slot or the next local player's ID is displayed beside it.
-+            if ( p->IsHuman() || p->IsFederationGhost() )
-             {
--                if( p->IsAuthenticated() && !se_Hide(p, tAccessLevel_Default) )
-+                tString globalID;
-+                if ( p->IsFederationGhost() )
-+                {
-+                    globalID = tString(
-+                        se_EscapeName( p->FederationGlobalID() ).c_str() );
-+                }
-+                else if( p->IsAuthenticated() &&
-+                         !se_Hide(p, tAccessLevel_Default) )
-+                {
-+                    globalID = p->GetFilteredAuthenticatedName();
-+                }
-+                if ( globalID.Len() > 1 )
-                 {
-                     for(; count > 0; --count)
-                     {
-                         ret << "\n";
-                     }
--                    ret << p->GetFilteredAuthenticatedName();
-+                    ret << globalID;
-                 }
-                 ++count;
-             }
-@@ -10764,6 +11182,10 @@ public:
-         {
-             return;
-         }
-+        if ( player_.IsFederationGhost() )
-+        {
-+            return;
-+        }
- 
-         tString logName = player_.GetLogName();
-         tString const & screenName = player_.GetName();
-@@ -10954,7 +11376,6 @@ void ePlayerNetID::UpdateName( void )
-     REAL r,g,b;
-     Color(r,g,b);
-     coloredName_ << tColoredString::ColorString(r,g,b) << nameFromServer_;
--
-     if ( name_ != newName || lastAccessLevel != GetAccessLevel() )
-     {
-         // copy it to the name, removing colors of course
-diff --git a/src/engine/ePlayer.h b/src/engine/ePlayer.h
-index 0650a456..97c6e309 100644
---- a/src/engine/ePlayer.h
-+++ b/src/engine/ePlayer.h
-@@ -331,6 +331,7 @@ public:
-     // chatting
-     bool IsChatting() const { return chatting_; }
-     void SetChatting ( ChatFlags flag, bool chatting );
-+    void FederationChat( tString const & message );
- 
-     // spectating
-     bool IsSpectating() const { return spectating_; }
-@@ -415,7 +416,15 @@ public:
-     static void SilenceMenu();				// menu where you can silence players
-     static void PoliceMenu();				// menu where you can silence and kick players
- 
--    virtual bool IsHuman() const { return true; }
-+    virtual bool IsHuman() const { return !federationGhost_; }
-+    bool IsFederationGhost() const { return federationGhost_; }
-+    void SetFederationGhost( bool ghost ) { federationGhost_ = ghost; }
-+    tString const & FederationLabel() const { return federationLabel_; }
-+    void SetFederationLabel( tString const & label ) { federationLabel_ = label; }
-+    tString const & FederationGlobalID() const { return federationGlobalID_; }
-+    void SetFederationGlobalID( tString const & globalID ) { federationGlobalID_ = globalID; }
-+    bool DisplayServerTags() const { return displayServerTags_; }
-+    void SetDisplayServerTags( bool display ) { displayServerTags_ = display; }
- 
-     void Activity(); // call it if this player just showed some activity.
-     REAL LastActivity() const; //!< returns how long the last activity of this player was ago
-@@ -440,6 +449,7 @@ public:
-     static tString Ranking( int MAX=12, bool cut = true );     // returns a ranking list
-     static void RankingLadderLog();     // writes a small ranking list to ladderlog
-     static void GridPosLadderLog();     // writes a cycle positions to ladderlog
-+    static void FederationExport();     // nonblocking local cycle telemetry for federation
-     static void OnlineStatsLadderLog(); //  writes the online players, teams and the numbers
-     static void  ResetScore();  // resets the ranking list
- 
-@@ -518,6 +528,16 @@ private:
- 
-     bool            hasLoggedIn_;
- 
-+    // Server-owned visual proxy imported from another federation member.
-+    // This stays local; clients receive an ordinary player network object.
-+    bool            federationGhost_;
-+    tString         federationLabel_;
-+    tString         federationGlobalID_;
-+
-+    // Per-client viewing preference. Every local player owned by the same
-+    // network connection is kept in sync by FEDERATION_DISPLAY_SERVER_TAGS.
-+    bool            displayServerTags_;
-+
-     REAL            wait_;                  //!< time in seconds WaitToLeaveChat() will wait for this player
- 
-     void CreateVoter();						// create our voter or find it
-@@ -823,4 +843,3 @@ ePlayerNetID *se_GetLocalPlayer();
- extern bool se_highlightMyName, se_tabCompletion, se_tabCompletionWithColors;
- 
- #endif
--
-diff --git a/src/network/nAuthentication.cpp b/src/network/nAuthentication.cpp
-index 92bf9e88..9eb06a54 100644
---- a/src/network/nAuthentication.cpp
-+++ b/src/network/nAuthentication.cpp
-@@ -56,7 +56,7 @@ typedef ZThread::ThreadedExecutor nExecutor;
- //typedef ZThread::SynchronousExecutor nExecutor;
- typedef ZThread::FastMutex nMutex;
- #define nQueue ZThread::LockedQueue
--#elif defined(HAVE_PTHREAD)
-+#elif defined(HAVE_PTHREAD) || defined(HAVE_LIBPTHREAD)
- #include "pthread-binding.h"
- typedef tPThreadMutex nMutex;
- #define nQueue tPThreadQueue
-@@ -239,10 +239,12 @@ template< class T > class nMemberFunctionRunnerTemplate
- #endif
- {
- private:
--#if defined(HAVE_PTHREAD) && !defined(HAVE_LIBZTHREAD)
-+#if (defined(HAVE_PTHREAD) || defined(HAVE_LIBPTHREAD)) && !defined(HAVE_LIBZTHREAD)
-     static void* DoCall( void *o ) {
-         nMemberFunctionRunnerTemplate * functionRunner = (nMemberFunctionRunnerTemplate*) o;
-         ( (functionRunner->object_)->*(functionRunner->function_) )();
-+        delete functionRunner;
-+        return NULL;
-     }
- #endif
- public:
-@@ -266,7 +268,7 @@ public:
-     //! schedule a task for execution in a background thread
-     static void ScheduleBackground( T & object, void (T::*function)()  )
-     {
--#if defined(HAVE_LIBZTHREAD) || defined(HAVE_PTHREAD)
-+#if defined(HAVE_LIBZTHREAD) || defined(HAVE_PTHREAD) || defined(HAVE_LIBPTHREAD)
-         // schedule the task into a background thread
-         if ( !tRecorder::IsRunning() )
-         {
-@@ -274,7 +276,15 @@ public:
-             nMemberFunctionRunnerTemplate<T> * runner = new nMemberFunctionRunnerTemplate<T>( object, function );
- 
-             pthread_t thread;
--            pthread_create(&thread, NULL, (nMemberFunctionRunnerTemplate::DoCall), (void*) runner);
-+            if (pthread_create(&thread, NULL, (nMemberFunctionRunnerTemplate::DoCall), (void*) runner) == 0)
-+            {
-+                pthread_detach(thread);
-+            }
-+            else
-+            {
-+                delete runner;
-+                ScheduleBreak( object, function );
-+            }
- #else
-             static nExecutor executor;
-             executor.execute( ZThread::Task( new nMemberFunctionRunnerTemplate( object, function ) ) );
-@@ -295,7 +305,7 @@ public:
-     //! schedule a task for execution in the next tToDo call
-     static void ScheduleForeground( T & object, void (T::*function)()  )
-     {
--#if defined(HAVE_LIBZTHREAD) || defined(HAVE_PTHREAD)
-+#if defined(HAVE_LIBZTHREAD) || defined(HAVE_PTHREAD) || defined(HAVE_LIBPTHREAD)
-         Pending().add( nMemberFunctionRunnerTemplate( object, function ) );
-         st_ToDo( FinishAll );
- #else
-@@ -332,7 +342,7 @@ private:
-     // taks for the break
-     static std::deque< nMemberFunctionRunnerTemplate > pendingForBreak_;
- 
--#if defined(HAVE_LIBZTHREAD) || defined(HAVE_PTHREAD)
-+#if defined(HAVE_LIBZTHREAD) || defined(HAVE_PTHREAD) || defined(HAVE_LIBPTHREAD)
-     // queue of foreground tasks
-     static nQueue< nMemberFunctionRunnerTemplate, nMutex > & Pending()
-     {
-@@ -387,7 +397,7 @@ public:
-     {
-         if ( block )
-         {
--#if defined(HAVE_LIBZTHREAD) || defined(HAVE_PTHREAD)
-+#if defined(HAVE_LIBZTHREAD) || defined(HAVE_PTHREAD) || defined(HAVE_LIBPTHREAD)
-             ScheduleBackground( object, function );
- #else
-             ScheduleBreak( object, function );
-@@ -420,7 +430,7 @@ public:
- 
-     // inform the user about delays
-         bool delays = false;
--#if defined(HAVE_LIBZTHREAD) || defined(HAVE_PTHREAD)
-+#if defined(HAVE_LIBZTHREAD) || defined(HAVE_PTHREAD) || defined(HAVE_LIBPTHREAD)
-         delays = tRecorder::IsRunning();
- #endif
-         if ( delays )
 diff --git a/src/network/nConfig.h b/src/network/nConfig.h
-index 9331df10..b1b2b89b 100644
+index 9331df1..b1b2b89 100644
 --- a/src/network/nConfig.h
 +++ b/src/network/nConfig.h
 @@ -156,6 +156,7 @@ public:
@@ -781,7 +168,7 @@ index 9331df10..b1b2b89b 100644
  #endif
 -
 diff --git a/src/network/nNetObject.cpp b/src/network/nNetObject.cpp
-index 396fc6ca..d0d75c72 100644
+index 396fc6c..672140a 100644
 --- a/src/network/nNetObject.cpp
 +++ b/src/network/nNetObject.cpp
 @@ -830,7 +830,9 @@ void nNetObject::DoBroadcastExistence(){
@@ -819,7 +206,7 @@ index 396fc6ca..d0d75c72 100644
      if (sn_GetNetState()==nSERVER || (AcceptClientSync() && owner==::sn_myNetID)){
          knowsAbout[user].syncReq=true;
          knowsAbout[user].nextSyncAck |=ack;
-@@ -1364,15 +1376,20 @@ void nNetObject::RequestSync(bool ack){
+@@ -1364,8 +1376,14 @@ void nNetObject::RequestSync(bool ack){
  #endif
  
      for(int i=MAXCLIENTS;i>=0;i--){
@@ -836,14 +223,7 @@ index 396fc6ca..d0d75c72 100644
      }
  
      if ( syncListID_ < 0 )
-         sn_SyncRequestedObject.Add( this, syncListID_ );
- }
- 
--
- static void net_control_handler(nMessage &m){
-     //con << "control\n";
-     if (sn_GetNetState()==nSERVER){
-@@ -1551,7 +1568,14 @@ void nNetObject::SyncAll(){
+@@ -1551,7 +1569,14 @@ void nNetObject::SyncAll(){
                      currentSync >= 0){
                  nNetObject *nos = sn_SyncRequestedObject( currentSync );
  
@@ -859,14 +239,13 @@ index 396fc6ca..d0d75c72 100644
                          && (sn_GetNetState()!=nCLIENT ||
                              nos->AcceptClientSync()))
                  {
-@@ -2147,5 +2171,3 @@ nMachine & nNetObject::DoGetMachine( void ) const
- {
+@@ -2148,4 +2173,3 @@ nMachine & nNetObject::DoGetMachine( void ) const
      return nMachine::GetMachine( Owner() );
  }
--
+ 
 -
 diff --git a/src/network/nNetObject.h b/src/network/nNetObject.h
-index c5026544..8e9d631f 100644
+index c502654..8e9d631 100644
 --- a/src/network/nNetObject.h
 +++ b/src/network/nNetObject.h
 @@ -203,6 +203,12 @@ public:
@@ -887,47 +266,8 @@ index c5026544..8e9d631f 100644
  
  #endif
 -
-diff --git a/src/network/nServerInfo.cpp b/src/network/nServerInfo.cpp
-index 63c1d504..eea478e5 100644
---- a/src/network/nServerInfo.cpp
-+++ b/src/network/nServerInfo.cpp
-@@ -41,6 +41,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
- #include "nServerInfo.h"
- #include "nNetObject.h"
- 
-+#include <algorithm>
- #include <fstream>
- 
- static nServerInfo*          sn_masterList  = NULL;
-@@ -2835,6 +2836,8 @@ void nServerInfo::DoGetFrom( nSocket const * socket )
- 
-     if ( nServerInfoAdmin::GetAdmin() )
-     {
-+        users           = nServerInfoAdmin::GetAdmin()->GetUserCount();
-+        maxUsers_      += std::max( 0, users - sn_NumRealUsers() );
-         userNames_      = nServerInfoAdmin::GetAdmin()->GetUsers();
-         userGlobalIDs_  = nServerInfoAdmin::GetAdmin()->GetGlobalIDs();
-         options_        = nServerInfoAdmin::GetAdmin()->GetOptions();
-@@ -3178,5 +3181,3 @@ const tString & nServerInfo::DoGetName( void ) const
- {
-     return name;
- }
--
--
-diff --git a/src/network/nServerInfo.h b/src/network/nServerInfo.h
-index 236a2548..81605ce2 100644
---- a/src/network/nServerInfo.h
-+++ b/src/network/nServerInfo.h
-@@ -390,6 +390,7 @@ protected:
-     virtual ~nServerInfoAdmin();
- 
- private:
-+    virtual int GetUserCount() const = 0;
-     virtual tString GetUsers()		const = 0;
-     virtual tString GetGlobalIDs()	const = 0;
-     virtual tString	GetOptions()	const = 0;
 diff --git a/src/render/rConsoleCout.cpp b/src/render/rConsoleCout.cpp
-index bb62f293..59081c14 100644
+index bb62f29..59081c1 100644
 --- a/src/render/rConsoleCout.cpp
 +++ b/src/render/rConsoleCout.cpp
 @@ -147,20 +147,45 @@ public:
@@ -1035,52 +375,8 @@ index bb62f293..59081c14 100644
      if (infp == NULL)
          close(p_stdin[WRITE]);
      else
-diff --git a/src/tools/pthread-binding.h b/src/tools/pthread-binding.h
-index f13e90db..feab5613 100644
---- a/src/tools/pthread-binding.h
-+++ b/src/tools/pthread-binding.h
-@@ -11,6 +11,9 @@ public:
-         // TODO: error checking
-         pthread_mutex_init(&mutex, NULL);
-     }
-+    ~tPThreadMutex() {
-+        pthread_mutex_destroy(&mutex);
-+    }
-     void acquire() {
-         pthread_mutex_lock(&mutex);
-     };
-@@ -20,7 +23,6 @@ public:
- };
- 
- class tPThreadRecursiveMutex
-- : public tPThreadMutex
- {
- private:
-     pthread_mutex_t mutex;
-@@ -28,9 +30,20 @@ public:
-     tPThreadRecursiveMutex() {
-         // TODO: error checking
-         pthread_mutexattr_t mta;
--        
-+
-+        pthread_mutexattr_init(&mta);
-         pthread_mutexattr_settype(&mta, PTHREAD_MUTEX_RECURSIVE);
-         pthread_mutex_init(&mutex, &mta);
-+        pthread_mutexattr_destroy(&mta);
-+    }
-+    ~tPThreadRecursiveMutex() {
-+        pthread_mutex_destroy(&mutex);
-+    }
-+    void acquire() {
-+        pthread_mutex_lock(&mutex);
-+    }
-+    void release() {
-+        pthread_mutex_unlock(&mutex);
-     }
- };
- 
 diff --git a/src/tools/tConfiguration.cpp b/src/tools/tConfiguration.cpp
-index 66fa8de5..38ba1748 100644
+index 66fa8de..38ba174 100644
 --- a/src/tools/tConfiguration.cpp
 +++ b/src/tools/tConfiguration.cpp
 @@ -149,6 +149,17 @@ const tConfiguration* tConfiguration::GetConfiguration() {
@@ -1110,7 +406,7 @@ index 66fa8de5..38ba1748 100644
  
      *target=dummy;
 diff --git a/src/tools/tConfiguration.h b/src/tools/tConfiguration.h
-index 311610e1..8742b6ab 100644
+index 311610e..8742b6a 100644
 --- a/src/tools/tConfiguration.h
 +++ b/src/tools/tConfiguration.h
 @@ -280,6 +280,10 @@ public:
@@ -1137,58 +433,8 @@ index 311610e1..8742b6ab 100644
  
  #endif
 -
-diff --git a/src/tools/tMemManager.cpp b/src/tools/tMemManager.cpp
-index b2fa9b98..907a33a6 100644
---- a/src/tools/tMemManager.cpp
-+++ b/src/tools/tMemManager.cpp
-@@ -90,7 +90,7 @@ static bool reported=false;
- #include <zthread/FastRecursiveMutex.h>
- 
- typedef ZThread::FastRecursiveMutex MUTEX;
--#elif defined(HAVE_PTHREAD)
-+#elif defined(HAVE_PTHREAD) || defined(HAVE_LIBPTHREAD)
- #include "pthread-binding.h"
- typedef tPThreadRecursiveMutex MUTEX;
- #else
-diff --git a/src/tools/tToDo.cpp b/src/tools/tToDo.cpp
-index e693d133..c50ed599 100644
---- a/src/tools/tToDo.cpp
-+++ b/src/tools/tToDo.cpp
-@@ -32,7 +32,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
- #include <zthread/FastRecursiveMutex.h>
- 
- static ZThread::FastRecursiveMutex st_mutex;
--#elif defined(HAVE_PTHREAD)
-+#elif defined(HAVE_PTHREAD) || defined(HAVE_LIBPTHREAD)
- #include "pthread-binding.h"
- static tPThreadRecursiveMutex st_mutex;
- #else
-@@ -61,12 +61,14 @@ void st_ToDoOnce(tTODO_FUNC *td){ // postpone something, avoid double entries
-     st_mutex.acquire();
-     if( st_toDoCurrent == td )
-     {
-+        st_mutex.release();
-         return;
-     }
-     for( int i = tToDos.Len()-1; i >= 0; --i )
-     {
-         if( tToDos[i]==td )
-         {
-+            st_mutex.release();
-             return;
-         }
-     }
-diff --git a/src/tron/gAIBase.cpp b/src/tron/gAIBase.cpp
-index 4fe8b6ae..0e427219 100644
---- a/src/tron/gAIBase.cpp
-+++ b/src/tron/gAIBase.cpp
-@@ -3363,4 +3363,3 @@ static void sg_SetAIRoute(std::istream &s)
- }
- 
- static tConfItemFunc sg_SetAIRoute_conf("SET_AI_POSITION",&sg_SetAIRoute);
--
 diff --git a/src/tron/gCycle.cpp b/src/tron/gCycle.cpp
-index 78153a33..b2cc8b03 100644
+index 78153a3..2190568 100644
 --- a/src/tron/gCycle.cpp
 +++ b/src/tron/gCycle.cpp
 @@ -58,11 +58,18 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -1210,19 +456,22 @@ index 78153a33..b2cc8b03 100644
  
  #ifndef DEDICATED
  #define DONTDOIT
-@@ -112,6 +119,11 @@ static tSettingItem<float> conf_smoothMinSpeed ("CYCLE_SMOOTH_MIN_SPEED", sg_cyc
+@@ -112,6 +119,14 @@ static tSettingItem<float> conf_smoothMinSpeed ("CYCLE_SMOOTH_MIN_SPEED", sg_cyc
  static float sg_cycleSyncSmoothThreshold = .2f;
  static tSettingItem<float> conf_smoothThreshold ("CYCLE_SMOOTH_THRESHOLD", sg_cycleSyncSmoothThreshold);
  
-+static tString sg_HighPrecisionRaceTime( REAL time );
-+static eLadderLogWriter se_cycleStartHoldInputWriter(
-+    "CYCLE_START_HOLD_INPUT", false);
-+static eLadderLogWriter se_cycleCollisionWriter("CYCLE_COLLISION", false);
++// A held cycle is networked at zero speed. Restoring its full takeoff speed in
++// one simulation step makes the owning client visibly jump forward. Keep the
++// client's prediction acceleration disabled for this short interval and send
++// authoritative, eased speeds instead.
++static REAL sg_cycleStartHoldReleaseTime = .35;
++static tSettingItem<REAL> conf_startHoldReleaseTime(
++    "CYCLE_START_HOLD_RELEASE_TIME", sg_cycleStartHoldReleaseTime);
 +
  static REAL sg_enemyChatbotTimePenalty = 30.0f;   //!< penalty for victim in chatbot mode
  static tSettingItem<REAL> sg_enemyChatbotTimePenaltyConf( "ENEMY_CHATBOT_PENALTY", sg_enemyChatbotTimePenalty );
  extern REAL sg_suicideTimeout;
-@@ -1482,8 +1494,11 @@ static void new_destination_handler(nMessage &m)
+@@ -1482,8 +1497,11 @@ static void new_destination_handler(nMessage &m)
                      if ( dest->GetGameTime() < -100 )
                          dest->SetGameTime( se_GameTime()+c->Lag()*3 );
  
@@ -1236,7 +485,7 @@ index 78153a33..b2cc8b03 100644
                  }
              }
      }
-@@ -1639,6 +1654,118 @@ void gCycle::OnNotifyNewDestination( gDestination* dest )
+@@ -1639,6 +1657,78 @@ void gCycle::OnNotifyNewDestination( gDestination* dest )
      }
  }
  
@@ -1270,60 +519,20 @@ index 78153a33..b2cc8b03 100644
 +    {
 +        bool down = destination.braking;
 +        bool brakeChanged = down != freezeBrakeActionDown_;
-+        bool previousDown = freezeBrakeActionDown_;
 +        freezeBrakeActionDown_ = down;
 +        if (brakeChanged)
 +        {
-+            if (Player())
-+            {
-+                se_cycleStartHoldInputWriter << Player()->GetLogName() <<
-+                    ReplayToken() << "destination" <<
-+                    sg_HighPrecisionRaceTime(se_GameTime()) <<
-+                    sg_HighPrecisionRaceTime(destination.gameTime) <<
-+                    down << previousDown << destination.messageID <<
-+                    pos.x << pos.y << turns << (currentDestination != NULL);
-+                se_cycleStartHoldInputWriter.write();
-+            }
-+            BeginStartHoldRelease();
++            freezeUntilBrake_ = false;
++            freezeUntil_ = se_GameTime();
++            braking = 0;
++            RequestSyncOwner();
++            RequestSyncAll();
 +        }
 +    }
 +
 +    // Consume the destination here so its frozen turn or starting brake action
 +    // is not replayed by the normal movement simulation after release.
 +    return true;
-+}
-+
-+static REAL sg_StartHoldPredictionLead(int owner)
-+{
-+    if (owner <= 0 || owner > MAXCLIENTS ||
-+            !sn_Connections[owner].socket)
-+        return 0;
-+
-+    REAL networkLead = sn_Connections[owner].ping.GetPing() * .5;
-+    if (!std::isfinite(networkLead) || networkLead < 0)
-+        return 0;
-+    if (networkLead > .5)
-+        networkLead = .5;
-+    return networkLead;
-+}
-+
-+void gCycle::BeginStartHoldRelease()
-+{
-+    freezeUntilBrake_ = false;
-+    braking = 0;
-+
-+    // RESPAWN_PLAYER_HELD is implemented entirely on the server. A stock
-+    // client therefore knows only that its speed is zero. Stage its ordinary
-+    // prediction settings now, then launch the server after the packet's
-+    // estimated one-way travel time. Both sides begin at freezeSpeed_, so the
-+    // first post-launch authoritative sync is a confirmation, not a position
-+    // correction.
-+    bool predictionStaged = sg_StageClientTakeoffPrediction(
-+        Owner(), freezeClientZeroAccelerationLease_, freezeSpeed_,
-+        SpeedMultiplier());
-+    REAL networkLead = predictionStaged ?
-+        sg_StartHoldPredictionLead(Owner()) : 0;
-+    freezeUntil_ = se_GameTime() + networkLead;
 +}
 +
 +void gCycle::ApplyStartHoldDirection(int winding, unsigned short turnCount)
@@ -1355,7 +564,7 @@ index 78153a33..b2cc8b03 100644
  
  // *******************************************************************************************
  // *
-@@ -2428,11 +2555,208 @@ void gCycle::InitAfterCreation(){
+@@ -2428,11 +2518,206 @@ void gCycle::InitAfterCreation(){
  }
  
  static eLadderLogWriter se_cycleCreatedWriter("CYCLE_CREATED", false);
@@ -1550,31 +759,22 @@ index 78153a33..b2cc8b03 100644
 +        freezeSpeed_(0),
 +        freezeReleaseStart_(-1),
 +        freezeReleaseUntil_(-1),
-+        freezeReleaseNextOwnerSync_(-1),
-+        freezeClientZeroAccelerationLease_(0),
++        freezeClientZeroAcceleration_(false),
 +        freezeUntilBrake_(false),
 +        freezeStartHoldTurns_(false),
 +        freezeBrakeActionDown_(false),
 +        lastStartHoldMessageID_(0),
 +        replayToken_(++sg_cycleReplayToken),
-+        federationGhost_(p && p->IsFederationGhost()),
 +        lastMovementStartPosition_(pos),
 +        lastMovementStartTime_(0),
 +        lastMovementValid_(false),
          skew(0),skewDot(0),
          rotationFrontWheel(1,0),rotationRearWheel(1,0),heightFrontWheel(0),heightRearWheel(0),
          tactical_pos(TP_Start),
-@@ -2441,13 +2765,23 @@ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
+@@ -2441,6 +2726,13 @@ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
          currentWall(NULL),
          lastWall(NULL)
  {
--    se_cycleCreatedWriter << p->GetLogName() << this->MapPosition().x << this->MapPosition().y << this->Direction().x << this->Direction().y;
--    if(p->CurrentTeam())
--        se_cycleCreatedWriter << Team()->Name().Filter();
--    else
--        se_cycleCreatedWriter << "";
--    se_cycleCreatedWriter << se_GameTime();
--    se_cycleCreatedWriter.write();
 +    // A connection may control several local players. If one is already held
 +    // and a new, normally moving cycle appears on that connection, restore
 +    // normal client prediction immediately rather than affecting that racer.
@@ -1582,20 +782,10 @@ index 78153a33..b2cc8b03 100644
 +            sg_ClientZeroAccelerationActive(Owner()))
 +        sg_CancelClientZeroAcceleration(Owner());
 +
-+    if ( !federationGhost_ )
-+    {
-+        se_cycleCreatedWriter << p->GetLogName() << this->MapPosition().x << this->MapPosition().y << this->Direction().x << this->Direction().y;
-+        if(p->CurrentTeam())
-+            se_cycleCreatedWriter << Team()->Name().Filter();
-+        else
-+            se_cycleCreatedWriter << "";
-+        se_cycleCreatedWriter << se_GameTime();
-+        se_cycleCreatedWriter.write();
-+    }
- 
-     windingNumberWrapped_ = windingNumber_ = Grid()->DirectionWinding(dirDrive);
-     dirDrive = Grid()->GetDirection(windingNumberWrapped_);
-@@ -2475,12 +2809,28 @@ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
+     se_cycleCreatedWriter << p->GetLogName() << this->MapPosition().x << this->MapPosition().y << this->Direction().x << this->Direction().y;
+     if(p->CurrentTeam())
+         se_cycleCreatedWriter << Team()->Name().Filter();
+@@ -2475,12 +2767,27 @@ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
  
      turnedPositions.push_back(startPos_);
      turnedDirections.push_back(startDir_);
@@ -1615,58 +805,18 @@ index 78153a33..b2cc8b03 100644
  #ifdef DEBUG
      con << "deleting cycle...\n";
  #endif
-+    if (freezeClientZeroAccelerationLease_)
++    if (freezeClientZeroAcceleration_)
 +    {
-+        sg_ReleaseClientZeroAcceleration(
-+            Owner(), freezeClientZeroAccelerationLease_);
-+        freezeClientZeroAccelerationLease_ = 0;
++        sg_ReleaseClientZeroAcceleration(Owner());
++        freezeClientZeroAcceleration_ = false;
 +    }
      // clear the destination list
  
      //Search the list for zones that could be referencing us
-@@ -2533,14 +2883,15 @@ void gCycle::OnRemoveFromGame()
-     {
-         keep = this;
- 
--        this->Turn(0);
-+        if ( !federationGhost_ )
-+            this->Turn(0);
- 
-         if ( sn_GetNetState() == nSERVER )
-             RequestSync();
-     }
- 
-     // make sure we're dead, so our walls know they need to time out.
--    if ( Alive() )
-+    if ( Alive() && !federationGhost_ )
-     {
-         Die( lastTime );
-     }
-@@ -2557,7 +2908,7 @@ void gCycle::OnRemoveFromGame()
- void gCycle::OnRoundEnd()
- {
-     // give survival bonus
--    if ( Alive() && player )
-+    if ( !federationGhost_ && Alive() && player )
-     {
-         Player()->AddScore( score_survive, tOutput("$player_win_survive"), tOutput() );
-     }
-@@ -2669,6 +3020,24 @@ REAL gCycle::CalculatePredictPosition( gPredictPositionData & data )
+@@ -2669,6 +2976,12 @@ REAL gCycle::CalculatePredictPosition( gPredictPositionData & data )
  }
  
  bool gCycle::Timestep(REAL currentTime){
-+    if ( federationGhost_ )
-+    {
-+        // The authoritative position arrives from the local sidecar. Keeping
-+        // this branch out of cycle physics guarantees no wall, collision,
-+        // rubber, zone timing, or score side effects on the follower.
-+        lastTime = currentTime;
-+        lastTimeAnim = currentTime;
-+        predictPosition_ = pos;
-+        lastGoodPosition_ = pos;
-+        return false;
-+    }
-+
 +    // Configuration commands, map settings, setting zones, and programmatic
 +    // network-setting resets all advance ChangeRevision().  Snapshot once on
 +    // the first cycle timestep after such a change so replays can reproduce
@@ -1676,7 +826,7 @@ index 78153a33..b2cc8b03 100644
      // clear out dangerous info when we're done
      gMaxSpaceAheadHitInfoClearer hitInfoClearer( maxSpaceHit_ );
  
-@@ -2975,6 +3344,84 @@ bool gCycle::TimestepCore(REAL currentTime, bool calculateAcceleration ){
+@@ -2975,6 +3288,107 @@ bool gCycle::TimestepCore(REAL currentTime, bool calculateAcceleration ){
      if (!std::isfinite(skewDot))
          skewDot=0;
  
@@ -1686,15 +836,6 @@ index 78153a33..b2cc8b03 100644
 +    // client protocol extension.
 +    if ( sn_GetNetState() == nSERVER && freezeUntil_ >= 0 && currentTime <= freezeUntil_ )
 +    {
-+        // A timed hold has a known launch time. Stage the same prediction
-+        // transition one network trip ahead; brake holds do this when their
-+        // input arrives in BeginStartHoldRelease().
-+        if (!freezeUntilBrake_ && freezeClientZeroAccelerationLease_ &&
-+                freezeUntil_ - currentTime <=
-+                    sg_StartHoldPredictionLead(Owner()))
-+            sg_StageClientTakeoffPrediction(
-+                Owner(), freezeClientZeroAccelerationLease_, freezeSpeed_,
-+                SpeedMultiplier());
 +        pos = freezePosition_;
 +        dirDrive = freezeDirection_;
 +        dir = freezeDirection_;
@@ -1735,33 +876,65 @@ index 78153a33..b2cc8b03 100644
 +        lastTime = releaseTime;
 +        lastTimeAnim = releaseTime;
 +        lastTimestep_ = 0;
-+        freezeReleaseStart_ = -1;
-+        freezeReleaseUntil_ = -1;
-+        freezeReleaseNextOwnerSync_ = -1;
-+        verletSpeed_ = freezeSpeed_;
++        REAL rampDuration = sg_cycleStartHoldReleaseTime;
++        if (!std::isfinite(rampDuration) || rampDuration < 0)
++            rampDuration = 0;
++        freezeReleaseStart_ = releaseTime;
++        freezeReleaseUntil_ = releaseTime + rampDuration;
++        verletSpeed_ = rampDuration > 0 ? 0 : freezeSpeed_;
 +        acceleration = 0;
 +        if ( Player() )
 +        {
-+            se_cycleReleasedWriter << Player()->GetLogName() <<
-+                sg_HighPrecisionRaceTime( releaseTime );
++            se_cycleReleasedWriter << Player()->GetLogName() << sg_HighPrecisionRaceTime( releaseTime );
 +            se_cycleReleasedWriter.write();
 +            sg_WriteCycleReplayState( this, "release", releaseTime );
 +        }
-+        if (freezeClientZeroAccelerationLease_)
++        RequestSync();
++        if (rampDuration <= 0 && freezeClientZeroAcceleration_)
 +        {
-+            sg_ReleaseClientZeroAcceleration(
-+                Owner(), freezeClientZeroAccelerationLease_);
-+            freezeClientZeroAccelerationLease_ = 0;
++            sg_ReleaseClientZeroAcceleration(Owner());
++            freezeClientZeroAcceleration_ = false;
 +        }
-+        if (Owner() != 0)
-+            RequestSync(Owner(), false);
-+        RequestSyncAll();
++    }
++
++    if (sn_GetNetState() == nSERVER && freezeReleaseUntil_ >= 0)
++    {
++        if (currentTime < freezeReleaseUntil_)
++        {
++            REAL progress = (currentTime - freezeReleaseStart_) /
++                (freezeReleaseUntil_ - freezeReleaseStart_);
++            clamp(progress, static_cast<REAL>(0), static_cast<REAL>(1));
++            // Smoothstep has zero slope at both ends, preventing a second
++            // acceleration jolt when normal cycle physics takes over.
++            REAL eased = progress * progress * (3 - 2 * progress);
++            verletSpeed_ = freezeSpeed_ * eased;
++            acceleration = 0;
++            lastTimestep_ = 0;
++            calculateAcceleration = false;
++            RequestSyncOwner();
++            RequestSyncAll();
++        }
++        else
++        {
++            freezeReleaseStart_ = -1;
++            freezeReleaseUntil_ = -1;
++            verletSpeed_ = freezeSpeed_;
++            acceleration = 0;
++            lastTimestep_ = 0;
++            if (freezeClientZeroAcceleration_)
++            {
++                sg_ReleaseClientZeroAcceleration(Owner());
++                freezeClientZeroAcceleration_ = false;
++            }
++            RequestSyncOwner();
++            RequestSyncAll();
++        }
 +    }
 +
      // eCoord oldpos=pos;
  
      REAL ts=(currentTime-lastTime);
-@@ -3098,6 +3545,16 @@ bool gCycle::TimestepCore(REAL currentTime, bool calculateAcceleration ){
+@@ -3098,6 +3512,16 @@ bool gCycle::TimestepCore(REAL currentTime, bool calculateAcceleration ){
                      lastTurnPos_ = pos; // hack last turn position to generate good wall
                  }
  
@@ -1778,39 +951,7 @@ index 78153a33..b2cc8b03 100644
                  // simulate rest of frame
                  if ( gCycleMovement::TimestepCore( currentTime, calculateAcceleration ) )
                      return true;
-@@ -3632,6 +4089,31 @@ void gCycle::PassEdge(const eWall *ww,REAL time,REAL a,int){
- 
-     const gPlayerWall *w = dynamic_cast<const gPlayerWall*>(ww);
- 
-+    if (sn_GetNetState() == nSERVER && Player())
-+    {
-+        tString wallKind("static");
-+        tString wallOwner("-");
-+        if (w)
-+        {
-+            wallKind = "player";
-+            if (w->Cycle() && w->Cycle()->Player())
-+                wallOwner = w->Cycle()->Player()->GetLogName();
-+        }
-+        eCoord wallStart = ww->EndPoint(0);
-+        eCoord wallEnd = ww->EndPoint(1);
-+        se_cycleCollisionWriter << Player()->GetLogName() << ReplayToken() <<
-+            wallKind << wallOwner << sg_HighPrecisionRaceTime(time) <<
-+            sg_HighPrecisionRaceTime(lastTime) <<
-+            sg_HighPrecisionRaceTime(se_GameTime()) << a <<
-+            collPos.x << collPos.y << pos.x << pos.y <<
-+            wallStart.x << wallStart.y << wallEnd.x << wallEnd.y <<
-+            Speed() << distance << braking <<
-+            sg_HighPrecisionRaceTime(freezeReleaseStart_) <<
-+            sg_HighPrecisionRaceTime(freezeReleaseUntil_) <<
-+            (currentDestination != NULL);
-+        se_cycleCollisionWriter.write();
-+    }
-+
-     enemyInfluence.AddWall( ww, collPos, 0, this );
- 
-     if (w)
-@@ -3828,6 +4310,62 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
+@@ -3828,6 +4252,51 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
      if (!Alive() && sn_GetNetState()==nSERVER)
          RequestSync(false);
  
@@ -1833,20 +974,14 @@ index 78153a33..b2cc8b03 100644
 +        {
 +            bool down = x > 0;
 +            bool brakeChanged = down != freezeBrakeActionDown_;
-+            bool previousDown = freezeBrakeActionDown_;
 +            freezeBrakeActionDown_ = down;
 +            if ( brakeChanged )
 +            {
-+                if ( Player() )
-+                {
-+                    se_cycleStartHoldInputWriter << Player()->GetLogName() <<
-+                        ReplayToken() << "action" <<
-+                        sg_HighPrecisionRaceTime(se_GameTime()) << "-" <<
-+                        x << previousDown << 0 << pos.x << pos.y << turns <<
-+                        (currentDestination != NULL);
-+                    se_cycleStartHoldInputWriter.write();
-+                }
-+                BeginStartHoldRelease();
++                freezeUntilBrake_ = false;
++                freezeUntil_ = se_GameTime();
++                braking = 0;
++                RequestSyncOwner();
++                RequestSyncAll();
 +            }
 +            return true;
 +        }
@@ -1854,16 +989,11 @@ index 78153a33..b2cc8b03 100644
 +        {
 +            if ( x > 0 )
 +            {
-+                if ( Player() )
-+                {
-+                    se_cycleStartHoldInputWriter << Player()->GetLogName() <<
-+                        ReplayToken() << "toggle" <<
-+                        sg_HighPrecisionRaceTime(se_GameTime()) << "-" <<
-+                        x << freezeBrakeActionDown_ << 0 << pos.x << pos.y <<
-+                        turns << (currentDestination != NULL);
-+                    se_cycleStartHoldInputWriter.write();
-+                }
-+                BeginStartHoldRelease();
++                freezeUntilBrake_ = false;
++                freezeUntil_ = se_GameTime();
++                braking = 0;
++                RequestSyncOwner();
++                RequestSyncAll();
 +            }
 +            return true;
 +        }
@@ -1873,7 +1003,7 @@ index 78153a33..b2cc8b03 100644
      if(se_turnLeft==*Act && x>.5){
          //SendControl(lastTime,&se_turnLeft,1);
          Turn(-1);
-@@ -3845,6 +4383,7 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
+@@ -3845,6 +4314,7 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
          {
              AccelerationDiscontinuity();
              braking = newBraking;
@@ -1881,7 +1011,7 @@ index 78153a33..b2cc8b03 100644
              AddDestination();
  
              // brake changed, process shooting
-@@ -3860,6 +4399,7 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
+@@ -3860,6 +4330,7 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
          {
              AccelerationDiscontinuity();
              braking = !braking;
@@ -1889,7 +1019,7 @@ index 78153a33..b2cc8b03 100644
              AddDestination();
  
              // brake changed, process shooting
-@@ -3873,6 +4413,11 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
+@@ -3873,6 +4344,11 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
      return false;
  }
  
@@ -1901,7 +1031,7 @@ index 78153a33..b2cc8b03 100644
  // client side bugfix: network sync messages get actually used
  static nVersionFeature sg_SyncsAreUsed( 5 );
  
-@@ -4050,6 +4595,8 @@ bool gCycle::DoTurn(int d)
+@@ -4050,6 +4526,8 @@ bool gCycle::DoTurn(int d)
              turnedPositions.push_back(pos);
              turnedDirections.push_back(dirDrive);
  
@@ -1910,7 +1040,7 @@ index 78153a33..b2cc8b03 100644
              return true;
          }
      }
-@@ -4356,6 +4903,13 @@ void gCycle::Kill(){
+@@ -4356,6 +4834,13 @@ void gCycle::Kill(){
                      se_cycleDestroyedWriter << "";
                  se_cycleDestroyedWriter.write();
  
@@ -1924,7 +1054,7 @@ index 78153a33..b2cc8b03 100644
                  Player()->LogActivity(ACTIVITY_DIED);
  
                  sg_cycleRespawnZone_Create(this);
-@@ -5539,6 +6093,23 @@ gCycle::gCycle(nMessage &m)
+@@ -5539,6 +6024,21 @@ gCycle::gCycle(nMessage &m)
          engine(NULL),
          turning(NULL),
          spark(NULL),
@@ -1934,40 +1064,19 @@ index 78153a33..b2cc8b03 100644
 +        freezeSpeed_(0),
 +        freezeReleaseStart_(-1),
 +        freezeReleaseUntil_(-1),
-+        freezeReleaseNextOwnerSync_(-1),
-+        freezeClientZeroAccelerationLease_(0),
++        freezeClientZeroAcceleration_(false),
 +        freezeUntilBrake_(false),
 +        freezeStartHoldTurns_(false),
 +        freezeBrakeActionDown_(false),
 +        lastStartHoldMessageID_(0),
 +        replayToken_(0),
-+        federationGhost_(false),
 +        lastMovementStartPosition_(0, 0),
 +        lastMovementStartTime_(0),
 +        lastMovementValid_(false),
          skew(0),skewDot(0),
          rotationFrontWheel(1,0),rotationRearWheel(1,0),heightFrontWheel(0),heightRearWheel(0),
          tactical_pos(TP_Start),
-@@ -5630,9 +6201,17 @@ void gCycle::WriteSync(nMessage &m){
-     }
- #endif
- 
-+    // Stock clients have no federation flag. A tiny nonzero speed combined
-+    // with a far-future inferred spawn time prevents them from predicting a
-+    // preliminary trail for a trail-free remote proxy.
-+    if ( federationGhost_ && speed <= 0 )
-+        speed = .001;
-     m << speed;
-     m << short( Alive() ? 1 : 0 );
--    m << distance;
-+    REAL syncDistance = distance;
-+    if ( federationGhost_ )
-+        syncDistance = -speed * 31536000.0f;
-+    m << syncDistance;
-     if (!currentWall || currentWall->preliminary)
-         m.Write(0);
-     else
-@@ -5652,6 +6231,10 @@ void gCycle::WriteSync(nMessage &m){
+@@ -5652,6 +6152,10 @@ void gCycle::WriteSync(nMessage &m){
      unsigned short lastMessageID = 0;
      if ( lastDestination )
          lastMessageID = lastDestination->messageID;
@@ -1978,7 +1087,7 @@ index 78153a33..b2cc8b03 100644
      m.Write(lastMessageID);
  
      // write brake
-@@ -6292,7 +6875,10 @@ void gCycle::ReadSync( nMessage &m )
+@@ -6292,7 +6796,10 @@ void gCycle::ReadSync( nMessage &m )
  
              // update brake status
              AccelerationDiscontinuity();
@@ -1989,68 +1098,7 @@ index 78153a33..b2cc8b03 100644
  
              // store last turn
              lastTurnPos_ = lastSyncMessage_.lastTurn;
-@@ -6781,7 +7367,59 @@ REAL gCycleExtrapolator::DoGetDistanceSinceLastTurn( void ) const
- 
- bool gCycle::Vulnerable() const
- {
--    return Alive() && lastTime > spawnTime_ + sg_cycleInvulnerableTime;
-+    return !federationGhost_ && Alive() && lastTime > spawnTime_ + sg_cycleInvulnerableTime;
-+}
-+
-+void gCycle::ApplyFederationState( const eCoord &position,
-+                                   const eCoord &direction,
-+                                   REAL speed, REAL localTime )
-+{
-+    if ( !federationGhost_ || !Alive() )
-+        return;
-+
-+    eCoord normalized = direction;
-+    REAL lengthSquared = normalized.NormSquared();
-+    if ( lengthSquared <= EPS )
-+        return;
-+    normalized = normalized * ( 1 / sqrt( lengthSquared ) );
-+
-+    // Never retain a server-side trail, even if a future code path creates
-+    // one before this state update is applied.
-+    if ( currentWall )
-+        DropWall( false );
-+
-+    pos = position;
-+    dir = dirDrive = normalized;
-+    lastDirDrive = normalized;
-+    SetWindingNumberWrapped( Grid()->DirectionWinding( normalized ) );
-+    verletSpeed_ = speed < 0 ? 0 : speed;
-+    acceleration = 0;
-+    lastTimestep_ = 0;
-+    lastTime = localTime;
-+    lastTimeAnim = localTime;
-+    lastGoodPosition_ = position;
-+    predictPosition_ = position;
-+    correctPosSmooth = eCoord( 0, 0 );
-+    correctDistanceSmooth = 0;
-+    lastMovementValid_ = false;
-+    lastTurnPos_ = position;
-+    RequestSync( false );
-+}
-+
-+void gCycle::ApplyFederationDeath( REAL localTime )
-+{
-+    if ( !federationGhost_ || !Alive() )
-+        return;
-+
-+    // A proxy death is visual state only.  Bypass gCycle::Die so it cannot
-+    // affect timing analysis, scoring, zones, explosions, or race records,
-+    // but mark the network object dead before it is detached.  Otherwise the
-+    // final client sync describes a still-live cycle that extrapolates forever.
-+    gCycleMovement::Die( localTime );
-+    predictPosition_ = pos;
-+    correctPosSmooth = eCoord( 0, 0 );
-+    correctDistanceSmooth = 0;
-+    RequestSync( true );
- }
- 
- static float sg_shotThreshold = 2.0f;
-@@ -7194,6 +7832,9 @@ void gCycle::TeleportTo(eCoord dest, eCoord dir, REAL time) {
+@@ -7194,6 +7701,9 @@ void gCycle::TeleportTo(eCoord dest, eCoord dir, REAL time) {
  	}
  	// Do a safe move to destination
  	MoveSafely(dest,time,time);
@@ -2060,7 +1108,7 @@ index 78153a33..b2cc8b03 100644
  	SetLastTurnPos(dest); // hacky way to ensure to build the wall properly
  	SetLastTurnTime(time);
  	// if dir is not (0,0), do a turn ...
-@@ -7213,6 +7854,180 @@ void gCycle::TeleportTo(eCoord dest, eCoord dir, REAL time) {
+@@ -7213,6 +7723,168 @@ void gCycle::TeleportTo(eCoord dest, eCoord dir, REAL time) {
  	RequestSync();
  }
  
@@ -2104,25 +1152,19 @@ index 78153a33..b2cc8b03 100644
 +void gCycle::FreezeFor(REAL seconds) {
 +    if (!Alive())
 +        return;
-+    if (freezeClientZeroAccelerationLease_ &&
-+            !sg_ClientZeroAccelerationOwned(
-+                Owner(), freezeClientZeroAccelerationLease_))
-+        freezeClientZeroAccelerationLease_ = 0;
 +    if (seconds <= 0) {
 +        freezeUntil_ = -1;
 +        freezeReleaseStart_ = -1;
 +        freezeReleaseUntil_ = -1;
-+        freezeReleaseNextOwnerSync_ = -1;
 +        freezeUntilBrake_ = false;
 +        freezeStartHoldTurns_ = false;
 +        freezeBrakeActionDown_ = false;
 +        verletSpeed_ = freezeSpeed_;
 +        RequestSync();
-+        if (freezeClientZeroAccelerationLease_)
++        if (freezeClientZeroAcceleration_)
 +        {
-+            sg_ReleaseClientZeroAcceleration(
-+                Owner(), freezeClientZeroAccelerationLease_);
-+            freezeClientZeroAccelerationLease_ = 0;
++            sg_ReleaseClientZeroAcceleration(Owner());
++            freezeClientZeroAcceleration_ = false;
 +        }
 +        return;
 +    }
@@ -2143,13 +1185,12 @@ index 78153a33..b2cc8b03 100644
 +                break;
 +            }
 +        }
-+        if (!otherLocalCycle && !freezeClientZeroAccelerationLease_)
-+            freezeClientZeroAccelerationLease_ =
++        if (!otherLocalCycle && !freezeClientZeroAcceleration_)
++            freezeClientZeroAcceleration_ =
 +                sg_AcquireClientZeroAcceleration(Owner());
 +    }
 +    freezeReleaseStart_ = -1;
 +    freezeReleaseUntil_ = -1;
-+    freezeReleaseNextOwnerSync_ = -1;
 +    bool retainStartHoldTurns = freezeStartHoldTurns_;
 +    freezePosition_ = pos;
 +    freezeDirection_ = dirDrive;
@@ -2173,10 +1214,6 @@ index 78153a33..b2cc8b03 100644
 +void gCycle::FreezeUntilBrake() {
 +    if (!Alive())
 +        return;
-+    if (freezeClientZeroAccelerationLease_ &&
-+            !sg_ClientZeroAccelerationOwned(
-+                Owner(), freezeClientZeroAccelerationLease_))
-+        freezeClientZeroAccelerationLease_ = 0;
 +    // A hold may also be applied to a cycle that is already moving. Finalize
 +    // its old wall at the hold position; the new wall starts in the selected
 +    // direction only after brake releases the cycle.
@@ -2199,13 +1236,12 @@ index 78153a33..b2cc8b03 100644
 +                break;
 +            }
 +        }
-+        if (!otherLocalCycle && !freezeClientZeroAccelerationLease_)
-+            freezeClientZeroAccelerationLease_ =
++        if (!otherLocalCycle && !freezeClientZeroAcceleration_)
++            freezeClientZeroAcceleration_ =
 +                sg_AcquireClientZeroAcceleration(Owner());
 +    }
 +    freezeReleaseStart_ = -1;
 +    freezeReleaseUntil_ = -1;
-+    freezeReleaseNextOwnerSync_ = -1;
 +    freezePosition_ = pos;
 +    freezeDirection_ = dirDrive;
 +    freezeUntil_ = std::numeric_limits<REAL>::max();
@@ -2241,7 +1277,7 @@ index 78153a33..b2cc8b03 100644
  int sg_defaultRespawnPosition = 0;
  static tConfItem<int> sg_defaultRespawnPositionConf("RESPAWN_DEFAULT_POSITION",sg_defaultRespawnPosition);
  
-@@ -7266,7 +8081,8 @@ static tConfItem<bool> sg_RespawnPlayerCMConf("RESPAWN_MESSAGE",sg_RespawnPlayer
+@@ -7266,7 +7938,8 @@ static tConfItem<bool> sg_RespawnPlayerCMConf("RESPAWN_MESSAGE",sg_RespawnPlayer
  bool sg_RespawnPlayerStrict = false;
  static tConfItem<bool> sg_RespawnPlayerStrictConf("RESPAWN_STRICT",sg_RespawnPlayerStrict);
  
@@ -2251,7 +1287,7 @@ index 78153a33..b2cc8b03 100644
  {
          eGrid *grid = eGrid::CurrentGrid();
          if( !grid || !SafeToSpawnObject() )
-@@ -7275,7 +8091,8 @@ static void sg_RespawnPlayer(std::istream &s)
+@@ -7275,7 +7948,8 @@ static void sg_RespawnPlayer(std::istream &s)
                  return;
          }
  
@@ -2261,7 +1297,7 @@ index 78153a33..b2cc8b03 100644
          int pos = 0; //
          tString PlayerName("");
          s >> PlayerName;
-@@ -7290,15 +8107,19 @@ static void sg_RespawnPlayer(std::istream &s)
+@@ -7290,15 +7964,19 @@ static void sg_RespawnPlayer(std::istream &s)
          tString x_str, y_str;
          REAL dirx,diry;
          
@@ -2283,7 +1319,7 @@ index 78153a33..b2cc8b03 100644
          {
              message = (
                  str0[0] == 't' || 
-@@ -7331,6 +8152,18 @@ static void sg_RespawnPlayer(std::istream &s)
+@@ -7331,6 +8009,18 @@ static void sg_RespawnPlayer(std::istream &s)
  
              gCycle *pCycle = new gCycle(grid, ppos, pdir, pPlayer);
              pPlayer->ControlObject(pCycle);
@@ -2302,7 +1338,7 @@ index 78153a33..b2cc8b03 100644
  
              if(message)
              {
-@@ -7345,8 +8178,34 @@ static void sg_RespawnPlayer(std::istream &s)
+@@ -7345,8 +8035,34 @@ static void sg_RespawnPlayer(std::istream &s)
          }
  }
  
@@ -2337,7 +1373,7 @@ index 78153a33..b2cc8b03 100644
  
  
  static void sg_TeleportPlayer(std::istream &s)
-@@ -7451,6 +8310,36 @@ static void sg_setCycleSpeed(std::istream &s)
+@@ -7451,6 +8167,36 @@ static void sg_setCycleSpeed(std::istream &s)
  }
  static tConfItemFunc sg_setCycleSpeedConf("SET_CYCLE_SPEED", sg_setCycleSpeed);
  
@@ -2375,10 +1411,10 @@ index 78153a33..b2cc8b03 100644
  {
      tString playerStr, rubberStr;
 diff --git a/src/tron/gCycle.h b/src/tron/gCycle.h
-index a003d88a..a942f268 100644
+index a003d88..342caa1 100644
 --- a/src/tron/gCycle.h
 +++ b/src/tron/gCycle.h
-@@ -169,6 +169,26 @@ class gCycle: public gCycleMovement
+@@ -169,6 +169,23 @@ class gCycle: public gCycleMovement
      eSoundPlayer *spark;
  
      REAL spawnTime_;    //!< time the cycle spawned at
@@ -2388,15 +1424,12 @@ index a003d88a..a942f268 100644
 +    REAL freezeSpeed_;  //!< speed to restore when the authoritative hold ends
 +    REAL freezeReleaseStart_; //!< authoritative start of the held-start acceleration ramp
 +    REAL freezeReleaseUntil_; //!< authoritative end of the held-start acceleration ramp
-+    REAL freezeReleaseNextOwnerSync_; //!< next authoritative ramp update for the owning client
-+    unsigned long long freezeClientZeroAccelerationLease_; //!< exact client prediction hold owned by this cycle
++    bool freezeClientZeroAcceleration_; //!< whether this cycle owns a client prediction hold
 +    bool freezeUntilBrake_; //!< whether the next brake-state change releases the hold
 +    bool freezeStartHoldTurns_; //!< whether held turn destinations rotate the cycle in place
 +    bool freezeBrakeActionDown_; //!< last continuous-brake action state during the hold
 +    unsigned short lastStartHoldMessageID_; //!< newest consumed held input acknowledged to the owner
 +    unsigned long long replayToken_; //!< process-local identifier for compact replay events
-+    bool federationGhost_; //!< read-only remote visual proxy; never participates in gameplay
-+    void BeginStartHoldRelease(); //!< align stock-client prediction with the authoritative takeoff
 +    void ApplyStartHoldDirection(int winding, unsigned short turnCount); //!< rotate in place without creating movement or walls
 +    void TurnDuringStartHold(int direction); //!< apply one grid-relative turn while waiting for brake
 +    eCoord lastMovementStartPosition_; //!< start of the last authoritative movement segment
@@ -2405,7 +1438,7 @@ index a003d88a..a942f268 100644
      REAL lastTimeAnim;  //!< last time animation was simulated at
      REAL timeCameIntoView;
  
-@@ -278,6 +298,7 @@ private:
+@@ -278,6 +295,7 @@ private:
      void	SyncFromExtrapolator();							// take over the extrapolator's data
  
      virtual void OnNotifyNewDestination(gDestination *dest);   //!< called when a destination is successfully inserted into the destination list
@@ -2413,7 +1446,7 @@ index a003d88a..a942f268 100644
      virtual void OnDropTempWall        ( gPlayerWall * wall, eCoord const & position, eCoord const & direction );   //!< called when another cycle grinds a wall; this cycle should then drop its current wall if the grinding is too close.
  
      //	unsigned short currentWallID;
-@@ -338,6 +359,7 @@ public:
+@@ -338,6 +356,7 @@ public:
      // virtual void SyncFriend( const eCoord& begWall );    //!< handle sync message for enemy cycles
  
      virtual void ReceiveControl(REAL time,uActionPlayer *Act,REAL x);
@@ -2421,7 +1454,7 @@ index a003d88a..a942f268 100644
      virtual void PrintName(tString &s) const;
      virtual bool ActionOnQuit();
  
-@@ -372,6 +394,18 @@ public:
+@@ -372,6 +391,14 @@ public:
      // const gPlayerWall* LastWall();
  
  	void TeleportTo(eCoord dest, eCoord dir, REAL time);
@@ -2432,24 +1465,20 @@ index a003d88a..a942f268 100644
 +    REAL ExactZoneEntryTime(const eCoord &center, REAL radius, REAL fallback) const;
 +    REAL SpawnTime() const { return spawnTime_; }
 +    unsigned long long ReplayToken() const { return replayToken_; }
-+    bool IsFederationGhost() const { return federationGhost_; }
-+    void ApplyFederationState( const eCoord &position, const eCoord &direction,
-+                               REAL speed, REAL localTime );
-+    void ApplyFederationDeath( REAL localTime );
 +    static void RecordReplaySettingsChange(REAL gameTime); //!< snapshot a settings change at its exact simulation time
      void SetWallBuilding(bool build);
  
  #ifndef DEDICATED
-@@ -418,4 +452,3 @@ extern REAL sg_cycleRespawnZoneRadius, sg_cycleRespawnZoneGrowth;
+@@ -418,4 +445,3 @@ extern REAL sg_cycleRespawnZoneRadius, sg_cycleRespawnZoneGrowth;
  extern bool sg_HideCycles, sg_HideCyclesWalls;
  
  #endif
 -
 diff --git a/src/tron/gCycleMovement.cpp b/src/tron/gCycleMovement.cpp
-index 2d6db292..5c984e56 100644
+index 2d6db29..1354bb7 100644
 --- a/src/tron/gCycleMovement.cpp
 +++ b/src/tron/gCycleMovement.cpp
-@@ -167,6 +167,147 @@ static nSettingItemWatched<REAL> c_sdb("CYCLE_SPEED_DECAY_BELOW",
+@@ -167,6 +167,63 @@ static nSettingItemWatched<REAL> c_sdb("CYCLE_SPEED_DECAY_BELOW",
                                         nConfItemVersionWatcher::Group_Bumpy,
                                         8);
  
@@ -2459,11 +1488,8 @@ index 2d6db292..5c984e56 100644
 +// protocol can send a setting to one peer, so suppress only that peer's
 +// below-base-speed prediction while its cycle is frozen. Server physics keep
 +// using the real value throughout.
-+static unsigned long long sg_clientZeroAccelerationLease[MAXCLIENTS + 2] = {};
-+static bool sg_clientTakeoffPredictionStaged[MAXCLIENTS + 2] = {};
-+static unsigned long long sg_nextClientZeroAccelerationLease = 0;
++static int sg_clientZeroAccelerationHolds[MAXCLIENTS + 2] = {};
 +static nVersionFeature sg_clientZeroAccelerationFeature(8);
-+static nVersionFeature sg_clientMinimumSpeedFeature(9);
 +
 +static void sg_SendClientSpeedDecayBelow(int client, REAL value)
 +{
@@ -2473,131 +1499,50 @@ index 2d6db292..5c984e56 100644
 +    sg_speedCycleDecayBelow = authoritative;
 +}
 +
-+static void sg_SendClientSpeedMin(int client, REAL value)
-+{
-+    REAL const authoritative = sg_speedCycleMin;
-+    sg_speedCycleMin = value;
-+    c_smin.GetSetting().SendConfig(true, client);
-+    sg_speedCycleMin = authoritative;
-+}
-+
-+unsigned long long sg_AcquireClientZeroAcceleration(int client)
++bool sg_AcquireClientZeroAcceleration(int client)
 +{
 +    if (sn_GetNetState() != nSERVER || client <= 0 || client > MAXCLIENTS ||
 +            !sn_Connections[client].socket ||
 +            !sg_clientZeroAccelerationFeature.Supported(client))
-+        return 0;
-+
-+    // Only one prediction override can exist per network peer. Replacing an
-+    // active lease leaves the already-sent zero in place and invalidates the
-+    // old owner; its eventual destructor will then be harmless.
-+    bool const wasActive = sg_clientZeroAccelerationLease[client] != 0;
-+    bool const oldTakeoffStaged =
-+        sg_clientTakeoffPredictionStaged[client];
-+    do
-+    {
-+        ++sg_nextClientZeroAccelerationLease;
-+    }
-+    while (sg_nextClientZeroAccelerationLease == 0);
-+    sg_clientZeroAccelerationLease[client] =
-+        sg_nextClientZeroAccelerationLease;
-+    sg_clientTakeoffPredictionStaged[client] = false;
-+    if (oldTakeoffStaged)
-+    {
-+        sg_SendClientSpeedMin(client, sg_speedCycleMin);
-+        sg_SendClientSpeedDecayBelow(client, 0);
-+    }
-+    else if (!wasActive)
-+        sg_SendClientSpeedDecayBelow(client, 0);
-+    return sg_clientZeroAccelerationLease[client];
-+}
-+
-+bool sg_StageClientTakeoffPrediction(
-+    int client, unsigned long long lease, REAL takeoffSpeed,
-+    REAL speedMultiplier)
-+{
-+    if (sn_GetNetState() != nSERVER || client <= 0 || client > MAXCLIENTS ||
-+            lease == 0 || sg_clientZeroAccelerationLease[client] != lease ||
-+            !sn_Connections[client].socket ||
-+            !sg_clientMinimumSpeedFeature.Supported(client))
 +        return false;
-+    if (sg_clientTakeoffPredictionStaged[client])
-+        return true;
 +
-+    REAL baseSpeed = sg_speedCycle * speedMultiplier;
-+    REAL minimumRatio = sg_speedCycleMin;
-+    if (std::isfinite(takeoffSpeed) && std::isfinite(baseSpeed) &&
-+            takeoffSpeed > 0 && baseSpeed > 0)
-+    {
-+        REAL takeoffRatio = takeoffSpeed / baseSpeed;
-+        if (takeoffRatio > minimumRatio)
-+            minimumRatio = takeoffRatio;
-+    }
-+
-+    // The client initiated the launch, but a stock client does not know that
-+    // this respawn was held. Let its prediction resume at the same takeoff
-+    // speed the server will restore after one estimated one-way trip. The
-+    // authoritative settings and physics remain unchanged on the server.
-+    sg_SendClientSpeedMin(client, minimumRatio);
-+    sg_SendClientSpeedDecayBelow(client, sg_speedCycleDecayBelow);
-+    sg_clientTakeoffPredictionStaged[client] = true;
++    if (sg_clientZeroAccelerationHolds[client]++ == 0)
++        sg_SendClientSpeedDecayBelow(client, 0);
 +    return true;
 +}
 +
-+void sg_ReleaseClientZeroAcceleration(
-+    int client, unsigned long long lease)
++void sg_ReleaseClientZeroAcceleration(int client)
 +{
-+    if (client <= 0 || client > MAXCLIENTS || lease == 0 ||
-+            sg_clientZeroAccelerationLease[client] != lease)
++    if (client <= 0 || client > MAXCLIENTS ||
++            sg_clientZeroAccelerationHolds[client] <= 0)
 +        return;
 +
-+    sg_clientZeroAccelerationLease[client] = 0;
-+    bool const takeoffStaged = sg_clientTakeoffPredictionStaged[client];
-+    sg_clientTakeoffPredictionStaged[client] = false;
-+    if (sn_GetNetState() == nSERVER && sn_Connections[client].socket)
-+    {
-+        if (takeoffStaged)
-+            sg_SendClientSpeedMin(client, sg_speedCycleMin);
++    if (--sg_clientZeroAccelerationHolds[client] == 0 &&
++            sn_GetNetState() == nSERVER && sn_Connections[client].socket)
 +        c_sdb.GetSetting().SendConfig(true, client);
-+    }
 +}
 +
 +void sg_CancelClientZeroAcceleration(int client)
 +{
 +    if (client <= 0 || client > MAXCLIENTS ||
-+            sg_clientZeroAccelerationLease[client] == 0)
++            sg_clientZeroAccelerationHolds[client] <= 0)
 +        return;
 +
-+    // Invalidate the lease before restoring the setting. Any old cycle that
-+    // still remembers this lease can no longer release a future replacement.
-+    sg_clientZeroAccelerationLease[client] = 0;
-+    bool const takeoffStaged = sg_clientTakeoffPredictionStaged[client];
-+    sg_clientTakeoffPredictionStaged[client] = false;
++    sg_clientZeroAccelerationHolds[client] = 0;
 +    if (sn_GetNetState() == nSERVER && sn_Connections[client].socket)
-+    {
-+        if (takeoffStaged)
-+            sg_SendClientSpeedMin(client, sg_speedCycleMin);
 +        c_sdb.GetSetting().SendConfig(true, client);
-+    }
 +}
 +
 +bool sg_ClientZeroAccelerationActive(int client)
 +{
 +    return client > 0 && client <= MAXCLIENTS &&
-+           sg_clientZeroAccelerationLease[client] != 0;
-+}
-+
-+bool sg_ClientZeroAccelerationOwned(
-+    int client, unsigned long long lease)
-+{
-+    return lease != 0 && client > 0 && client <= MAXCLIENTS &&
-+           sg_clientZeroAccelerationLease[client] == lease;
++           sg_clientZeroAccelerationHolds[client] > 0;
 +}
 +
  REAL sg_speedCycleDecayAbove = .1;
  static nSettingItemWatched<REAL> c_sda("CYCLE_SPEED_DECAY_ABOVE",
                                         sg_speedCycleDecayAbove,
-@@ -1310,6 +1451,10 @@ void gCycleMovement::OnNotifyNewDestination( gDestination * dest )
+@@ -1310,6 +1367,10 @@ void gCycleMovement::OnNotifyNewDestination( gDestination * dest )
      }
  }
  
@@ -2608,7 +1553,7 @@ index 2d6db292..5c984e56 100644
  // *******************************************************************************************
  // *
  // *	OnDropTempWall
-@@ -2447,7 +2592,10 @@ bool gCycleMovement::Timestep( REAL currentTime )
+@@ -2447,7 +2508,10 @@ bool gCycleMovement::Timestep( REAL currentTime )
                      }
                      else{
                          AccelerationDiscontinuity();
@@ -2619,50 +1564,31 @@ index 2d6db292..5c984e56 100644
                          if (sn_GetNetState()!=nCLIENT)
                              RequestSync();
                      }
-@@ -4296,6 +4444,12 @@ void gCycleMovement::MyInitAfterCreation( void )
-     brakingReservoir = 1.0f;
-     rubberDepleteTime_ = 0.0f;
- 
-+    // CalculateAcceleration normally resets these before TimestepCore uses
-+    // them. Held-start release ramps intentionally skip that calculation, so
-+    // they must also have a defined value from the moment a cycle is created.
-+    brakeUsage = 0.0f;
-+    rubberUsage = 0.0f;
-+
-     braking = false;
- 
-     uncannyTimingToReport_ = false;
-@@ -4550,4 +4704,3 @@ static void sg_FillCyclePhysics()
+@@ -4550,4 +4614,3 @@ static void sg_FillCyclePhysics()
  }
  
  static nCallbackFillServerInfo sg_fillCyclePhysics(sg_FillCyclePhysics);
 -
 diff --git a/src/tron/gCycleMovement.h b/src/tron/gCycleMovement.h
-index 849d9930..8989e219 100644
+index 849d993..1c701ad 100644
 --- a/src/tron/gCycleMovement.h
 +++ b/src/tron/gCycleMovement.h
-@@ -50,6 +50,20 @@ private:
+@@ -50,6 +50,14 @@ private:
  
  REAL GetTurnSpeedFactor(void);
  
 +//! Temporarily suppress below-base-speed prediction on one legacy client.
-+//! The returned lease identifies the exact hold that owns the override, so a
-+//! delayed old cycle cannot release a newer cycle's hold on the same client.
 +//! These use the existing per-peer network configuration protocol and never
 +//! alter authoritative server physics.
-+unsigned long long sg_AcquireClientZeroAcceleration(int client);
-+bool sg_StageClientTakeoffPrediction(
-+    int client, unsigned long long lease, REAL takeoffSpeed,
-+    REAL speedMultiplier);
-+void sg_ReleaseClientZeroAcceleration(int client, unsigned long long lease);
++bool sg_AcquireClientZeroAcceleration(int client);
++void sg_ReleaseClientZeroAcceleration(int client);
 +void sg_CancelClientZeroAcceleration(int client);
 +bool sg_ClientZeroAccelerationActive(int client);
-+bool sg_ClientZeroAccelerationOwned(int client, unsigned long long lease);
 +
  class gEnemyInfluence{
  private:
      nObserverPtr< ePlayerNetID >	lastEnemyInfluence;  	// the last enemy wall we encountered
-@@ -173,6 +187,8 @@ protected:
+@@ -173,6 +181,8 @@ protected:
      // destination handling
      REAL                    DistanceToDestination   ( gDestination &        dest        ) const     ;   //!< calculates the distance to the given destination
      virtual void            OnNotifyNewDestination  ( gDestination *        dest        )           ;   //!< notifies cycle of the insertion of a new destination
@@ -2672,678 +1598,10 @@ index 849d9930..8989e219 100644
              ,                                         eCoord const &        pos
              ,                                         eCoord const &        dir         )           ;   //!< called when another cycle grinds a wall; this cycle should then drop its current wall if the grinding is too close.
 diff --git a/src/tron/gGame.cpp b/src/tron/gGame.cpp
-index a1d74d73..b7bba460 100644
+index a1d74d7..9320b44 100644
 --- a/src/tron/gGame.cpp
 +++ b/src/tron/gGame.cpp
-@@ -68,6 +68,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
- #include "gZone.h"
- #include "eVoter.h"
- #include "tRecorder.h"
-+#include "tReferenceHolder.h"
- #include "gSvgOutput.h"
- #include "rScreen.h"
- 
-@@ -80,10 +81,26 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
- 
- #include <math.h>
- #include <stdlib.h>
-+#include <chrono>
-+#include <cstdio>
- #include <string>
- #include <fstream>
- #include <ctype.h>
- #include <time.h>
-+#include <cerrno>
-+#include <cstring>
-+#include <limits>
-+#include <map>
-+#include <sstream>
-+#include <vector>
-+
-+#ifndef WIN32
-+#include <fcntl.h>
-+#include <sys/socket.h>
-+#include <sys/stat.h>
-+#include <sys/un.h>
-+#include <unistd.h>
-+#endif
- 
- #include "gRotation.h"
- #include "nSocket.h"
-@@ -132,6 +149,24 @@ static tSettingItem< bool > sg_waitForExternalScriptConf( "WAIT_FOR_EXTERNAL_SCR
- static REAL sg_waitForExternalScriptTimeout = 3;
- static tSettingItem<REAL> sg_waitForExternalScriptTimeoutConf( "WAIT_FOR_EXTERNAL_SCRIPT_TIMEOUT", sg_waitForExternalScriptTimeout );
- 
-+// Federated racing nodes finish loading at different times because each waits
-+// for its own clients and grid objects. Hold the final transition into play
-+// until both controllers provide the same short wall-clock release deadline.
-+static bool sg_federationRoundSync = false;
-+static tSettingItem<bool> sg_federationRoundSyncConf(
-+    "FEDERATION_ROUND_SYNC", sg_federationRoundSync
-+);
-+
-+static tString sg_federationRoundReleaseAt("0");
-+static tSettingItem<tString> sg_federationRoundReleaseAtConf(
-+    "FEDERATION_ROUND_RELEASE_AT", sg_federationRoundReleaseAt
-+);
-+
-+static REAL sg_federationRoundSyncTimeout = 8.0f;
-+static tSettingItem<REAL> sg_federationRoundSyncTimeoutConf(
-+    "FEDERATION_ROUND_SYNC_TIMEOUT", sg_federationRoundSyncTimeout
-+);
-+
- static REAL sg_svgOutputFreq = -1;
- static tSettingItem<REAL> sg_svgOutputFreqConf( "SVG_OUTPUT_TIMING", sg_svgOutputFreq );
- 
-@@ -1034,6 +1069,607 @@ static float sg_playerGridPosInterval=1;
- static tSettingItem<float> sggpi("PLAYER_GRIDPOS_INTERVAL",
-                                  sg_playerGridPosInterval);
- 
-+// Disabled by default. Federation releases enable this only on an explicitly
-+// configured publisher; the exporter itself is nonblocking and local-only.
-+static float sg_federationExportInterval=-1;
-+static tSettingItem<float> sg_federationExportIntervalConf(
-+    "FEDERATION_EXPORT_INTERVAL", sg_federationExportInterval);
-+
-+static tCONTROLLED_PTR(gGame) sg_currentGame;
-+
-+static bool sg_federationImportEnabled = false;
-+static tSettingItem<bool> sg_federationImportEnabledConf(
-+    "FEDERATION_IMPORT_ENABLED", sg_federationImportEnabled);
-+static tString sg_federationImportSocket(
-+    "/run/tronner-federation/engine-import.sock");
-+static tConfItemLine sg_federationImportSocketConf(
-+    "FEDERATION_IMPORT_SOCKET", sg_federationImportSocket);
-+static tString sg_federationGhostLabel("REMOTE");
-+static tConfItemLine sg_federationGhostLabelConf(
-+    "FEDERATION_GHOST_LABEL", sg_federationGhostLabel);
-+static REAL sg_federationGhostTimeout = 3.0;
-+static tSettingItem<REAL> sg_federationGhostTimeoutConf(
-+    "FEDERATION_GHOST_TIMEOUT", sg_federationGhostTimeout);
-+static int sg_federationGhostLimit = 64;
-+static tSettingItem<int> sg_federationGhostLimitConf(
-+    "FEDERATION_GHOST_LIMIT", sg_federationGhostLimit);
-+
-+#ifndef WIN32
-+struct sg_FederationGhost
-+{
-+    ePlayerNetID *player;
-+    std::string visibleName;
-+    unsigned long long observedNS;
-+    unsigned long long metadataNS;
-+    unsigned long long flagsNS;
-+    unsigned long long colorNS;
-+    double lastSeen;
-+    int cycleRed;
-+    int cycleGreen;
-+    int cycleBlue;
-+    REAL effectiveRed;
-+    REAL effectiveGreen;
-+    REAL effectiveBlue;
-+    bool hasEffectiveColor;
-+
-+    sg_FederationGhost()
-+        : player(0), observedNS(0), metadataNS(0), flagsNS(0), colorNS(0),
-+          lastSeen(0), cycleRed(-1), cycleGreen(-1), cycleBlue(-1),
-+          effectiveRed(1), effectiveGreen(1), effectiveBlue(1),
-+          hasEffectiveColor(false)
-+    {
-+    }
-+};
-+
-+typedef std::map<std::string, sg_FederationGhost> sg_FederationGhostMap;
-+static sg_FederationGhostMap sg_federationGhosts;
-+static tReferenceHolder<ePlayerNetID> sg_federationGhostReferences;
-+static int sg_federationImportFD = -1;
-+static std::string sg_federationBoundPath;
-+
-+static bool sg_FederationHexDecode( std::string const &encoded,
-+                                    std::string &decoded,
-+                                    size_t maximumBytes )
-+{
-+    if ( encoded == "-" )
-+    {
-+        decoded.clear();
-+        return true;
-+    }
-+    if ( encoded.empty() || encoded.size() % 2 ||
-+         encoded.size() > maximumBytes * 2 )
-+        return false;
-+
-+    decoded.clear();
-+    decoded.reserve( encoded.size() / 2 );
-+    for ( size_t index = 0; index < encoded.size(); index += 2 )
-+    {
-+        int value = 0;
-+        for ( int digit = 0; digit < 2; ++digit )
-+        {
-+            char character = encoded[index + digit];
-+            value *= 16;
-+            if ( character >= '0' && character <= '9' )
-+                value += character - '0';
-+            else if ( character >= 'a' && character <= 'f' )
-+                value += character - 'a' + 10;
-+            else
-+                return false;
-+        }
-+        if ( value == 0 || value == '\n' || value == '\r' )
-+            return false;
-+        decoded.push_back( static_cast<char>( value ) );
-+    }
-+    return true;
-+}
-+
-+static std::string sg_FederationSafeLabel()
-+{
-+    std::string raw( static_cast<char const *>( sg_federationGhostLabel ) );
-+    std::string safe;
-+    for ( std::string::const_iterator character = raw.begin();
-+          character != raw.end() && safe.size() < 12; ++character )
-+    {
-+        if ( (*character >= 'A' && *character <= 'Z') ||
-+             (*character >= 'a' && *character <= 'z') ||
-+             (*character >= '0' && *character <= '9') ||
-+             *character == '_' || *character == '-' )
-+            safe.push_back( *character );
-+    }
-+    return safe.empty() ? std::string("REMOTE") : safe;
-+}
-+
-+static void sg_RemoveFederationGhost( sg_FederationGhostMap::iterator ghost )
-+{
-+    ePlayerNetID *player = ghost->second.player;
-+    if ( player )
-+    {
-+        gCycle *cycle = dynamic_cast<gCycle *>( player->Object() );
-+        if ( cycle )
-+            cycle->ApplyFederationDeath( se_GameTime() );
-+        player->RemoveFromGame();
-+        sg_federationGhostReferences.Remove( player );
-+    }
-+    sg_federationGhosts.erase( ghost );
-+}
-+
-+static void sg_ClearFederationGhosts()
-+{
-+    while ( !sg_federationGhosts.empty() )
-+        sg_RemoveFederationGhost( sg_federationGhosts.begin() );
-+    sg_federationGhostReferences.ReleaseAll();
-+}
-+
-+static void sg_CloseFederationImport( bool clearGhosts )
-+{
-+    if ( sg_federationImportFD >= 0 )
-+    {
-+        close( sg_federationImportFD );
-+        sg_federationImportFD = -1;
-+    }
-+    if ( !sg_federationBoundPath.empty() )
-+    {
-+        unlink( sg_federationBoundPath.c_str() );
-+        sg_federationBoundPath.clear();
-+    }
-+    if ( clearGhosts )
-+        sg_ClearFederationGhosts();
-+}
-+
-+static bool sg_OpenFederationImport()
-+{
-+    std::string path( static_cast<char const *>( sg_federationImportSocket ) );
-+    if ( path.empty() || path.size() >= sizeof(((sockaddr_un *)0)->sun_path) )
-+        return false;
-+    if ( sg_federationImportFD >= 0 && path == sg_federationBoundPath )
-+        return true;
-+    sg_CloseFederationImport( false );
-+
-+    int fd = socket( AF_UNIX, SOCK_DGRAM, 0 );
-+    if ( fd < 0 )
-+        return false;
-+    int flags = fcntl( fd, F_GETFL, 0 );
-+    if ( flags < 0 || fcntl( fd, F_SETFL, flags | O_NONBLOCK ) < 0 )
-+    {
-+        close( fd );
-+        return false;
-+    }
-+    int descriptorFlags = fcntl( fd, F_GETFD, 0 );
-+    if ( descriptorFlags >= 0 )
-+        fcntl( fd, F_SETFD, descriptorFlags | FD_CLOEXEC );
-+
-+    sockaddr_un address;
-+    std::memset( &address, 0, sizeof(address) );
-+    address.sun_family = AF_UNIX;
-+    std::memcpy( address.sun_path, path.c_str(), path.size() + 1 );
-+    unlink( path.c_str() );
-+    if ( bind( fd, reinterpret_cast<sockaddr *>( &address ), sizeof(address) ) < 0 )
-+    {
-+        close( fd );
-+        return false;
-+    }
-+    chmod( path.c_str(), 0660 );
-+    sg_federationImportFD = fd;
-+    sg_federationBoundPath = path;
-+    return true;
-+}
-+
-+static bool sg_FederationValidIdentity( std::string const &identity )
-+{
-+    if ( identity.empty() || identity.size() > 512 || identity.size() % 2 )
-+        return false;
-+    for ( std::string::const_iterator character = identity.begin();
-+          character != identity.end(); ++character )
-+        if ( !( (*character >= '0' && *character <= '9') ||
-+                (*character >= 'a' && *character <= 'f') ) )
-+            return false;
-+    return true;
-+}
-+
-+static sg_FederationGhostMap::iterator sg_FederationFindOrCreate(
-+    std::string const &identity )
-+{
-+    sg_FederationGhostMap::iterator found = sg_federationGhosts.find( identity );
-+    if ( found != sg_federationGhosts.end() )
-+        return found;
-+    int limit = sg_federationGhostLimit;
-+    if ( limit < 1 || limit > 512 ||
-+         static_cast<int>( sg_federationGhosts.size() ) >= limit )
-+        return sg_federationGhosts.end();
-+    return sg_federationGhosts.insert(
-+        std::make_pair( identity, sg_FederationGhost() ) ).first;
-+}
-+
-+static bool sg_FederationApplyMetadata(
-+    sg_FederationGhost &ghost,
-+    std::string const &labelHex,
-+    std::string const &displayHex,
-+    std::string const &coloredHex,
-+    std::string const &authenticatedHex,
-+    int red, int green, int blue,
-+    double ping )
-+{
-+    std::string label, display, colored, authenticated;
-+    if ( red < 0 || red > 15 || green < 0 || green > 15 ||
-+         blue < 0 || blue > 15 || !std::isfinite( ping ) ||
-+         ping < 0 || ping > 30 ||
-+         ( !labelHex.empty() &&
-+           !sg_FederationHexDecode( labelHex, label, 16 ) ) ||
-+         !sg_FederationHexDecode( displayHex, display, 128 ) ||
-+         !sg_FederationHexDecode( coloredHex, colored, 256 ) ||
-+         !sg_FederationHexDecode( authenticatedHex, authenticated, 128 ) ||
-+        display.empty() )
-+        return false;
-+
-+    if ( label.empty() )
-+        label = sg_FederationSafeLabel();
-+    if ( label.empty() || label.size() > 16 )
-+        return false;
-+    for ( std::string::const_iterator character = label.begin();
-+          character != label.end(); ++character )
-+        if ( !( ( *character >= 'a' && *character <= 'z' ) ||
-+                ( *character >= 'A' && *character <= 'Z' ) ||
-+                ( *character >= '0' && *character <= '9' ) ||
-+                *character == '_' || *character == '-' ) )
-+            return false;
-+    bool created = !ghost.player;
-+    if ( created )
-+    {
-+        ghost.player = tNEW(ePlayerNetID)();
-+        ghost.player->SetFederationGhost( true );
-+        sg_federationGhostReferences.Add( ghost.player );
-+    }
-+    ghost.player->SetFederationLabel( tString( label.c_str() ) );
-+    bool sync = created ||
-+        ghost.player->r != static_cast<unsigned short>( red ) ||
-+        ghost.player->g != static_cast<unsigned short>( green ) ||
-+        ghost.player->b != static_cast<unsigned short>( blue ) ||
-+        fabs( ghost.player->ping - ping ) > .0005;
-+    if ( ghost.player->FederationGlobalID() !=
-+         tString( authenticated.c_str() ) )
-+    {
-+        ghost.player->SetFederationGlobalID(
-+            tString( authenticated.c_str() ) );
-+        sync = true;
-+    }
-+    ghost.player->r = static_cast<unsigned short>( red );
-+    ghost.player->g = static_cast<unsigned short>( green );
-+    ghost.player->b = static_cast<unsigned short>( blue );
-+    ghost.player->ping = static_cast<REAL>( ping );
-+    std::string expectedPrefix = "[" + label + "] ";
-+    std::string coloredPrefix =
-+        "0x66ccff[" + label + "] 0xffffff";
-+    tString plainColored = tColoredString::RemoveColors(
-+        tString( colored.c_str() ) );
-+    std::string plain( static_cast<char const *>( plainColored ) );
-+    bool alreadyTagged = !plain.empty() &&
-+        plain.compare( 0, expectedPrefix.size(), expectedPrefix ) == 0;
-+    std::string visible = colored.empty() ? display : colored;
-+    if ( alreadyTagged )
-+    {
-+        // Normalize payloads produced by the previous federation build. The
-+        // recipient's WriteSync call now decides whether this peer label is
-+        // visible, so the ghost's canonical name must remain untagged.
-+        if ( visible.compare( 0, coloredPrefix.size(), coloredPrefix ) == 0 )
-+            visible.erase( 0, coloredPrefix.size() );
-+        else
-+            visible = display;
-+    }
-+    if ( visible != ghost.visibleName )
-+    {
-+        ghost.player->SetName( tString( visible.c_str() ) );
-+        ghost.visibleName = visible;
-+        sync = true;
-+    }
-+    if ( sync )
-+        ghost.player->RequestSync();
-+    if ( created )
-+        nNetObject::SyncAll();
-+    return true;
-+}
-+
-+static void sg_ApplyFederationGhostLine( std::string const &line )
-+{
-+    std::istringstream input( line );
-+    std::string version, action, identity, displayHex, coloredHex, extra;
-+    if ( !( input >> version >> action ) ||
-+         ( version != "GHOST_V1" && version != "GHOST_V2" &&
-+           version != "GHOST_V3" ) )
-+        return;
-+    bool metadataV2 = version == "GHOST_V2" || version == "GHOST_V3";
-+    bool metadataV3 = version == "GHOST_V3";
-+
-+    if ( action == "CHAT" )
-+    {
-+        std::string messageHex, message;
-+        if ( !( input >> identity >> messageHex ) || ( input >> extra ) ||
-+             !sg_FederationValidIdentity( identity ) ||
-+             !sg_FederationHexDecode( messageHex, message, 512 ) ||
-+             message.empty() )
-+            return;
-+        sg_FederationGhostMap::iterator found = sg_federationGhosts.find( identity );
-+        if ( found != sg_federationGhosts.end() && found->second.player )
-+        {
-+            found->second.lastSeen = tSysTimeFloat();
-+            found->second.player->FederationChat( tString( message.c_str() ) );
-+        }
-+        return;
-+    }
-+
-+    if ( action == "FLAGS" )
-+    {
-+        unsigned long long observedNS = 0;
-+        int chatting = 0;
-+        if ( !( input >> identity >> observedNS >> chatting ) ||
-+             ( input >> extra ) ||
-+             !sg_FederationValidIdentity( identity ) || observedNS == 0 ||
-+             ( chatting != 0 && chatting != 1 ) )
-+            return;
-+        sg_FederationGhostMap::iterator found =
-+            sg_federationGhosts.find( identity );
-+        if ( found != sg_federationGhosts.end() && found->second.player &&
-+             observedNS > found->second.flagsNS )
-+        {
-+            found->second.flagsNS = observedNS;
-+            found->second.lastSeen = tSysTimeFloat();
-+            found->second.player->SetChatting(
-+                ePlayerNetID::ChatFlags_Away, chatting != 0 );
-+        }
-+        return;
-+    }
-+
-+    if ( action == "COLOR" )
-+    {
-+        unsigned long long observedNS = 0;
-+        double red = 0, green = 0, blue = 0;
-+        if ( !( input >> identity >> observedNS >> red >> green >> blue ) ||
-+             ( input >> extra ) ||
-+             !sg_FederationValidIdentity( identity ) || observedNS == 0 ||
-+             !std::isfinite( red ) || !std::isfinite( green ) ||
-+             !std::isfinite( blue ) || red < 0 || red > 4 || green < 0 ||
-+             green > 4 || blue < 0 || blue > 4 )
-+            return;
-+        sg_FederationGhostMap::iterator found =
-+            sg_federationGhosts.find( identity );
-+        if ( found != sg_federationGhosts.end() && found->second.player &&
-+             observedNS > found->second.colorNS )
-+        {
-+            sg_FederationGhost &ghost = found->second;
-+            bool changed = !ghost.hasEffectiveColor ||
-+                fabs( ghost.effectiveRed - red ) > .0005 ||
-+                fabs( ghost.effectiveGreen - green ) > .0005 ||
-+                fabs( ghost.effectiveBlue - blue ) > .0005;
-+            ghost.colorNS = observedNS;
-+            ghost.lastSeen = tSysTimeFloat();
-+            ghost.effectiveRed = static_cast<REAL>( red );
-+            ghost.effectiveGreen = static_cast<REAL>( green );
-+            ghost.effectiveBlue = static_cast<REAL>( blue );
-+            ghost.hasEffectiveColor = true;
-+            gCycle *cycle = dynamic_cast<gCycle *>( ghost.player->Object() );
-+            if ( changed && cycle )
-+            {
-+                ghost.player->ClearObject();
-+                ghost.cycleRed = ghost.cycleGreen = ghost.cycleBlue = -1;
-+            }
-+        }
-+        return;
-+    }
-+
-+    int red = 15, green = 15, blue = 15;
-+    double ping = 0;
-+    unsigned long long observedNS = 0;
-+    if ( action == "PRESENCE" )
-+    {
-+        int connected = 0;
-+        std::string authenticatedHex = "-";
-+        std::string labelHex;
-+        if ( metadataV3 && !( input >> identity >> labelHex ) )
-+            return;
-+        bool parsed = metadataV2
-+            ? static_cast<bool>( ( metadataV3 ? input : input >> identity ) >>
-+                                 displayHex >> coloredHex >>
-+                                 authenticatedHex >> red >> green >> blue >> ping >>
-+                                 observedNS >> connected )
-+            : static_cast<bool>( input >> identity >> displayHex >> coloredHex >>
-+                                 red >> green >> blue >> ping >> observedNS >> connected );
-+        if ( !parsed || ( input >> extra ) ||
-+             !sg_FederationValidIdentity( identity ) || observedNS == 0 ||
-+             ( connected != 0 && connected != 1 ) )
-+            return;
-+        sg_FederationGhostMap::iterator found = sg_federationGhosts.find( identity );
-+        if ( !connected )
-+        {
-+            if ( found != sg_federationGhosts.end() &&
-+                 observedNS > found->second.metadataNS )
-+                sg_RemoveFederationGhost( found );
-+            return;
-+        }
-+        found = sg_FederationFindOrCreate( identity );
-+        if ( found == sg_federationGhosts.end() ||
-+             observedNS <= found->second.metadataNS ||
-+             !sg_FederationApplyMetadata(
-+                 found->second, labelHex, displayHex, coloredHex, authenticatedHex,
-+                 red, green, blue, ping ) )
-+            return;
-+        found->second.metadataNS = observedNS;
-+        found->second.lastSeen = tSysTimeFloat();
-+        return;
-+    }
-+
-+    int alive = 0;
-+    double remoteGameTime = 0, x = 0, y = 0, xdir = 0, ydir = 0, speed = 0;
-+    std::string authenticatedHex = "-";
-+    std::string labelHex;
-+    if ( metadataV3 && !( input >> identity >> labelHex ) )
-+        return;
-+    bool parsed = metadataV2
-+        ? static_cast<bool>( ( metadataV3 ? input : input >> identity ) >>
-+                             displayHex >> coloredHex >>
-+                             authenticatedHex >> red >> green >> blue >> ping >>
-+                             observedNS >> remoteGameTime >> x >> y >> xdir >>
-+                             ydir >> speed >> alive )
-+        : static_cast<bool>( input >> identity >> displayHex >> coloredHex >>
-+                             red >> green >> blue >> ping >> observedNS >>
-+                             remoteGameTime >> x >> y >> xdir >> ydir >> speed >> alive );
-+    if ( action != "STATE" || !parsed || ( input >> extra ) ||
-+         !sg_FederationValidIdentity( identity ) || observedNS == 0 ||
-+         ( alive != 0 && alive != 1 ) ||
-+         !std::isfinite( remoteGameTime ) || !std::isfinite( x ) ||
-+         !std::isfinite( y ) || !std::isfinite( xdir ) ||
-+         !std::isfinite( ydir ) || !std::isfinite( speed ) ||
-+         fabs( x ) > 10000000 || fabs( y ) > 10000000 ||
-+         speed < 0 || speed > 1000000 ||
-+         ( alive && xdir * xdir + ydir * ydir < EPS ) )
-+        return;
-+
-+    sg_FederationGhostMap::iterator found = sg_FederationFindOrCreate( identity );
-+    if ( found == sg_federationGhosts.end() ||
-+         observedNS <= found->second.observedNS ||
-+         !sg_FederationApplyMetadata(
-+             found->second, labelHex, displayHex, coloredHex, authenticatedHex,
-+             red, green, blue, ping ) )
-+        return;
-+    sg_FederationGhost &ghost = found->second;
-+    ghost.observedNS = observedNS;
-+    if ( observedNS > ghost.metadataNS )
-+        ghost.metadataNS = observedNS;
-+    ghost.lastSeen = tSysTimeFloat();
-+
-+    gCycle *cycle = dynamic_cast<gCycle *>( ghost.player->Object() );
-+    // Cycle color is transmitted only in its create message. If color metadata
-+    // arrived after creation, replace the visual proxy on the next motion state.
-+    if ( cycle && ( ghost.cycleRed != red || ghost.cycleGreen != green ||
-+                    ghost.cycleBlue != blue ) )
-+    {
-+        ghost.player->ClearObject();
-+        cycle = 0;
-+        ghost.cycleRed = ghost.cycleGreen = ghost.cycleBlue = -1;
-+    }
-+    if ( !alive )
-+    {
-+        if ( cycle )
-+        {
-+            cycle->ApplyFederationDeath( se_GameTime() );
-+            ghost.player->ClearObject();
-+        }
-+        ghost.cycleRed = ghost.cycleGreen = ghost.cycleBlue = -1;
-+        ghost.player->RequestSync();
-+        return;
-+    }
-+
-+    eGrid *grid = eGrid::CurrentGrid();
-+    if ( !sg_currentGame || !grid )
-+        return;
-+    eCoord position( static_cast<REAL>( x * gArena::SizeMultiplier() ),
-+                     static_cast<REAL>( y * gArena::SizeMultiplier() ) );
-+    eCoord direction( static_cast<REAL>( xdir ), static_cast<REAL>( ydir ) );
-+    if ( !cycle || !cycle->Alive() )
-+    {
-+        if ( cycle )
-+            ghost.player->ClearObject();
-+        cycle = new gCycle( grid, position, direction, ghost.player );
-+        if ( ghost.hasEffectiveColor )
-+        {
-+            cycle->color_.r = ghost.effectiveRed;
-+            cycle->color_.g = ghost.effectiveGreen;
-+            cycle->color_.b = ghost.effectiveBlue;
-+            cycle->trailColor_ = cycle->color_;
-+        }
-+        ghost.player->ControlObject( cycle );
-+        ghost.cycleRed = red;
-+        ghost.cycleGreen = green;
-+        ghost.cycleBlue = blue;
-+        nNetObject::SyncAll();
-+    }
-+    cycle->ApplyFederationState( position, direction,
-+                                 static_cast<REAL>( speed ), se_GameTime() );
-+}
-+
-+static void sg_FederationImportPoll()
-+{
-+    if ( !sg_federationImportEnabled || sn_GetNetState() != nSERVER )
-+    {
-+        if ( sg_federationImportFD >= 0 || !sg_federationGhosts.empty() )
-+            sg_CloseFederationImport( true );
-+        return;
-+    }
-+    if ( !sg_OpenFederationImport() )
-+        return;
-+
-+    for ( int count = 0; count < 256; ++count )
-+    {
-+        char buffer[4097];
-+        ssize_t length = recv( sg_federationImportFD, buffer,
-+                               sizeof(buffer) - 1, MSG_DONTWAIT );
-+        if ( length < 0 )
-+        {
-+            if ( errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR )
-+                sg_CloseFederationImport( false );
-+            break;
-+        }
-+        if ( length == 0 || length >= static_cast<ssize_t>( sizeof(buffer) ) )
-+            continue;
-+        buffer[length] = 0;
-+        sg_ApplyFederationGhostLine( std::string( buffer, length ) );
-+    }
-+
-+    double timeout = sg_federationGhostTimeout;
-+    if ( !std::isfinite( timeout ) || timeout < .5 )
-+        timeout = .5;
-+    double now = tSysTimeFloat();
-+    sg_FederationGhostMap::iterator ghost = sg_federationGhosts.begin();
-+    while ( ghost != sg_federationGhosts.end() )
-+    {
-+        sg_FederationGhostMap::iterator current = ghost++;
-+        if ( now - current->second.lastSeen > timeout )
-+            sg_RemoveFederationGhost( current );
-+    }
-+}
-+#else
-+static void sg_FederationImportPoll()
-+{
-+}
-+#endif
-+
-+static void sg_FederationImportStats( std::istream & )
-+{
-+#ifndef WIN32
-+    int cycles = 0;
-+    int trails = 0;
-+    int idle = 0;
-+    int exactColors = 0;
-+    for ( sg_FederationGhostMap::const_iterator ghost = sg_federationGhosts.begin();
-+          ghost != sg_federationGhosts.end(); ++ghost )
-+    {
-+        gCycle *cycle = ghost->second.player
-+            ? dynamic_cast<gCycle *>( ghost->second.player->Object() ) : 0;
-+        if ( ghost->second.player && ghost->second.player->IsChatting() )
-+            ++idle;
-+        if ( cycle )
-+        {
-+            ++cycles;
-+            if ( cycle->CurrentWall() )
-+                ++trails;
-+            if ( ghost->second.hasEffectiveColor &&
-+                 fabs( cycle->color_.r - ghost->second.effectiveRed ) < .0005 &&
-+                 fabs( cycle->color_.g - ghost->second.effectiveGreen ) < .0005 &&
-+                 fabs( cycle->color_.b - ghost->second.effectiveBlue ) < .0005 )
-+                ++exactColors;
-+        }
-+    }
-+    con << "Federation import: " << sg_federationGhosts.size()
-+        << " remote players, " << cycles << " visible cycles, " << trails
-+        << " trails, socket "
-+        << ( sg_federationImportFD >= 0 ? "ready" : "closed" ) << ".\n";
-+    con << "Federation idle indicators: " << idle << ".\n";
-+    con << "Federation cycle colors: " << exactColors << " exact.\n";
-+#else
-+    con << "Federation import is unavailable on this platform.\n";
-+#endif
-+}
-+static tConfItemFunc sg_federationImportStatsConf(
-+    "FEDERATION_IMPORT_STATS", &sg_FederationImportStats);
-+
- static float sg_zoneGridPosInterval=1;
- static tSettingItem<float> sggzi("ZONE_GRIDPOS_INTERVAL",
-                                  sg_zoneGridPosInterval);
-@@ -1274,6 +1910,7 @@ void gDelayCommand::Run(REAL currentTime)
+@@ -1274,6 +1274,7 @@ void gDelayCommand::Run(REAL currentTime)
  
              std::stringstream st(delayCmd->Command());
              tConfItemBase::LoadAll(st); // run command if it's not too old, otherwise, just skip it ...
@@ -3351,16 +1609,7 @@ index a1d74d73..b7bba460 100644
  
              if(delayCmd->Interval() > 0) delayCmd->Update();
              else delayedCommands_.erase(it);
-@@ -1416,8 +2053,6 @@ void check_hs(){
- }
- 
- 
--static tCONTROLLED_PTR(gGame) sg_currentGame;
--
- void sg_OutputOnlinePlayers()
- {
-     //! Send to /var/online_players.txt
-@@ -1634,6 +2269,31 @@ static tSettingItem<bool> gamestateWaitEnabledConf("GAME_WAIT_PLAYERS_ENABLED",
+@@ -1634,6 +1635,31 @@ static tSettingItem<bool> gamestateWaitEnabledConf("GAME_WAIT_PLAYERS_ENABLED",
  static int gameSinglePlayerHumans=1;
  static tSettingItem<int> gameSinglePlayerHumansConf("GAME_SP_HUMANS", gameSinglePlayerHumans);
  
@@ -3392,24 +1641,7 @@ index a1d74d73..b7bba460 100644
  static void sg_endChallenge();
  void update_settings( bool const * goon )
  {
-@@ -1649,6 +2309,8 @@ void update_settings( bool const * goon )
-             while ( sg_NumHumans() <= 0 && sg_NumUsers() > 0 && ( !goon || *goon ) && uMenu::quickexit == uMenu::QuickExit_Off )
-             {
-                 if(!gamestateWaitEnabled) break;
-+
-+                sg_FederationImportPoll();
-                 
-                 if ( !restarted && bool(sg_currentGame) )
-                 {
-@@ -2244,6 +2906,7 @@ void sg_HostGame(){
-         while(numPlayers == 0 &&
-                 (ded_idle <= 0.0f || tSysTimeFloat()<startTime + ded_idle * 3600 ) && !uMenu::quickexit ){
-             sr_Read_stdin();
-+            sg_FederationImportPoll();
-             st_DoToDo();
-             gGame::NetSyncIdle();
- 
-@@ -2880,23 +3543,54 @@ static tConfItemFunc exit_conf("EXIT",&Quit_conf);
+@@ -2880,23 +2906,54 @@ static tConfItemFunc exit_conf("EXIT",&Quit_conf);
  ShutDownCounter::ShutDownCounter()
  {
      isActive_ = false;
@@ -3464,7 +1696,7 @@ index a1d74d73..b7bba460 100644
      if ( sg_currentGame )
      {
          sg_currentGame->NoLongerGoOn();
-@@ -2931,7 +3625,7 @@ static void sg_ShutDownParse(std::istream &s)
+@@ -2931,7 +2988,7 @@ static void sg_ShutDownParse(std::istream &s)
  
          sg_ShutDown->SetTimeout(timeout);
          sg_ShutDown->Start();
@@ -3473,7 +1705,7 @@ index a1d74d73..b7bba460 100644
      }
      else
      {
-@@ -3637,6 +4331,19 @@ extern REAL sent_per_messid[100];
+@@ -3637,6 +3694,19 @@ extern REAL sent_per_messid[100];
  static REAL lastdeath=0;
  static bool roundOver=false;   // flag set when the round winner is declared
  
@@ -3493,118 +1725,7 @@ index a1d74d73..b7bba460 100644
  static void sg_VoteMenuIdle()
  {
      if ( !uMenu::MenuActive() )
-@@ -3651,6 +4358,12 @@ static eLadderLogWriter sg_newRoundWriter("NEW_ROUND", true);
- static eLadderLogWriter sg_newSetWriter("NEW_SET", true);
- static eLadderLogWriter sg_newMatchWriter("NEW_MATCH", true);
- static eLadderLogWriter sg_waitForExternalScriptWriter("WAIT_FOR_EXTERNAL_SCRIPT", true);
-+static eLadderLogWriter sg_federationRoundReadyWriter(
-+    "FEDERATION_ROUND_READY", true
-+);
-+static eLadderLogWriter sg_federationRoundReleasedWriter(
-+    "FEDERATION_ROUND_RELEASED", true
-+);
- static eLadderLogWriter sg_nextRoundWriter("NEXT_ROUND", false);
- static eLadderLogWriter sg_roundCommencingWriter("ROUND_COMMENCING", false);
- static SvgOutput sg_svgOutput;
-@@ -3659,6 +4372,71 @@ static eLadderLogWriter sg_roundFinishedWriter("ROUND_FINISHED", true);
- static eLadderLogWriter sg_roundEndedWriter("ROUND_ENDED", true);
- static eLadderLogWriter sg_roundStartedWriter("ROUND_STARTED", true);
- 
-+#ifdef DEDICATED
-+static void sg_WaitForFederationRoundRelease()
-+{
-+    if ( sn_GetNetState() != nSERVER || !sg_federationRoundSync )
-+    {
-+        return;
-+    }
-+
-+    // A release from an earlier round must never open this gate. The
-+    // controller sends the new release only after receiving this round's
-+    // READY event from both nodes.
-+    sg_federationRoundReleaseAt = "0";
-+    double readyAt = std::chrono::duration<double>(
-+        std::chrono::system_clock::now().time_since_epoch()
-+    ).count();
-+    char readyAtText[32];
-+    std::snprintf( readyAtText, sizeof(readyAtText), "%.6f", readyAt );
-+    sg_federationRoundReadyWriter << mapfile << readyAtText;
-+    sg_federationRoundReadyWriter.write();
-+
-+    double timeout = tRealSysTimeFloat()
-+        + ( sg_federationRoundSyncTimeout > 0
-+            ? sg_federationRoundSyncTimeout
-+            : 0.1f );
-+    bool synchronized = false;
-+    while ( timeout > tRealSysTimeFloat() )
-+    {
-+        // The release arrives through console.in. Continue normal network and
-+        // federation polling while the final game timer remains paused.
-+        sr_Read_stdin();
-+        sg_FederationImportPoll();
-+        sn_BasicNetworkSystem.Select( 0.01f );
-+        gGame::NetSyncIdle();
-+
-+        double now = std::chrono::duration<double>(
-+            std::chrono::system_clock::now().time_since_epoch()
-+        ).count();
-+        double releaseAt = std::strtod(
-+            static_cast<const char *>(sg_federationRoundReleaseAt),
-+            NULL
-+        );
-+        if ( releaseAt > 0.0 && now >= releaseAt )
-+        {
-+            synchronized = true;
-+            break;
-+        }
-+    }
-+
-+    double releasedAt = std::chrono::duration<double>(
-+        std::chrono::system_clock::now().time_since_epoch()
-+    ).count();
-+    char releasedAtText[32];
-+    std::snprintf(
-+        releasedAtText,
-+        sizeof(releasedAtText),
-+        "%.6f",
-+        releasedAt
-+    );
-+    sg_federationRoundReleasedWriter
-+        << mapfile << releasedAtText << ( synchronized ? 1 : 0 );
-+    sg_federationRoundReleasedWriter.write();
-+    sg_federationRoundReleaseAt = "0";
-+}
-+#endif
-+
- // **********************************************************************
- // *
- // *	Map Display Settings
-@@ -3998,6 +4776,12 @@ void gGame::StateUpdate(){
-                 }
-                 else
-                     mess << "$gamestate_newround_goldengoal";
-+#ifdef DEDICATED
-+                // All per-node map, grid, client, and match setup is now
-+                // complete. Synchronize at the last safe point before the
-+                // visible Go message and game-timer release.
-+                sg_WaitForFederationRoundRelease();
-+#endif
-                 sn_ConsoleOut(mess);
- 
-                 se_SaveToScoreFile("$gamestate_newround_log");
-@@ -4080,6 +4864,12 @@ void gGame::StateUpdate(){
-                 {
-                     sr_Read_stdin();
- 
-+                    // The normal game loop polls federation imports once per
-+                    // frame. Keep doing so while an external script holds the
-+                    // server between rounds, otherwise remote chat and state
-+                    // remain queued until the next round starts.
-+                    sg_FederationImportPoll();
-+
-                     // wait for network messages
-                     sn_BasicNetworkSystem.Select( 0.1f );
-                     gGame::NetSyncIdle();
-@@ -4825,7 +5615,7 @@ void gGame::Analysis(REAL time){
+@@ -4825,7 +4895,7 @@ void gGame::Analysis(REAL time){
          int humanTeamsClamp = human_teams;
          if ( humanTeamsClamp > 2 )
              humanTeamsClamp = 2;
@@ -3613,7 +1734,7 @@ index a1d74d73..b7bba460 100644
          {
              StartNewMatch();
              if (eTeam::ongoingChallenge) sg_endChallenge();
-@@ -4883,10 +5673,22 @@ void gGame::Analysis(REAL time){
+@@ -4883,10 +4953,22 @@ void gGame::Analysis(REAL time){
          int shutdown_countdown = sg_ShutDown->Timeout();
          if (shutdown_countdown > 0)
          {
@@ -3640,7 +1761,7 @@ index a1d74d73..b7bba460 100644
  
              sg_ShutDown->SetTimeout(sg_ShutDown->Timeout() - 1);
          }
-@@ -4897,6 +5699,19 @@ void gGame::Analysis(REAL time){
+@@ -4897,6 +4979,19 @@ void gGame::Analysis(REAL time){
          }
      }
  
@@ -3660,7 +1781,7 @@ index a1d74d73..b7bba460 100644
      // who is alive?
      if ( time-lastdeath < 1.0f )
      {
-@@ -5010,8 +5825,14 @@ void gGame::Analysis(REAL time){
+@@ -5010,8 +5105,14 @@ void gGame::Analysis(REAL time){
      int winnerExtraRound = ( winner != 0 || alive == 0 ) ? 1 : 0;
  
  
@@ -3677,7 +1798,7 @@ index a1d74d73..b7bba460 100644
      {
          roundOver = true;
  
-@@ -5030,7 +5851,7 @@ void gGame::Analysis(REAL time){
+@@ -5030,7 +5131,7 @@ void gGame::Analysis(REAL time){
      }
  
      // analyze the ranking list
@@ -3686,7 +1807,7 @@ index a1d74d73..b7bba460 100644
      {
          holdBackNextRound = true;
      }
-@@ -5056,7 +5877,7 @@ void gGame::Analysis(REAL time){
+@@ -5056,7 +5157,7 @@ void gGame::Analysis(REAL time){
                          ||
                          rounds + winnerExtraRound >= sg_currentSettings->limitRounds ||     // or the round limit
                          tSysTimeFloat()>=startTime+sg_currentSettings->limitTime*60 ||      // or the time limit
@@ -3695,41 +1816,8 @@ index a1d74d73..b7bba460 100644
                          || // or the mercy limit is hit
                          ( sg_currentSettings->maxBlowout && eTeam::teams.Len() > 1 && eTeam::teams(0)->Score() >= eTeam::teams(1)->Score() + sg_currentSettings->maxBlowout)
                     )
-@@ -5429,6 +6250,8 @@ bool gGame::GameLoop(bool input){
-         return false;
-     }
- 
-+    sg_FederationImportPoll();
-+
-     // do basic network receiving and sending. This pushes out all input the player makes as fast as possible.
-     sg_Receive();
-     sn_SendPlanned();
-@@ -5497,6 +6320,14 @@ bool gGame::GameLoop(bool input){
-             ePlayerNetID::GridPosLadderLog();
-             lastTime = gtime;
-         }
-+    } {
-+        static float lastTime = 1e42;
-+        if((sg_federationExportInterval >= 0) &&
-+                (gtime > sg_federationExportInterval) &&
-+                (gtime >= lastTime + sg_federationExportInterval || gtime < lastTime)) {
-+            ePlayerNetID::FederationExport();
-+            lastTime = gtime;
-+        }
-     } {
-         static float lastTime = 1e42;
-         if((sg_zoneGridPosInterval >= 0) && (gtime > sg_zoneGridPosInterval) && (gtime >= lastTime + sg_zoneGridPosInterval || gtime < lastTime)) {
-@@ -5667,6 +6498,8 @@ bool GameLoop(bool input=true){
-         REAL t=tSysTimeFloat();
-         for(int i=se_PlayerNetIDs.Len()-1;i>=0;i--){
-             ePlayerNetID *p=se_PlayerNetIDs(i);
-+            if ( p->IsFederationGhost() )
-+                continue;
- 
-             // get average and variance (increased a bit) of this player's ping
-             nPingAverager const & averager = sn_Connections[p->Owner()].ping;
 diff --git a/src/tron/gGame.h b/src/tron/gGame.h
-index cf09018f..71453794 100644
+index cf09018..7145379 100644
 --- a/src/tron/gGame.h
 +++ b/src/tron/gGame.h
 @@ -242,11 +242,14 @@ class ShutDownCounter
@@ -3761,7 +1849,7 @@ index cf09018f..71453794 100644
  #endif
 -
 diff --git a/src/tron/gParser.cpp b/src/tron/gParser.cpp
-index 12b17b34..de61bf83 100644
+index 12b17b3..de61bf8 100644
 --- a/src/tron/gParser.cpp
 +++ b/src/tron/gParser.cpp
 @@ -10,6 +10,8 @@
@@ -3866,7 +1954,7 @@ index 12b17b34..de61bf83 100644
      sizeMultiplier = aSizeMultiplier;
      // EOP
 diff --git a/src/tron/gZone.cpp b/src/tron/gZone.cpp
-index 68b539bf..b98269ad 100644
+index 68b539b..e6ac428 100644
 --- a/src/tron/gZone.cpp
 +++ b/src/tron/gZone.cpp
 @@ -64,6 +64,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -3929,12 +2017,10 @@ index 68b539bf..b98269ad 100644
  void gZone::BounceOffPoint(eCoord dest, eCoord collide)
  {
      //Use a simple angle deflection for now not even accounting for points that made too far in
-@@ -1703,6 +1735,12 @@ void gZone::InteractWith( eGameObject * target, REAL time, int recursion )
+@@ -1703,6 +1735,10 @@ void gZone::InteractWith( eGameObject * target, REAL time, int recursion )
      gCycle* prey = dynamic_cast< gCycle* >( target );
      if ( InteractsWithCycle() && prey )
      {
-+        if ( prey->IsFederationGhost() )
-+            return;
 +        if (privateUser_ && privateUser_ != prey->Owner())
 +        {
 +            return;
@@ -3942,7 +2028,7 @@ index 68b539bf..b98269ad 100644
          if(prey->Player() && prey->Alive())
          {
              REAL r = GetRadius(), dist = ( prey->Position() - this->Position() ).NormSquared();
-@@ -2425,13 +2463,58 @@ gWinZoneHack::~gWinZoneHack( void )
+@@ -2425,13 +2461,58 @@ gWinZoneHack::~gWinZoneHack( void )
  // *******************************************************************************
  
  static eLadderLogWriter sg_winzonePlayerEnterWriter("WINZONE_PLAYER_ENTER", true);
@@ -4002,7 +2088,7 @@ index 68b539bf..b98269ad 100644
      sg_winzonePlayerEnterWriter.write();
  
      //HACK RACE begin
-@@ -6958,6 +7041,7 @@ void gTargetZoneHack::OnEnter( gCycle * target, REAL time )
+@@ -6958,6 +7039,7 @@ void gTargetZoneHack::OnEnter( gCycle * target, REAL time )
          std::istringstream stream(&OnEnterCmd(0));
          tCurrentAccessLevel elevator( sg_SetTargetCmd_conf.GetRequiredLevel(), true );
          tConfItemBase::LoadAll(stream);
@@ -4010,7 +2096,7 @@ index 68b539bf..b98269ad 100644
      }
  
      if(!isInside(target))
-@@ -7012,6 +7096,7 @@ void gTargetZoneHack::OnExit(gCycle *target, REAL time)
+@@ -7012,6 +7094,7 @@ void gTargetZoneHack::OnExit(gCycle *target, REAL time)
      std::istringstream stream(&OnExitCmd(0));
      tCurrentAccessLevel elevator( sg_SetTargetCmd_conf.GetRequiredLevel(), true );
      tConfItemBase::LoadAll(stream);
@@ -4018,7 +2104,7 @@ index 68b539bf..b98269ad 100644
  
      sg_targetzonePlayerLeftWriter << this->GetID() << name_ << MapPosition().x << MapPosition().y << target->Player()->GetUserName() << target->Player()->Object()->MapPosition().x << target->Player()->Object()->MapPosition().y << target->Player()->Object()->Direction().x << target->Player()->Object()->Direction().y << time;
      sg_targetzonePlayerLeftWriter.write();
-@@ -7036,6 +7121,7 @@ void gTargetZoneHack::OnVanish( void )
+@@ -7036,6 +7119,7 @@ void gTargetZoneHack::OnVanish( void )
      std::istringstream stream(&OnVanishCmd(0));
      tCurrentAccessLevel elevator( sg_SetTargetCmd_conf.GetRequiredLevel(), true );
      tConfItemBase::LoadAll(stream);
@@ -4026,7 +2112,7 @@ index 68b539bf..b98269ad 100644
  
      // check if we have a winner ...
      if (sg_targetIsWinzone && (TargetZoneCounter_==1) && firstPlayer_)
-@@ -7392,7 +7478,15 @@ void gTeleportZoneHack::OnEnter( gCycle * target, REAL time )
+@@ -7392,7 +7476,15 @@ void gTeleportZoneHack::OnEnter( gCycle * target, REAL time )
      REAL l = (eCoord::F(v,d)*vn*2.0);
      // if center is behind, you might have been teleported in this zone. Don't jump !
      if (l<=0) return;
@@ -4043,7 +2129,7 @@ index 68b539bf..b98269ad 100644
      // check if newPos is inside this zone
      //if ((newPos-GetPosition()).Norm()<=GetRadius()) return;
      // if not, let's jump
-@@ -8904,12 +8998,14 @@ void gRespawnZoneHack::OnVanish( void )
+@@ -8904,12 +8996,14 @@ void gRespawnZoneHack::OnVanish( void )
  //!
  // *******************************************************************************
  
@@ -4061,7 +2147,7 @@ index 68b539bf..b98269ad 100644
  
      checkpointId_ = checkpointId;
  
-@@ -8917,7 +9013,11 @@ gCheckpointZoneHack::gCheckpointZoneHack( eGrid * grid, const eCoord & pos, int
+@@ -8917,7 +9011,11 @@ gCheckpointZoneHack::gCheckpointZoneHack( eGrid * grid, const eCoord & pos, int
      if (checkpointTime_ < 0)
          checkpointTime_ = 0;
  
@@ -4074,7 +2160,7 @@ index 68b539bf..b98269ad 100644
  
      SetExpansionSpeed(0);
      SetRotationSpeed( .3f );
-@@ -8957,6 +9057,63 @@ tArray<gCheckpointZoneHack *> sg_GetCheckpointZones()
+@@ -8957,6 +9055,63 @@ tArray<gCheckpointZoneHack *> sg_GetCheckpointZones()
      return checkpointZones;
  }
  
@@ -4138,7 +2224,7 @@ index 68b539bf..b98269ad 100644
  // *******************************************************************************
  // *
  // *    gCheckpointZoneHack
-@@ -8971,7 +9128,11 @@ tArray<gCheckpointZoneHack *> sg_GetCheckpointZones()
+@@ -8971,7 +9126,11 @@ tArray<gCheckpointZoneHack *> sg_GetCheckpointZones()
  gCheckpointZoneHack::gCheckpointZoneHack( nMessage & m )
  : gZone( m )
  {
@@ -4151,7 +2237,7 @@ index 68b539bf..b98269ad 100644
  }
  
  
-@@ -8988,6 +9149,16 @@ gCheckpointZoneHack::~gCheckpointZoneHack( void )
+@@ -8988,6 +9147,16 @@ gCheckpointZoneHack::~gCheckpointZoneHack( void )
  {
  }
  
@@ -4168,7 +2254,7 @@ index 68b539bf..b98269ad 100644
  
  // *******************************************************************************
  // *
-@@ -9021,6 +9192,24 @@ bool gCheckpointZoneHack::Timestep( REAL time )
+@@ -9021,6 +9190,24 @@ bool gCheckpointZoneHack::Timestep( REAL time )
  
  void gCheckpointZoneHack::OnEnter( gCycle * target, REAL time )
  {
@@ -4193,7 +2279,7 @@ index 68b539bf..b98269ad 100644
      gRacePlayer *racer = gRacePlayer::GetPlayer(target->Player());
      if (racer && sg_RaceTimerEnabled)
      {
-@@ -9124,11 +9313,8 @@ void gCheckpointZoneHack::OnEnter( gCycle * target, REAL time )
+@@ -9124,11 +9311,8 @@ void gCheckpointZoneHack::OnEnter( gCycle * target, REAL time )
  
                  if (sg_RaceCheckpointRequireHit == 1)
                  {
@@ -4205,7 +2291,7 @@ index 68b539bf..b98269ad 100644
                          racer->SetCanFinish(true);
                          racer->SetCheckpointsDone(true);
                      }
-@@ -9140,14 +9326,9 @@ void gCheckpointZoneHack::OnEnter( gCycle * target, REAL time )
+@@ -9140,14 +9324,9 @@ void gCheckpointZoneHack::OnEnter( gCycle * target, REAL time )
                      //  finish line (win/target zone)
                      if (all_done)
                      {
@@ -4221,7 +2307,7 @@ index 68b539bf..b98269ad 100644
  
                  //  add the time to the countdown
 diff --git a/src/tron/gZone.h b/src/tron/gZone.h
-index 73c9a2dd..6290606a 100644
+index 73c9a2d..6290606 100644
 --- a/src/tron/gZone.h
 +++ b/src/tron/gZone.h
 @@ -125,6 +125,9 @@ public:

@@ -1,7 +1,6 @@
 import collections
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 from TronnerRacing import TronnerRacing
 
@@ -45,8 +44,6 @@ class ServerOptionsTests(unittest.IsolatedAsyncioTestCase):
             display_name=lambda entry: entry.name.replace("_", " "),
         )
         controller._server_options_last = None
-        controller.federation_role = "off"
-        controller._federation_server_state_last_publish_monotonic = 0.0
         controller.sink = Sink()
         return controller
 
@@ -76,35 +73,6 @@ class ServerOptionsTests(unittest.IsolatedAsyncioTestCase):
                 "Next Map: Queued Map by Queuer",
             ],
         )
-
-    def test_follower_uses_authoritative_next_map_not_local_rotation(self):
-        controller = self.controller()
-        controller.federation_role = "follower"
-        controller.federation_leader_current_map_key = controller.current.key
-        controller.federation_leader_next_map_key = "remote/maps/Remote_Map-v2.aamap.xml"
-
-        self.assertEqual(
-            controller._server_options_text(),
-            "Current map: Current Map by Curator | "
-            "Next Map: Remote Map by remote",
-        )
-
-    async def test_leader_publishes_server_state(self):
-        controller = self.controller()
-        controller.federation_role = "leader"
-        controller._publish_federation_control = AsyncMock(return_value=True)
-
-        await controller._refresh_server_options_once()
-
-        controller._publish_federation_control.assert_awaited_once_with(
-            "controller_message",
-            {
-                "scope": "server_state",
-                "current_map_key": "current",
-                "next_map_key": "next",
-            },
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

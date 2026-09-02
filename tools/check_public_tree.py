@@ -53,6 +53,14 @@ SECRET_PATTERNS = {
         rb"https://(?!example\.firebaseio\.com)[A-Za-z0-9._-]+\.firebaseio\.com"
     ),
 }
+REMOVED_ARCHITECTURE_PATTERNS = {
+    "removed multi-server architecture": re.compile(
+        rb"feder" + rb"ation", re.IGNORECASE
+    ),
+    "removed secondary server location": re.compile(
+        rb"San " + rb"Francisco|Amster" + rb"dam", re.IGNORECASE
+    ),
+}
 IPV4 = re.compile(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
 PRODUCTION_PATH = re.compile(r"/(?:home|Users)/[^/\s]+/|/" + r"root/")
 
@@ -121,6 +129,9 @@ def scan(root: Path) -> list[str]:
         for label, pattern in SECRET_PATTERNS.items():
             if pattern.search(data):
                 failures.append(f"probable {label}: {relative}")
+        for label, pattern in REMOVED_ARCHITECTURE_PATTERNS.items():
+            if pattern.search(data):
+                failures.append(f"{label}: {relative}")
         if b"\0" in data:
             continue
         text = data.decode("utf-8", "replace")

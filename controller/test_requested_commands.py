@@ -144,8 +144,6 @@ class RequestedBehaviorTests(unittest.IsolatedAsyncioTestCase):
             controller.respawn_tasks = {}
             controller.freeze_tasks = {}
             controller.players = {}
-            controller.federation_remote_players = {}
-            controller.federation_role = "off"
 
             reasons = []
 
