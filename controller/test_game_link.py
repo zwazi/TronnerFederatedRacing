@@ -106,7 +106,7 @@ class GameLinkTests(unittest.IsolatedAsyncioTestCase):
         controller = object.__new__(TronnerRacing)
         controller.sink = Sink()
         controller.config = {}
-        controller.federation_local_server_id = "region-a"
+        controller.server_id = "nyc1"
         player = Player("racer", "Racer")
 
         await controller._command_link(player, "042731")
@@ -116,7 +116,7 @@ class GameLinkTests(unittest.IsolatedAsyncioTestCase):
             plain_console_text(controller.sink.commands[-1]),
         )
 
-    async def test_link_redeems_locally_on_either_federation_server(self):
+    async def test_link_redeems_on_the_configured_server(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             secret_path = Path(temporary_directory) / "game-link-secret"
             secret_path.write_text("server-secret\n", encoding="utf-8")
@@ -129,7 +129,7 @@ class GameLinkTests(unittest.IsolatedAsyncioTestCase):
                     "server_id": "region-b",
                 }
             }
-            controller.federation_local_server_id = "region-b"
+            controller.server_id = "nyc1"
             player = Player("racer", "Racer", auth_name="Player@forums")
 
             with mock.patch(

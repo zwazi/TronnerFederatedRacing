@@ -94,26 +94,6 @@ class ImmutableResourceTests(unittest.TestCase):
                 install_immutable_file(source, destination)
             self.assertEqual(destination.read_bytes(), b"old")
 
-    def test_federated_resource_requires_exact_hash_and_internal_identity(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo = repository(root)
-            data = map_bytes("v1", 1)
-            key = f"Tester/maps/Race-v1{MAP_SUFFIX}"
-            digest = hashlib.sha256(data).hexdigest()
-
-            entry = repo.install_federated_resource(key, data, digest)
-
-            self.assertEqual(entry.key, key)
-            self.assertEqual((repo.public_dir / key).read_bytes(), data)
-            self.assertEqual((repo.cache_dir / key).read_bytes(), data)
-            with self.assertRaisesRegex(ValueError, "digest mismatch"):
-                repo.install_federated_resource(key, data, "0" * 64)
-            with self.assertRaisesRegex(ValueError, "identity mismatch"):
-                repo.install_federated_resource(
-                    f"Tester/maps/Other-v1{MAP_SUFFIX}", data, digest
-                )
-
     def test_synthesized_version_never_collides_with_repository_version(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

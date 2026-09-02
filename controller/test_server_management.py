@@ -35,7 +35,6 @@ class ServerManagementTest(unittest.IsolatedAsyncioTestCase):
         controller.repository = SimpleNamespace(catalog={}, firebase_catalog_version=14)
         controller.store = SimpleNamespace(path=Path("/tmp/tronner-management-test/state.sqlite3"))
         controller.config = {"live_dashboard": {"local_region": "A"}}
-        controller.federation_role = "leader"
         controller.round_active = False
         controller.transitioning = False
         controller.final_countdown_active = False
@@ -46,8 +45,6 @@ class ServerManagementTest(unittest.IsolatedAsyncioTestCase):
         controller.round_started_epoch = None
         controller.current = None
         controller.excluded_map_keys = set()
-        controller.federation_snapshot_received = False
-        controller.federation_last_received_monotonic = 0.0
         controller.last_game_monotonic = None
 
         status = controller._server_management_status()
@@ -147,21 +144,8 @@ class ServerManagementTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(controller.sink.commands), 1)
 
-    async def test_map_commands_are_refused_by_federation_follower(self):
+    async def test_announcement_targets_the_local_server(self):
         controller = self.controller()
-        controller.federation_role = "follower"
-
-        with self.assertRaisesRegex(ValueError, "federation leader"):
-            await controller._execute_server_management_command({
-                "type": "queue_map",
-                "requestedBy": "admin-id",
-                "requestedName": "Grid admin",
-                "mapKey": "author/maps/example.aamap.xml",
-            })
-
-    async def test_standalone_accepts_group_announcement_as_local(self):
-        controller = self.controller()
-        controller.federation_role = "off"
         controller.broadcast = AsyncMock()
 
         result, details = await controller._execute_server_management_command({
@@ -169,14 +153,12 @@ class ServerManagementTest(unittest.IsolatedAsyncioTestCase):
             "requestedBy": "admin-id",
             "requestedName": "Grid admin",
             "message": "Server maintenance soon.",
-            "scope": "federation",
+            "scope": "local",
         })
 
         self.assertEqual(result, "Announcement delivered.")
         self.assertEqual(details, {"scope": "local"})
-        controller.broadcast.assert_awaited_once_with(
-            "Server maintenance soon.", federate=False
-        )
+        controller.broadcast.assert_awaited_once_with("Server maintenance soon.")
         self.assertTrue(controller.live_dashboard_authority)
 
     async def test_console_stream_is_temporary_and_replays_only_a_bounded_tail(self):
