@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import functools
 import heapq
 import math
 import xml.etree.ElementTree as ET
@@ -52,6 +53,23 @@ def _point_segment_distance(point: Point, start: Point, end: Point) -> float:
     return math.hypot(point[0] - nearest[0], point[1] - nearest[1])
 
 
+def _closest_point_on_segment(point: Point, start: Point, end: Point) -> Point:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length_squared = dx * dx + dy * dy
+    if length_squared <= 1e-18:
+        return start
+    amount = max(
+        0.0,
+        min(
+            1.0,
+            ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy)
+            / length_squared,
+        ),
+    )
+    return start[0] + amount * dx, start[1] + amount * dy
+
+
 def _point_in_polygon(point: Point, polygon: Sequence[Point]) -> bool:
     inside = False
     previous = polygon[-1]
@@ -67,6 +85,75 @@ def _point_in_polygon(point: Point, polygon: Sequence[Point]) -> bool:
                 inside = not inside
         previous = current
     return inside
+
+
+def _segments_intersect(
+    first_start: Point,
+    first_end: Point,
+    second_start: Point,
+    second_end: Point,
+) -> bool:
+    """Return whether two closed line segments touch or cross."""
+
+    scale = max(
+        1.0,
+        *(
+            abs(value)
+            for point in (first_start, first_end, second_start, second_end)
+            for value in point
+        ),
+    )
+    tolerance = 1e-10 * scale
+
+    def orientation(start: Point, end: Point, point: Point) -> float:
+        return (
+            (end[0] - start[0]) * (point[1] - start[1])
+            - (end[1] - start[1]) * (point[0] - start[0])
+        )
+
+    def on_segment(start: Point, end: Point, point: Point) -> bool:
+        return (
+            min(start[0], end[0]) - tolerance
+            <= point[0]
+            <= max(start[0], end[0]) + tolerance
+            and min(start[1], end[1]) - tolerance
+            <= point[1]
+            <= max(start[1], end[1]) + tolerance
+        )
+
+    first_a = orientation(first_start, first_end, second_start)
+    first_b = orientation(first_start, first_end, second_end)
+    second_a = orientation(second_start, second_end, first_start)
+    second_b = orientation(second_start, second_end, first_end)
+    if (
+        (
+            (first_a > tolerance and first_b < -tolerance)
+            or (first_a < -tolerance and first_b > tolerance)
+        )
+        and (
+            (second_a > tolerance and second_b < -tolerance)
+            or (second_a < -tolerance and second_b > tolerance)
+        )
+    ):
+        return True
+    return (
+        (
+            abs(first_a) <= tolerance
+            and on_segment(first_start, first_end, second_start)
+        )
+        or (
+            abs(first_b) <= tolerance
+            and on_segment(first_start, first_end, second_end)
+        )
+        or (
+            abs(second_a) <= tolerance
+            and on_segment(second_start, second_end, first_start)
+        )
+        or (
+            abs(second_b) <= tolerance
+            and on_segment(second_start, second_end, first_end)
+        )
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,7 +305,9 @@ def parse_map_geometry(
             spawns.append(scaled_point(node))
         elif name == "Zone":
             effect = node.attrib.get("effect", "").casefold()
-            if effect not in {"death", "teleport", "win"}:
+            # TARGET_DECLARE_WINNER is enabled by default in Armagetron, so a
+            # target zone is a finish goal just like a win zone for routing.
+            if effect not in {"death", "target", "teleport", "win"}:
                 continue
             for shape in node:
                 shape_name = _local_name(shape.tag)
@@ -263,12 +352,12 @@ def parse_map_geometry(
                                     ),
                                 )
                             )
-                    elif effect == "win":
+                    elif effect in {"target", "win"}:
                         win_circles.append(circle)
                     else:
                         death_circles.append(circle)
                 elif shape_name == "ShapePolygon" and len(points) >= 3:
-                    if effect == "win":
+                    if effect in {"target", "win"}:
                         win_polygons.append(tuple(points))
                     elif effect == "death":
                         death_polygons.append(tuple(points))
@@ -318,6 +407,8 @@ class RouteModel:
     height: int
     blocked: bytearray
     distances: list[float]
+    guide_points: tuple[Point, ...] = ()
+    guide_distances: tuple[float, ...] = ()
 
     def _index(self, x: int, y: int) -> int:
         return y * self.width + x
@@ -389,6 +480,30 @@ class RouteModel:
                     )
         return best
 
+    def segment_is_clear(self, start: Point, end: Point) -> bool:
+        """Check a short connection against the map's exact static obstacles."""
+        if any(
+            _segments_intersect(start, end, wall_start, wall_end)
+            for wall_start, wall_end in self.geometry.wall_segments
+        ):
+            return False
+        if any(
+            _point_segment_distance(circle.center, start, end) <= circle.radius
+            for circle in self.geometry.death_circles
+        ):
+            return False
+        for polygon in self.geometry.death_polygons:
+            if _point_in_polygon(start, polygon) or _point_in_polygon(end, polygon):
+                return False
+            if any(
+                _segments_intersect(start, end, edge_start, edge_end)
+                for edge_start, edge_end in zip(
+                    polygon, (*polygon[1:], polygon[0])
+                )
+            ):
+                return False
+        return True
+
     def distance_at(self, position: Point, search_radius: int = 4) -> float:
         cell_x, cell_y = self._nearest_cell(position)
         best = math.inf
@@ -403,8 +518,10 @@ class RouteModel:
                     value = self.distances[self._index(x, y)]
                     if not math.isfinite(value):
                         continue
-                    found = True
                     grid_point = self._grid_point(x, y)
+                    if not self.segment_is_clear(position, grid_point):
+                        continue
+                    found = True
                     best = min(
                         best,
                         value
@@ -415,6 +532,17 @@ class RouteModel:
                     )
             if found:
                 return best
+        maximum_guide_distance = (search_radius + 1) * self.cell_size
+        for point, value in zip(self.guide_points, self.guide_distances):
+            connection = math.dist(position, point)
+            if (
+                math.isfinite(value)
+                and connection <= maximum_guide_distance
+                and self.segment_is_clear(position, point)
+            ):
+                best = min(best, value + connection)
+        if math.isfinite(best):
+            return best
         # A raster cell can become disconnected when a very narrow passage is
         # smaller than the bounded grid resolution.  Returning straight-line
         # distance here would reintroduce the exact false positive this model
@@ -423,13 +551,10 @@ class RouteModel:
 
     @property
     def reference_distance(self) -> float:
-        values = sorted(
-            value
-            for value in (self.distance_at(spawn) for spawn in self.geometry.spawns)
-            if math.isfinite(value) and value > 0
-        )
-        if not values:
+        values = [self.distance_at(spawn) for spawn in self.geometry.spawns]
+        if not values or any(not math.isfinite(value) or value <= 0 for value in values):
             return 0.0
+        values.sort()
         return values[len(values) // 2]
 
 
@@ -438,8 +563,9 @@ def build_route_model(
     *,
     maximum_cells: int = 100_000,
     minimum_cell_size: float = 1.0,
-    wall_clearance_cells: float = 0.72,
+    wall_clearance_cells: float = 0.0,
     size_multiplier: float = 1.0,
+    narrow_passage_guides: bool = False,
 ) -> RouteModel | None:
     geometry = parse_map_geometry(path, size_multiplier=size_multiplier)
     if not geometry.has_goal:
@@ -523,41 +649,25 @@ def build_route_model(
         end_y = min(height - 1, int(math.ceil((high_y - origin_y) / cell_size)))
         return range(start_x, end_x + 1), range(start_y, end_y + 1)
 
-    # A map wall has no thickness.  At less than half a cell's diagonal, a
-    # wall that passes between cell centers can disappear from the raster
-    # entirely.  The default is deliberately just above sqrt(2) / 2 so every
-    # grid cell touched by a wall is blocked (a conservative supercover).
+    # Clearance is optional. Exact continuous edge checks below keep zero-width
+    # walls and zone boundaries solid without widening them enough to erase a
+    # legitimate narrow passage.
     clearance = max(0.0, wall_clearance_cells) * cell_size
-    for start, end in geometry.wall_segments:
-        xs, ys = grid_bounds(
-            min(start[0], end[0]) - clearance,
-            min(start[1], end[1]) - clearance,
-            max(start[0], end[0]) + clearance,
-            max(start[1], end[1]) + clearance,
-        )
-        # Long diagonal walls can have very large bounding boxes.  Sampling the
-        # segment is bounded by its length while still covering every crossed
-        # cell and its immediate clearance neighborhood.
-        if len(xs) * len(ys) > max(64, 8 * (len(xs) + len(ys))):
-            steps = max(1, int(math.ceil(math.dist(start, end) / (cell_size * 0.25))))
-            candidates: set[tuple[int, int]] = set()
-            radius = max(1, int(math.ceil(clearance / cell_size)) + 1)
-            for step in range(steps + 1):
-                amount = step / steps
-                px = start[0] + (end[0] - start[0]) * amount
-                py = start[1] + (end[1] - start[1]) * amount
-                center_x = int(round((px - origin_x) / cell_size))
-                center_y = int(round((py - origin_y) / cell_size))
-                for y in range(center_y - radius, center_y + radius + 1):
-                    for x in range(center_x - radius, center_x + radius + 1):
-                        if 0 <= x < width and 0 <= y < height:
-                            candidates.add((x, y))
-            cells = candidates
-        else:
-            cells = ((x, y) for y in ys for x in xs)
-        for x, y in cells:
-            if _point_segment_distance(grid_point(x, y), start, end) <= clearance:
-                blocked[index(x, y)] = 1
+    if clearance > 0:
+        for start, end in geometry.wall_segments:
+            xs, ys = grid_bounds(
+                min(start[0], end[0]) - clearance,
+                min(start[1], end[1]) - clearance,
+                max(start[0], end[0]) + clearance,
+                max(start[1], end[1]) + clearance,
+            )
+            for y in ys:
+                for x in xs:
+                    if (
+                        _point_segment_distance(grid_point(x, y), start, end)
+                        <= clearance
+                    ):
+                        blocked[index(x, y)] = 1
 
     for circle in geometry.death_circles:
         radius = circle.radius + clearance
@@ -657,15 +767,95 @@ def build_route_model(
         distances[goal] = 0.0
         heapq.heappush(queue, (0.0, goal))
 
-    def clear_grid_edge(start_x: int, start_y: int, end_x: int, end_y: int) -> bool:
-        steps = max(abs(end_x - start_x), abs(end_y - start_y)) * 2
-        for step in range(1, max(1, steps) + 1):
-            amount = step / max(1, steps)
-            x = int(round(start_x + (end_x - start_x) * amount))
-            y = int(round(start_y + (end_y - start_y) * amount))
-            if blocked[index(x, y)]:
-                return False
+    # Index exact obstacle boundaries in coarse spatial bins. Navigation edges
+    # are short, so each lookup examines only nearby geometry instead of every
+    # wall and zone in the map.
+    segment_obstacles = list(geometry.wall_segments)
+    for polygon in geometry.death_polygons:
+        segment_obstacles.extend(zip(polygon, (*polygon[1:], polygon[0])))
+    bin_size = max(cell_size * 8.0, 1e-6)
+    segment_bins: dict[tuple[int, int], set[int]] = collections.defaultdict(set)
+    circle_bins: dict[tuple[int, int], set[int]] = collections.defaultdict(set)
+
+    def spatial_bin(point: Point) -> tuple[int, int]:
+        return (
+            int(math.floor((point[0] - origin_x) / bin_size)),
+            int(math.floor((point[1] - origin_y) / bin_size)),
+        )
+
+    for obstacle_id, (start, end) in enumerate(segment_obstacles):
+        steps = max(
+            1,
+            int(math.ceil(math.dist(start, end) / (bin_size * 0.5))),
+        )
+        for step in range(steps + 1):
+            amount = step / steps
+            center_x, center_y = spatial_bin(
+                (
+                    start[0] + (end[0] - start[0]) * amount,
+                    start[1] + (end[1] - start[1]) * amount,
+                )
+            )
+            for bin_y in range(center_y - 1, center_y + 2):
+                for bin_x in range(center_x - 1, center_x + 2):
+                    segment_bins[(bin_x, bin_y)].add(obstacle_id)
+
+    for obstacle_id, circle in enumerate(geometry.death_circles):
+        low = spatial_bin(
+            (circle.center[0] - circle.radius, circle.center[1] - circle.radius)
+        )
+        high = spatial_bin(
+            (circle.center[0] + circle.radius, circle.center[1] + circle.radius)
+        )
+        for bin_y in range(low[1], high[1] + 1):
+            for bin_x in range(low[0], high[0] + 1):
+                circle_bins[(bin_x, bin_y)].add(obstacle_id)
+
+    @functools.lru_cache(maxsize=None)
+    def nearby_obstacles(
+        low_x: int,
+        low_y: int,
+        high_x: int,
+        high_y: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        segment_candidates: set[int] = set()
+        circle_candidates: set[int] = set()
+        for bin_y in range(low_y - 1, high_y + 2):
+            for bin_x in range(low_x - 1, high_x + 2):
+                segment_candidates.update(segment_bins.get((bin_x, bin_y), ()))
+                circle_candidates.update(circle_bins.get((bin_x, bin_y), ()))
+        return tuple(segment_candidates), tuple(circle_candidates)
+
+    def segment_is_clear(start: Point, end: Point) -> bool:
+        low = spatial_bin((min(start[0], end[0]), min(start[1], end[1])))
+        high = spatial_bin((max(start[0], end[0]), max(start[1], end[1])))
+        segment_candidates, circle_candidates = nearby_obstacles(
+            low[0], low[1], high[0], high[1]
+        )
+        if any(
+            _segments_intersect(start, end, *segment_obstacles[obstacle_id])
+            for obstacle_id in segment_candidates
+        ):
+            return False
+        if any(
+            _point_segment_distance(
+                geometry.death_circles[obstacle_id].center, start, end
+            )
+            <= geometry.death_circles[obstacle_id].radius + clearance
+            for obstacle_id in circle_candidates
+        ):
+            return False
+        if any(
+            _point_in_polygon(start, polygon) or _point_in_polygon(end, polygon)
+            for polygon in geometry.death_polygons
+        ):
+            return False
         return True
+
+    def clear_grid_edge(start_x: int, start_y: int, end_x: int, end_y: int) -> bool:
+        return segment_is_clear(
+            grid_point(start_x, start_y), grid_point(end_x, end_y)
+        )
 
     def nearest_safe_cell(point: Point) -> tuple[int, int] | None:
         center_x = int(round((point[0] - origin_x) / cell_size))
@@ -748,7 +938,7 @@ def build_route_model(
                 distances[previous] = candidate
                 heapq.heappush(queue, (candidate, previous))
 
-    return RouteModel(
+    model = RouteModel(
         geometry=geometry,
         origin_x=origin_x,
         origin_y=origin_y,
@@ -758,6 +948,359 @@ def build_route_model(
         blocked=blocked,
         distances=distances,
     )
+    if (
+        model.reference_distance <= 0
+        and narrow_passage_guides
+        and maximum_cells < 500_000
+    ):
+        projected_cell_size = max(
+            0.1,
+            min(minimum_cell_size, 0.1),
+            math.sqrt(extent_x * extent_y / 500_000),
+        )
+        if projected_cell_size <= cell_size * 0.5:
+            return build_route_model(
+                path,
+                maximum_cells=500_000,
+                minimum_cell_size=min(minimum_cell_size, 0.1),
+                wall_clearance_cells=wall_clearance_cells,
+                size_multiplier=size_multiplier,
+                narrow_passage_guides=True,
+            )
+    if model.reference_distance <= 0 and narrow_passage_guides:
+        _bridge_narrow_passages(
+            model,
+            moves=moves,
+            grid_point=grid_point,
+            segment_is_clear=segment_is_clear,
+            clear_grid_edge=clear_grid_edge,
+        )
+    return model
+
+
+def _bridge_narrow_passages(
+    model: RouteModel,
+    *,
+    moves: tuple[tuple[int, int, float], ...],
+    grid_point,
+    segment_is_clear,
+    clear_grid_edge,
+    include_zone_portals: bool = False,
+    include_circle_rings: bool = False,
+) -> None:
+    """Merge sparse sub-cell passage guides into a disconnected raster."""
+
+    geometry = model.geometry
+    cell_size = model.cell_size
+    guide_epsilon = max(cell_size * 0.02, 1e-7)
+    guide_spacing = max(cell_size * 0.45, guide_epsilon * 4)
+    guide_radius = cell_size * 0.8
+    raw_guides: list[Point] = [*geometry.spawns]
+    raw_guides.extend(circle.center for circle in geometry.win_circles)
+    raw_guides.extend(
+        (
+            sum(point[0] for point in polygon) / len(polygon),
+            sum(point[1] for point in polygon) / len(polygon),
+        )
+        for polygon in geometry.win_polygons
+    )
+
+    obstacle_segments = list(geometry.wall_segments)
+    for polygon in geometry.death_polygons:
+        obstacle_segments.extend(zip(polygon, (*polygon[1:], polygon[0])))
+    if len(obstacle_segments) > 1_000 or len(geometry.death_circles) > 500:
+        return
+    obstacle_vertices = {
+        point for segment in obstacle_segments for point in segment
+    }
+    endpoint_samples = 24
+    for point in obstacle_vertices:
+        for sample in range(endpoint_samples):
+            angle = 2 * math.pi * sample / endpoint_samples
+            raw_guides.append(
+                (
+                    point[0] + guide_epsilon * math.cos(angle),
+                    point[1] + guide_epsilon * math.sin(angle),
+                )
+            )
+
+    def add_portal_line(center: Point, direction: Point, half_length: float) -> None:
+        if len(raw_guides) >= 60_000:
+            return
+        length = math.hypot(*direction)
+        if length <= 1e-12:
+            return
+        unit = direction[0] / length, direction[1] / length
+        samples = max(1, int(math.ceil(half_length / guide_spacing)))
+        for sample in range(-samples, samples + 1):
+            if len(raw_guides) >= 60_000:
+                break
+            amount = half_length * sample / samples
+            raw_guides.append(
+                (center[0] + unit[0] * amount, center[1] + unit[1] * amount)
+            )
+
+    # Only sub-cell and near-sub-cell gaps need supplemental samples. Wider
+    # passages are represented by the ordinary raster already.
+    portal_limit = cell_size * 1.25
+    circles = geometry.death_circles if include_zone_portals else ()
+    if include_circle_rings:
+        for circle in geometry.death_circles:
+            guide_radius_value = circle.radius + guide_epsilon
+            if circle.radius <= 1e-12:
+                continue
+            maximum_angle = 2 * math.acos(
+                min(1.0, circle.radius / guide_radius_value)
+            )
+            samples = max(
+                12,
+                int(math.ceil(2 * math.pi / max(maximum_angle * 0.8, 1e-4))),
+            )
+            for sample in range(samples):
+                angle = 2 * math.pi * sample / samples
+                raw_guides.append(
+                    (
+                        circle.center[0] + guide_radius_value * math.cos(angle),
+                        circle.center[1] + guide_radius_value * math.sin(angle),
+                    )
+                )
+    for first_id, first in enumerate(circles):
+        for second in circles[first_id + 1 :]:
+            center_distance = math.dist(first.center, second.center)
+            gap = center_distance - first.radius - second.radius
+            if not (guide_epsilon * 2 < gap < portal_limit):
+                continue
+            direction = (
+                (second.center[0] - first.center[0]) / center_distance,
+                (second.center[1] - first.center[1]) / center_distance,
+            )
+            center = (
+                first.center[0] + direction[0] * (first.radius + gap / 2),
+                first.center[1] + direction[1] * (first.radius + gap / 2),
+            )
+            add_portal_line(center, (-direction[1], direction[0]), cell_size * 2.5)
+
+    for circle in circles:
+        for start, end in obstacle_segments:
+            nearest = _closest_point_on_segment(circle.center, start, end)
+            center_distance = math.dist(circle.center, nearest)
+            gap = center_distance - circle.radius
+            if not (guide_epsilon * 2 < gap < portal_limit):
+                continue
+            direction = end[0] - start[0], end[1] - start[1]
+            if math.hypot(*direction) <= 1e-12:
+                continue
+            amount = (circle.radius + gap / 2) / center_distance
+            center = (
+                circle.center[0]
+                + (nearest[0] - circle.center[0]) * amount,
+                circle.center[1]
+                + (nearest[1] - circle.center[1]) * amount,
+            )
+            add_portal_line(center, direction, cell_size * 2.5)
+
+    for first_id, (first_start, first_end) in enumerate(obstacle_segments):
+        first_direction = (
+            first_end[0] - first_start[0],
+            first_end[1] - first_start[1],
+        )
+        first_length = math.hypot(*first_direction)
+        if first_length <= 1e-12:
+            continue
+        unit = first_direction[0] / first_length, first_direction[1] / first_length
+        for second_start, second_end in obstacle_segments[first_id + 1 :]:
+            second_direction = (
+                second_end[0] - second_start[0],
+                second_end[1] - second_start[1],
+            )
+            second_length = math.hypot(*second_direction)
+            if second_length <= 1e-12:
+                continue
+            parallel = abs(
+                unit[0] * second_direction[1] / second_length
+                - unit[1] * second_direction[0] / second_length
+            )
+            if parallel > 0.02:
+                continue
+            second_low, second_high = sorted(
+                (
+                    (second_start[0] - first_start[0]) * unit[0]
+                    + (second_start[1] - first_start[1]) * unit[1],
+                    (second_end[0] - first_start[0]) * unit[0]
+                    + (second_end[1] - first_start[1]) * unit[1],
+                )
+            )
+            overlap_low = max(0.0, second_low)
+            overlap_high = min(first_length, second_high)
+            if overlap_high <= overlap_low:
+                continue
+            first_mid = (
+                first_start[0] + unit[0] * (overlap_low + overlap_high) / 2,
+                first_start[1] + unit[1] * (overlap_low + overlap_high) / 2,
+            )
+            second_mid = _closest_point_on_segment(
+                first_mid, second_start, second_end
+            )
+            gap = math.dist(first_mid, second_mid)
+            if not (guide_epsilon * 2 < gap < portal_limit):
+                continue
+            center = (
+                (first_mid[0] + second_mid[0]) / 2,
+                (first_mid[1] + second_mid[1]) / 2,
+            )
+            add_portal_line(
+                center,
+                unit,
+                (overlap_high - overlap_low) / 2 + cell_size * 2,
+            )
+
+    unique_guides: dict[tuple[int, int], Point] = {}
+    quantization = max(guide_epsilon * 0.1, 1e-9)
+    for point in raw_guides:
+        if not segment_is_clear(point, point):
+            continue
+        key = (
+            int(round(point[0] / quantization)),
+            int(round(point[1] / quantization)),
+        )
+        unique_guides.setdefault(key, point)
+    guide_points = tuple(unique_guides.values())
+    if not guide_points:
+        return
+
+    guide_bins: dict[tuple[int, int], list[int]] = collections.defaultdict(list)
+    for guide_id, point in enumerate(guide_points):
+        guide_bins[
+            (
+                int(math.floor(point[0] / guide_radius)),
+                int(math.floor(point[1] / guide_radius)),
+            )
+        ].append(guide_id)
+    guide_edges: list[list[tuple[int, float]]] = [
+        [] for _ in guide_points
+    ]
+    for guide_id, point in enumerate(guide_points):
+        bin_x = int(math.floor(point[0] / guide_radius))
+        bin_y = int(math.floor(point[1] / guide_radius))
+        for near_y in range(bin_y - 1, bin_y + 2):
+            for near_x in range(bin_x - 1, bin_x + 2):
+                for other_id in guide_bins.get((near_x, near_y), ()):
+                    if other_id <= guide_id:
+                        continue
+                    cost = math.dist(point, guide_points[other_id])
+                    if cost <= guide_radius and segment_is_clear(
+                        point, guide_points[other_id]
+                    ):
+                        guide_edges[guide_id].append((other_id, cost))
+                        guide_edges[other_id].append((guide_id, cost))
+
+    guide_grid_edges: list[list[tuple[int, float]]] = [
+        [] for _ in guide_points
+    ]
+    grid_guide_edges: dict[int, list[tuple[int, float]]] = collections.defaultdict(
+        list
+    )
+    cross_radius = cell_size * 4.5
+    for guide_id, point in enumerate(guide_points):
+        center_x, center_y = model._nearest_cell(point)
+        for y in range(max(0, center_y - 4), min(model.height, center_y + 5)):
+            for x in range(max(0, center_x - 4), min(model.width, center_x + 5)):
+                grid_id = model._index(x, y)
+                if model.blocked[grid_id]:
+                    continue
+                grid_position = grid_point(x, y)
+                cost = math.dist(point, grid_position)
+                if cost <= cross_radius and segment_is_clear(point, grid_position):
+                    guide_grid_edges[guide_id].append((grid_id, cost))
+                    grid_guide_edges[grid_id].append((guide_id, cost))
+
+    grid_count = model.width * model.height
+    guide_distances = [math.inf] * len(guide_points)
+    merged_queue: list[tuple[float, int]] = []
+    for guide_id, point in enumerate(guide_points):
+        candidates = [
+            model.distances[grid_id] + cost
+            for grid_id, cost in guide_grid_edges[guide_id]
+            if math.isfinite(model.distances[grid_id])
+        ]
+        if any(
+            math.dist(point, circle.center) <= circle.radius
+            for circle in geometry.win_circles
+        ) or any(_point_in_polygon(point, polygon) for polygon in geometry.win_polygons):
+            candidates.append(0.0)
+        if candidates:
+            guide_distances[guide_id] = min(candidates)
+            heapq.heappush(
+                merged_queue, (guide_distances[guide_id], grid_count + guide_id)
+            )
+
+    while merged_queue:
+        distance, current = heapq.heappop(merged_queue)
+        if current >= grid_count:
+            guide_id = current - grid_count
+            if distance != guide_distances[guide_id]:
+                continue
+            for other_id, cost in guide_edges[guide_id]:
+                candidate = distance + cost
+                if candidate + 1e-9 < guide_distances[other_id]:
+                    guide_distances[other_id] = candidate
+                    heapq.heappush(
+                        merged_queue, (candidate, grid_count + other_id)
+                    )
+            for grid_id, cost in guide_grid_edges[guide_id]:
+                candidate = distance + cost
+                if candidate + 1e-9 < model.distances[grid_id]:
+                    model.distances[grid_id] = candidate
+                    heapq.heappush(merged_queue, (candidate, grid_id))
+            continue
+
+        if distance != model.distances[current]:
+            continue
+        current_x = current % model.width
+        current_y = current // model.width
+        for move_x, move_y, move_cost in moves:
+            next_x = current_x - move_x
+            next_y = current_y - move_y
+            if not (0 <= next_x < model.width and 0 <= next_y < model.height):
+                continue
+            next_id = model._index(next_x, next_y)
+            if model.blocked[next_id] or not clear_grid_edge(
+                current_x, current_y, next_x, next_y
+            ):
+                continue
+            candidate = distance + move_cost * cell_size
+            if candidate + 1e-9 < model.distances[next_id]:
+                model.distances[next_id] = candidate
+                heapq.heappush(merged_queue, (candidate, next_id))
+        for guide_id, cost in grid_guide_edges.get(current, ()):
+            candidate = distance + cost
+            if candidate + 1e-9 < guide_distances[guide_id]:
+                guide_distances[guide_id] = candidate
+                heapq.heappush(
+                    merged_queue, (candidate, grid_count + guide_id)
+                )
+
+    model.guide_points = guide_points
+    model.guide_distances = tuple(guide_distances)
+    if model.reference_distance <= 0 and not include_zone_portals:
+        _bridge_narrow_passages(
+            model,
+            moves=moves,
+            grid_point=grid_point,
+            segment_is_clear=segment_is_clear,
+            clear_grid_edge=clear_grid_edge,
+            include_zone_portals=True,
+        )
+    elif model.reference_distance <= 0 and not include_circle_rings:
+        _bridge_narrow_passages(
+            model,
+            moves=moves,
+            grid_point=grid_point,
+            segment_is_clear=segment_is_clear,
+            clear_grid_edge=clear_grid_edge,
+            include_zone_portals=True,
+            include_circle_rings=True,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
