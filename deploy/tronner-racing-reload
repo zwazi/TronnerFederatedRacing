@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+service_pid="$1"
+ready_file=/run/tronner-racing/graceful-reload.pid
+
+if [ ! -r "$ready_file" ]; then
+    echo "Graceful server script reload is not active; restart tronner-racing once first." >&2
+    exit 1
+fi
+
+ready_pid=$(sed -n '1p' "$ready_file")
+if [ "$ready_pid" != "$service_pid" ]; then
+    echo "Graceful server script reload readiness is stale; restart tronner-racing once first." >&2
+    exit 1
+fi
+
+kill -USR1 "$service_pid"

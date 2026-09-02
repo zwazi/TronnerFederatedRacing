@@ -1,7 +1,7 @@
 # Standalone installation
 
 The installer supports Ubuntu and creates one game process plus one racing
-controller. Render examples first; production rendering rejects example
+server script. Render examples first; production rendering rejects example
 identities and hostnames.
 
 ```sh
