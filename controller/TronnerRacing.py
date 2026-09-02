@@ -4165,7 +4165,6 @@ class TronnerRacing:
         self.final_countdown_route_building = False
         self.final_countdown_progress_states: dict[int, PlayerProgressState] = {}
         self.final_countdown_duration_seconds: float | None = None
-        self.final_countdown_reference_seconds: float | None = None
         reload_state = self.store.get_json("controller_reload", {})
         self.controller_reload_state: dict = (
             reload_state if isinstance(reload_state, dict) else {}
@@ -5633,7 +5632,6 @@ class TronnerRacing:
         self.final_countdown_route_building = False
         self.final_countdown_progress_states = {}
         self.final_countdown_duration_seconds = None
-        self.final_countdown_reference_seconds = None
         self.store.set_json("final_countdown_active", False)
         self.store.set_json("final_countdown_end_epoch", None)
         self.store.set_json("final_countdown_map_key", None)
@@ -8667,13 +8665,9 @@ class TronnerRacing:
     async def _prepare_final_countdown_guard(
         self,
         duration: float,
-        reference_seconds: float,
     ) -> None:
         self.final_countdown_progress_states = {}
         self.final_countdown_duration_seconds = max(1.0, float(duration))
-        self.final_countdown_reference_seconds = max(
-            1.0, float(reference_seconds)
-        )
         self.final_countdown_route_model = None
         self.final_countdown_route_map_key = self.current.key if self.current else None
         self.final_countdown_route_building = False
@@ -8883,41 +8877,6 @@ class TronnerRacing:
         assessment = assess_progress(
             tuple(state.samples),
             remaining_seconds=remaining,
-            total_seconds=total,
-            reference_distance=model.reference_distance,
-            reference_seconds=float(
-                getattr(self, "final_countdown_reference_seconds", 0.0) or total / 1.5
-            ),
-            early_required_fraction=float(
-                self.config.get(
-                    "final_countdown_grief_early_required_fraction", 0.30
-                )
-            ),
-            late_required_fraction=float(
-                self.config.get(
-                    "final_countdown_grief_late_required_fraction", 0.90
-                )
-            ),
-            early_minimum_ground_fraction=float(
-                self.config.get(
-                    "final_countdown_grief_early_minimum_ground_fraction", 0.12
-                )
-            ),
-            late_minimum_ground_fraction=float(
-                self.config.get(
-                    "final_countdown_grief_late_minimum_ground_fraction", 0.35
-                )
-            ),
-            early_minimum_efficiency=float(
-                self.config.get(
-                    "final_countdown_grief_early_minimum_efficiency", 0.03
-                )
-            ),
-            late_minimum_efficiency=float(
-                self.config.get(
-                    "final_countdown_grief_late_minimum_efficiency", 0.15
-                )
-            ),
             route_slack_distance=max(
                 model.cell_size * 1.5,
                 float(
@@ -8947,19 +8906,23 @@ class TronnerRacing:
             state.warned_at = now
             await self.private(
                 player,
-                "Final countdown warning: speed up and follow the route to the "
-                f"winzone; you are {assessment.reason}. Your run will be ended "
+                f"Final countdown warning: {assessment.reason}. Your run will be "
+                "ended "
                 f"if this continues for {math.ceil(grace)} seconds.",
             )
             LOG.info(
                 "final-countdown warning map=%s player=%s reason=%s "
-                "ground=%.3f route=%.3f required=%.3f remaining=%.3f",
+                "ground=%.3f route=%.3f required=%.3f projected=%.3f "
+                "can_finish=%s making_progress=%s remaining=%.3f",
                 self.current.key if self.current else "",
                 player.identity_key,
                 assessment.reason,
                 assessment.ground_speed,
                 assessment.route_speed,
                 assessment.required_speed,
+                assessment.projected_seconds,
+                assessment.can_finish,
+                assessment.making_progress,
                 remaining,
             )
             return
@@ -8969,19 +8932,23 @@ class TronnerRacing:
         state.killed = True
         await self.private(
             player,
-            "Your final-countdown run was ended because you did not make "
-            "sufficient progress toward the winzone after being warned.",
+            f"Your final-countdown run was ended because {assessment.reason} "
+            "after you were warned.",
         )
         await self.sink.send(f"KILL_SILENT {player.target}")
         LOG.warning(
             "final-countdown griefer removed map=%s player=%s reason=%s "
-            "ground=%.3f route=%.3f required=%.3f remaining=%.3f",
+            "ground=%.3f route=%.3f required=%.3f projected=%.3f "
+            "can_finish=%s making_progress=%s remaining=%.3f",
             self.current.key if self.current else "",
             player.identity_key,
             assessment.reason,
             assessment.ground_speed,
             assessment.route_speed,
             assessment.required_speed,
+            assessment.projected_seconds,
+            assessment.can_finish,
+            assessment.making_progress,
             remaining,
         )
 
@@ -9242,10 +9209,7 @@ class TronnerRacing:
             # Cap that additional window independently at the configured map
             # maximum (five minutes by default).
             duration = min(duration, self._map_play_seconds(self.current))
-        reference_seconds = (
-            records[0].best_seconds if records else max(1.0, duration / 1.5)
-        )
-        await self._prepare_final_countdown_guard(duration, reference_seconds)
+        await self._prepare_final_countdown_guard(duration)
         now = time.time()
 
         if not resume or not self.final_countdown_end_epoch:

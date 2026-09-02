@@ -60,9 +60,6 @@ class RouteModelTests(unittest.TestCase):
             assess_progress(
                 trajectory,
                 remaining_seconds=40,
-                total_seconds=60,
-                reference_distance=model.reference_distance,
-                reference_seconds=20,
             )
         )
 
@@ -103,7 +100,7 @@ class RouteModelTests(unittest.TestCase):
 
 
 class ProgressAssessmentTests(unittest.TestCase):
-    def test_high_speed_circle_is_a_violation(self):
+    def test_fast_circle_can_reach_but_fails_constant_progress(self):
         assessment = assess_progress(
             (
                 (0.0, 0.0, 0.0, 50.0),
@@ -112,34 +109,53 @@ class ProgressAssessmentTests(unittest.TestCase):
                 (3.0, 0.0, 10.0, 50.0),
             ),
             remaining_seconds=20,
-            total_seconds=90,
-            reference_distance=100,
-            reference_seconds=10,
+            route_slack_distance=0,
         )
         self.assertIsNotNone(assessment)
-        self.assertEqual(assessment.reason, "moving without making route progress")
+        self.assertTrue(assessment.can_finish)
+        self.assertFalse(assessment.making_progress)
+        self.assertEqual(
+            assessment.reason,
+            "you are not making consistent progress toward the winzone",
+        )
 
-    def test_same_pace_becomes_insufficient_late_in_countdown(self):
+    def test_current_position_and_speed_determine_whether_finish_is_possible(self):
         samples = (
-            (0.0, 0.0, 0.0, 56.0),
-            (3.0, 6.0, 0.0, 50.0),
+            (0.0, 0.0, 0.0, 22.0),
+            (2.0, 4.0, 0.0, 18.0),
         )
-        early = assess_progress(
-            samples,
-            remaining_seconds=80,
-            total_seconds=90,
-            reference_distance=100,
-            reference_seconds=10,
-        )
-        late = assess_progress(
+        enough_time = assess_progress(
             samples,
             remaining_seconds=10,
-            total_seconds=90,
-            reference_distance=100,
-            reference_seconds=10,
+            route_slack_distance=0,
         )
-        self.assertIsNone(early)
-        self.assertIsNotNone(late)
+        too_late = assess_progress(
+            samples,
+            remaining_seconds=8,
+            route_slack_distance=0,
+        )
+        self.assertIsNone(enough_time)
+        self.assertIsNotNone(too_late)
+        self.assertFalse(too_late.can_finish)
+        self.assertTrue(too_late.making_progress)
+        self.assertAlmostEqual(too_late.projected_seconds, 9.0)
+
+    def test_slow_forward_progress_fails_reachability_only(self):
+        assessment = assess_progress(
+            (
+                (0.0, 0.0, 0.0, 50.0),
+                (2.0, 2.0, 0.0, 48.0),
+            ),
+            remaining_seconds=10,
+            route_slack_distance=0,
+        )
+        self.assertIsNotNone(assessment)
+        self.assertFalse(assessment.can_finish)
+        self.assertTrue(assessment.making_progress)
+        self.assertEqual(
+            assessment.reason,
+            "your current speed is too low to reach the winzone before time expires",
+        )
 
 
 class Sink:
@@ -158,7 +174,56 @@ class ConstantRouteModel:
         return 50.0
 
 
+class LinearRouteModel:
+    cell_size = 1.0
+    reference_distance = 50.0
+
+    def distance_at(self, position):
+        return max(0.0, 50.0 - position[0])
+
+
 class CountdownEnforcementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_insufficient_finish_pace_is_warned_then_killed(self):
+        controller = object.__new__(TronnerRacing)
+        controller.config = {
+            "final_countdown_grief_detection_enabled": True,
+            "final_countdown_grief_early_window_seconds": 2,
+            "final_countdown_grief_late_window_seconds": 2,
+            "final_countdown_grief_early_grace_seconds": 1,
+            "final_countdown_grief_late_grace_seconds": 1,
+            "final_countdown_grief_route_slack_distance": 0,
+        }
+        controller.current = SimpleNamespace(key="Test/maps/Pace-v1.aamap.xml")
+        controller.final_countdown_active = True
+        controller.final_countdown_end_epoch = 20.0
+        controller.final_countdown_duration_seconds = 20.0
+        controller.final_countdown_route_model = LinearRouteModel()
+        controller.final_countdown_route_map_key = controller.current.key
+        controller.final_countdown_progress_states = {}
+        controller.sink = Sink()
+        messages = []
+
+        async def private(_player, message):
+            messages.append(message)
+
+        controller.private = private
+        player = Player("racer", "Racer", connected=True, active=True, alive=True)
+        controller.finalists = {id(player)}
+
+        with mock.patch("TronnerRacing.time.time", return_value=8.0) as clock:
+            await controller._record_final_countdown_progress(player, 0.0, (0.0, 0.0))
+            clock.return_value = 9.0
+            await controller._record_final_countdown_progress(player, 1.0, (1.0, 0.0))
+            clock.return_value = 10.0
+            await controller._record_final_countdown_progress(player, 2.0, (2.0, 0.0))
+            clock.return_value = 11.0
+            await controller._record_final_countdown_progress(player, 3.0, (3.0, 0.0))
+
+        self.assertTrue(
+            any("current speed is too low" in message for message in messages)
+        )
+        self.assertEqual(controller.sink.commands, ["KILL_SILENT racer"])
+
     async def test_persistent_non_progress_is_warned_then_killed(self):
         controller = object.__new__(TronnerRacing)
         controller.config = {
@@ -173,7 +238,6 @@ class CountdownEnforcementTests(unittest.IsolatedAsyncioTestCase):
         controller.final_countdown_active = True
         controller.final_countdown_end_epoch = 20.0
         controller.final_countdown_duration_seconds = 20.0
-        controller.final_countdown_reference_seconds = 10.0
         controller.final_countdown_route_model = ConstantRouteModel()
         controller.final_countdown_route_map_key = controller.current.key
         controller.final_countdown_progress_states = {}
