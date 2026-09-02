@@ -66,6 +66,17 @@ class RouteModelTests(unittest.TestCase):
             )
         )
 
+    def test_wall_between_grid_centers_cannot_disappear(self):
+        model = self.build(
+            '''
+            <Zone effect="win"><ShapeCircle radius="3"><Point x="20" y="50"/></ShapeCircle></Zone>
+            <Wall><Point x="0" y="0"/><Point x="100" y="0"/><Point x="100" y="100"/><Point x="0" y="100"/><Point x="0" y="0"/></Wall>
+            <Wall><Point x="50.5" y="0"/><Point x="50.5" y="100"/></Wall>
+            '''
+        )
+
+        self.assertTrue(math.isinf(model.distance_at((80.0, 50.0))))
+
     def test_death_zone_is_treated_as_route_obstacle(self):
         model = self.build(
             '''
