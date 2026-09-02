@@ -5,7 +5,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from final_countdown_guard import assess_progress, build_route_model
+from final_countdown_guard import (
+    AccelerationCapability,
+    accelerated_travel_distance,
+    assess_progress,
+    build_route_model,
+)
 from TronnerRacing import Player, TronnerRacing
 
 
@@ -21,7 +26,12 @@ def test_map(field: str, axes: str = '<Axes number="4"/>') -> str:
 
 
 class RouteModelTests(unittest.TestCase):
-    def build(self, field: str, axes: str = '<Axes number="4"/>'):
+    def build(
+        self,
+        field: str,
+        axes: str = '<Axes number="4"/>',
+        size_multiplier: float = 1.0,
+    ):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         path = Path(temporary.name) / "guard.aamap.xml"
@@ -30,6 +40,7 @@ class RouteModelTests(unittest.TestCase):
             path,
             maximum_cells=30_000,
             minimum_cell_size=1.0,
+            size_multiplier=size_multiplier,
         )
         self.assertIsNotNone(model)
         return model
@@ -50,11 +61,10 @@ class RouteModelTests(unittest.TestCase):
             math.dist(start, (20.0, 50.0)),
         )
         self.assertLess(model.distance_at(detour), model.distance_at(start))
-        trajectory = tuple(
-            (float(index), point[0], point[1], model.distance_at(point))
-            for index, point in enumerate(
-                ((80.0, 50.0), (80.0, 60.0), (80.0, 70.0))
-            )
+        trajectory = (
+            (0.0, 80.0, 50.0, model.distance_at((80.0, 50.0)), 0.0),
+            (1.0, 80.0, 60.0, model.distance_at((80.0, 60.0)), 10.0),
+            (2.0, 80.0, 70.0, model.distance_at((80.0, 70.0)), 20.0),
         )
         self.assertIsNone(
             assess_progress(
@@ -98,15 +108,60 @@ class RouteModelTests(unittest.TestCase):
         self.assertEqual(len(model.geometry.axis_directions), 4)
         self.assertTrue(math.isfinite(model.distance_at((80.0, 50.0))))
 
+    def test_absolute_teleport_is_a_route_edge_through_a_dividing_wall(self):
+        model = self.build(
+            '''
+            <Zone effect="win"><ShapeCircle radius="3"><Point x="20" y="50"/></ShapeCircle></Zone>
+            <Zone effect="teleport"><ShapeCircle radius="5"><Point x="80" y="50"/><Teleport destX="40" destY="50" modes="abs" reloc="0"/></ShapeCircle></Zone>
+            <Wall><Point x="0" y="0"/><Point x="100" y="0"/><Point x="100" y="100"/><Point x="0" y="100"/><Point x="0" y="0"/></Wall>
+            <Wall><Point x="50" y="0"/><Point x="50" y="100"/></Wall>
+            '''
+        )
+
+        self.assertEqual(len(model.geometry.teleports), 1)
+        self.assertTrue(math.isfinite(model.distance_at((80.0, 50.0))))
+        self.assertLess(model.distance_at((80.0, 50.0)), 30.0)
+        self.assertLess(
+            model.observed_travel_distance((90.0, 50.0), (42.0, 50.0)),
+            10.0,
+        )
+
+    def test_relative_and_cycle_teleports_are_modelled(self):
+        for mode, destination in (("rel", -60), ("cycle", 60)):
+            with self.subTest(mode=mode):
+                model = self.build(
+                    f'''
+                    <Zone effect="win"><ShapeCircle radius="3"><Point x="20" y="50"/></ShapeCircle></Zone>
+                    <Zone effect="teleport"><ShapeCircle radius="5"><Point x="80" y="50"/><Teleport destX="{destination}" destY="0" modes="{mode}" reloc="1"/></ShapeCircle></Zone>
+                    <Wall><Point x="0" y="0"/><Point x="100" y="0"/><Point x="100" y="100"/><Point x="0" y="100"/><Point x="0" y="0"/></Wall>
+                    <Wall><Point x="50" y="0"/><Point x="50" y="100"/></Wall>
+                    '''
+                )
+                self.assertTrue(math.isfinite(model.distance_at((90.0, 50.0))))
+
+    def test_map_size_multiplier_scales_teleport_geometry_and_destination(self):
+        model = self.build(
+            '''
+            <Zone effect="win"><ShapeCircle radius="3"><Point x="20" y="50"/></ShapeCircle></Zone>
+            <Zone effect="teleport"><ShapeCircle radius="5"><Point x="80" y="50"/><Teleport destX="40" destY="50" modes="abs"/></ShapeCircle></Zone>
+            ''',
+            size_multiplier=2.0,
+        )
+
+        teleport = model.geometry.teleports[0]
+        self.assertEqual(teleport.entrance.center, (160.0, 100.0))
+        self.assertEqual(teleport.entrance.radius, 10.0)
+        self.assertEqual(teleport.destination, (80.0, 100.0))
+
 
 class ProgressAssessmentTests(unittest.TestCase):
     def test_fast_circle_can_reach_but_fails_constant_progress(self):
         assessment = assess_progress(
             (
-                (0.0, 0.0, 0.0, 50.0),
-                (1.0, 10.0, 0.0, 50.0),
-                (2.0, 10.0, 10.0, 50.0),
-                (3.0, 0.0, 10.0, 50.0),
+                (0.0, 0.0, 0.0, 50.0, 0.0),
+                (1.0, 10.0, 0.0, 50.0, 10.0),
+                (2.0, 10.0, 10.0, 50.0, 20.0),
+                (3.0, 0.0, 10.0, 50.0, 30.0),
             ),
             remaining_seconds=20,
             route_slack_distance=0,
@@ -121,8 +176,8 @@ class ProgressAssessmentTests(unittest.TestCase):
 
     def test_current_position_and_speed_determine_whether_finish_is_possible(self):
         samples = (
-            (0.0, 0.0, 0.0, 22.0),
-            (2.0, 4.0, 0.0, 18.0),
+            (0.0, 0.0, 0.0, 22.0, 0.0),
+            (2.0, 4.0, 0.0, 18.0, 4.0),
         )
         enough_time = assess_progress(
             samples,
@@ -143,8 +198,8 @@ class ProgressAssessmentTests(unittest.TestCase):
     def test_slow_forward_progress_fails_reachability_only(self):
         assessment = assess_progress(
             (
-                (0.0, 0.0, 0.0, 50.0),
-                (2.0, 2.0, 0.0, 48.0),
+                (0.0, 0.0, 0.0, 50.0, 0.0),
+                (2.0, 2.0, 0.0, 48.0, 2.0),
             ),
             remaining_seconds=10,
             route_slack_distance=0,
@@ -154,8 +209,88 @@ class ProgressAssessmentTests(unittest.TestCase):
         self.assertTrue(assessment.making_progress)
         self.assertEqual(
             assessment.reason,
-            "your current speed is too low to reach the winzone before time expires",
+            "your projected pace cannot reach the winzone before time expires",
         )
+
+    def test_base_speed_recovery_can_make_a_run_reachable(self):
+        samples = (
+            (0.0, 0.0, 0.0, 900.0, 0.0),
+            (2.0, 100.0, 0.0, 800.0, 100.0),
+        )
+        self.assertIsNotNone(
+            assess_progress(
+                samples,
+                remaining_seconds=10,
+                route_slack_distance=0,
+            )
+        )
+        capability = AccelerationCapability.from_settings(
+            {
+                "CYCLE_SPEED": "125",
+                "CYCLE_SPEED_DECAY_BELOW": "0.2",
+                "CYCLE_SPEED_DECAY_ABOVE": "0.2",
+                "CYCLE_ACCEL": "0",
+                "REAL_CYCLE_SPEED_FACTOR": "1",
+            }
+        )
+        expected_distance = 1250 + (50 - 125) * (1 - math.exp(-2)) / 0.2
+        self.assertAlmostEqual(
+            accelerated_travel_distance(50, 10, capability),
+            expected_distance,
+        )
+        self.assertIsNone(
+            assess_progress(
+                samples,
+                remaining_seconds=10,
+                route_slack_distance=0,
+                acceleration_capability=capability,
+            )
+        )
+
+    def test_wall_acceleration_envelope_uses_engine_settings(self):
+        capability = AccelerationCapability.from_settings(
+            {
+                "CYCLE_SPEED": "10",
+                "CYCLE_ACCEL": "10",
+                "CYCLE_ACCEL_SELF": "1",
+                "CYCLE_ACCEL_TEAM": "1",
+                "CYCLE_ACCEL_ENEMY": "1",
+                "CYCLE_ACCEL_RIM": "0",
+                "CYCLE_ACCEL_SLINGSHOT": "1",
+                "CYCLE_ACCEL_TUNNEL": "1",
+                "CYCLE_ACCEL_OFFSET": "2",
+                "CYCLE_WALL_NEAR": "6",
+            }
+        )
+        self.assertAlmostEqual(capability.external_acceleration, 7.5)
+
+    def test_controller_reads_active_engine_acceleration_snapshot(self):
+        class SettingsStore:
+            @staticmethod
+            def replay_settings_ref(identifier):
+                return 7 if identifier == "active" else None
+
+            @staticmethod
+            def dashboard_replay_settings(settings_ref):
+                self.assertEqual(settings_ref, 7)
+                return {
+                    "settings": [
+                        ["CYCLE_SPEED", "125"],
+                        ["CYCLE_SPEED_DECAY_BELOW", "0.2"],
+                        ["CYCLE_SPEED_DECAY_ABOVE", "0.2"],
+                        ["CYCLE_ACCEL", "0"],
+                        ["REAL_CYCLE_SPEED_FACTOR", "1"],
+                    ]
+                }
+
+        controller = object.__new__(TronnerRacing)
+        controller.active_replay_settings_identifier = "active"
+        controller.store = SettingsStore()
+        capability = controller._active_acceleration_capability()
+
+        self.assertIsNotNone(capability)
+        self.assertEqual(capability.base_speed, 125)
+        self.assertEqual(capability.decay_below, 0.2)
 
 
 class Sink:
@@ -173,6 +308,9 @@ class ConstantRouteModel:
     def distance_at(self, _position):
         return 50.0
 
+    def observed_travel_distance(self, start, end):
+        return math.dist(start, end)
+
 
 class LinearRouteModel:
     cell_size = 1.0
@@ -180,6 +318,9 @@ class LinearRouteModel:
 
     def distance_at(self, position):
         return max(0.0, 50.0 - position[0])
+
+    def observed_travel_distance(self, start, end):
+        return math.dist(start, end)
 
 
 class CountdownEnforcementTests(unittest.IsolatedAsyncioTestCase):
@@ -220,7 +361,7 @@ class CountdownEnforcementTests(unittest.IsolatedAsyncioTestCase):
             await controller._record_final_countdown_progress(player, 3.0, (3.0, 0.0))
 
         self.assertTrue(
-            any("current speed is too low" in message for message in messages)
+            any("projected pace cannot reach" in message for message in messages)
         )
         self.assertEqual(controller.sink.commands, ["KILL_SILENT racer"])
 

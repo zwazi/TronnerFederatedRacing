@@ -16,6 +16,8 @@ bounded distance-to-finish field. The field:
 
 - uses the map's regular or explicitly configured axis directions;
 - blocks static wall segments, death circles, and death polygons;
+- treats absolute, map-relative, and cycle-relative teleport zones as directed
+  zero-travel-distance route edges;
 - accepts every circular or polygonal winzone as a goal; and
 - is built in a worker thread with a configured cell limit.
 
@@ -30,6 +32,11 @@ field still cannot certify a spawn-to-winzone route, the server script disables
 route judgments for that map and retains the native input-idle fallback. It
 does not substitute straight-line distance.
 
+Teleport destinations use the same `abs`, `rel`, and `cycle` formulas as the
+patched game engine. The route field can chain multiple teleports. Teleport
+displacement shortens the remaining route but is excluded from measured driving
+distance, so a large jump cannot be mistaken for extreme cycle speed.
+
 Checkpoint maps are also conservative: until a player has collected every
 required checkpoint, the winzone field is not used to judge that player.
 
@@ -37,10 +44,14 @@ required checkpoint, the winzone field is not used to judge that player.
 
 The rolling trajectory supplies two independent answers:
 
-1. **Can the racer finish in time?** The server script divides the wall-aware
-   distance from the racer's current position by their measured ground speed.
-   The resulting projected travel time must fit inside the countdown time that
-   remains.
+1. **Can the racer finish in time?** The server script projects travel over the
+   wall-aware distance from the racer's current position using recent measured
+   ground speed and the active engine settings snapshot. The projection includes
+   recovery toward `CYCLE_SPEED`, the configured below/above-base decay rates,
+   the maximum wall-acceleration envelope, the real cycle-speed multiplier, and
+   any configured speed cap. It deliberately assumes maximum available
+   acceleration so a run is not ended when the player could still accelerate
+   enough to finish.
 2. **Is the racer making consistent progress?** The wall-aware distance must
    trend downward by more than the route field's small raster-noise allowance
    over the rolling observation window. Fast circles and sustained movement

@@ -19,11 +19,11 @@ import heapq
 import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 
 Point = tuple[float, float]
-TimedProgressSample = tuple[float, float, float, float]
+TimedProgressSample = tuple[float, float, float, float, float]
 
 
 def _local_name(tag: str) -> str:
@@ -76,6 +76,52 @@ class Circle:
 
 
 @dataclasses.dataclass(frozen=True)
+class Teleport:
+    entrance: Circle
+    destination: Point
+    mode: str
+    relocation: float
+
+    def exits_from(
+        self,
+        position: Point,
+        directions: Sequence[Point],
+    ) -> tuple[Point, ...]:
+        if self.mode == "abs":
+            return (self.destination,)
+        exits: list[Point] = []
+        for direction in directions:
+            normal = (-direction[1], direction[0])
+            toward_center = (
+                (self.entrance.center[0] - position[0]) * direction[0]
+                + (self.entrance.center[1] - position[1]) * direction[1]
+            )
+            crossing_distance = 2.0 * toward_center
+            if crossing_distance <= 0:
+                continue
+            relocation = (
+                direction[0] * crossing_distance * self.relocation,
+                direction[1] * crossing_distance * self.relocation,
+            )
+            if self.mode == "cycle":
+                offset = (
+                    direction[0] * self.destination[0]
+                    + normal[0] * self.destination[1],
+                    direction[1] * self.destination[0]
+                    + normal[1] * self.destination[1],
+                )
+            else:
+                offset = self.destination
+            exits.append(
+                (
+                    position[0] + offset[0] + relocation[0],
+                    position[1] + offset[1] + relocation[1],
+                )
+            )
+        return tuple(exits)
+
+
+@dataclasses.dataclass(frozen=True)
 class MapGeometry:
     axis_directions: tuple[Point, ...]
     wall_segments: tuple[tuple[Point, Point], ...]
@@ -83,6 +129,7 @@ class MapGeometry:
     death_polygons: tuple[tuple[Point, ...], ...]
     win_circles: tuple[Circle, ...]
     win_polygons: tuple[tuple[Point, ...], ...]
+    teleports: tuple[Teleport, ...]
     spawns: tuple[Point, ...]
 
     @property
@@ -100,7 +147,19 @@ def _node_direction(node: ET.Element) -> Point:
     )
 
 
-def parse_map_geometry(path: Path) -> MapGeometry:
+def parse_map_geometry(
+    path: Path,
+    *,
+    size_multiplier: float = 1.0,
+) -> MapGeometry:
+    size_multiplier = max(1e-6, float(size_multiplier))
+
+    def scaled_point(node: ET.Element) -> Point:
+        return (
+            float(node.attrib["x"]) * size_multiplier,
+            float(node.attrib["y"]) * size_multiplier,
+        )
+
     root = ET.parse(path).getroot()
     axes_node = next(
         (node for node in root.iter() if _local_name(node.tag) == "Axes"),
@@ -142,12 +201,13 @@ def parse_map_geometry(path: Path) -> MapGeometry:
     death_polygons: list[tuple[Point, ...]] = []
     win_circles: list[Circle] = []
     win_polygons: list[tuple[Point, ...]] = []
+    teleports: list[Teleport] = []
 
     for node in root.iter():
         name = _local_name(node.tag)
         if name == "Wall":
             points = [
-                (float(child.attrib["x"]), float(child.attrib["y"]))
+                scaled_point(child)
                 for child in node
                 if _local_name(child.tag) == "Point"
                 and "x" in child.attrib
@@ -155,28 +215,63 @@ def parse_map_geometry(path: Path) -> MapGeometry:
             ]
             wall_segments.extend(zip(points, points[1:]))
         elif name == "Spawn" and "x" in node.attrib and "y" in node.attrib:
-            spawns.append((float(node.attrib["x"]), float(node.attrib["y"])))
+            spawns.append(scaled_point(node))
         elif name == "Zone":
             effect = node.attrib.get("effect", "").casefold()
-            if effect not in {"death", "win"}:
+            if effect not in {"death", "teleport", "win"}:
                 continue
-            circles = win_circles if effect == "win" else death_circles
-            polygons = win_polygons if effect == "win" else death_polygons
             for shape in node:
                 shape_name = _local_name(shape.tag)
                 points = [
-                    (float(point.attrib["x"]), float(point.attrib["y"]))
+                    scaled_point(point)
                     for point in shape
                     if _local_name(point.tag) == "Point"
                     and "x" in point.attrib
                     and "y" in point.attrib
                 ]
                 if shape_name == "ShapeCircle" and points:
-                    circles.append(
-                        Circle(points[0], abs(float(shape.attrib.get("radius", "0"))))
+                    circle = Circle(
+                        points[0],
+                        abs(float(shape.attrib.get("radius", "0")))
+                        * size_multiplier,
                     )
+                    if effect == "teleport":
+                        teleport_node = next(
+                            (
+                                child
+                                for child in shape
+                                if _local_name(child.tag) == "Teleport"
+                            ),
+                            None,
+                        )
+                        if teleport_node is not None:
+                            mode = teleport_node.attrib.get("modes", "abs").casefold()
+                            teleports.append(
+                                Teleport(
+                                    entrance=circle,
+                                    destination=(
+                                        float(teleport_node.attrib.get("destX", "0"))
+                                        * size_multiplier,
+                                        float(teleport_node.attrib.get("destY", "0"))
+                                        * size_multiplier,
+                                    ),
+                                    mode=(
+                                        mode if mode in {"abs", "cycle", "rel"} else "abs"
+                                    ),
+                                    relocation=float(
+                                        teleport_node.attrib.get("reloc", "1")
+                                    ),
+                                )
+                            )
+                    elif effect == "win":
+                        win_circles.append(circle)
+                    else:
+                        death_circles.append(circle)
                 elif shape_name == "ShapePolygon" and len(points) >= 3:
-                    polygons.append(tuple(points))
+                    if effect == "win":
+                        win_polygons.append(tuple(points))
+                    elif effect == "death":
+                        death_polygons.append(tuple(points))
 
     return MapGeometry(
         axis_directions=tuple(normalized_directions),
@@ -185,6 +280,7 @@ def parse_map_geometry(path: Path) -> MapGeometry:
         death_polygons=tuple(death_polygons),
         win_circles=tuple(win_circles),
         win_polygons=tuple(win_polygons),
+        teleports=tuple(teleports),
         spawns=tuple(spawns),
     )
 
@@ -262,6 +358,37 @@ class RouteModel:
                 )
         return min(candidates) if candidates else math.inf
 
+    def observed_travel_distance(self, start: Point, end: Point) -> float:
+        """Estimate driven distance without charging for a teleport jump."""
+        best = math.dist(start, end)
+        for teleport in self.geometry.teleports:
+            entrance_distance = max(
+                0.0,
+                math.dist(start, teleport.entrance.center)
+                - teleport.entrance.radius,
+            )
+            entry_points = (
+                teleport.entrance.center,
+                *(
+                    (
+                        teleport.entrance.center[0]
+                        - direction[0] * teleport.entrance.radius,
+                        teleport.entrance.center[1]
+                        - direction[1] * teleport.entrance.radius,
+                    )
+                    for direction in self.geometry.axis_directions
+                ),
+            )
+            for entry in entry_points:
+                for destination in teleport.exits_from(
+                    entry, self.geometry.axis_directions
+                ):
+                    best = min(
+                        best,
+                        entrance_distance + math.dist(destination, end),
+                    )
+        return best
+
     def distance_at(self, position: Point, search_radius: int = 4) -> float:
         cell_x, cell_y = self._nearest_cell(position)
         best = math.inf
@@ -312,8 +439,9 @@ def build_route_model(
     maximum_cells: int = 100_000,
     minimum_cell_size: float = 1.0,
     wall_clearance_cells: float = 0.72,
+    size_multiplier: float = 1.0,
 ) -> RouteModel | None:
-    geometry = parse_map_geometry(path)
+    geometry = parse_map_geometry(path, size_multiplier=size_multiplier)
     if not geometry.has_goal:
         return None
 
@@ -329,6 +457,31 @@ def build_route_model(
         )
     for polygon in (*geometry.death_polygons, *geometry.win_polygons):
         boundary_points.extend(polygon)
+    for teleport in geometry.teleports:
+        radius = teleport.entrance.radius
+        boundary_points.extend(
+            (
+                (
+                    teleport.entrance.center[0] - radius,
+                    teleport.entrance.center[1] - radius,
+                ),
+                (
+                    teleport.entrance.center[0] + radius,
+                    teleport.entrance.center[1] + radius,
+                ),
+            )
+        )
+        if teleport.mode == "abs":
+            boundary_points.append(teleport.destination)
+            continue
+        for direction in geometry.axis_directions:
+            entry = (
+                teleport.entrance.center[0] - direction[0] * radius,
+                teleport.entrance.center[1] - direction[1] * radius,
+            )
+            boundary_points.extend(
+                teleport.exits_from(entry, geometry.axis_directions)
+            )
     if not boundary_points:
         return None
 
@@ -514,6 +667,60 @@ def build_route_model(
                 return False
         return True
 
+    def nearest_safe_cell(point: Point) -> tuple[int, int] | None:
+        center_x = int(round((point[0] - origin_x) / cell_size))
+        center_y = int(round((point[1] - origin_y) / cell_size))
+        for radius in range(5):
+            candidates = [
+                (x, y)
+                for y in range(center_y - radius, center_y + radius + 1)
+                for x in range(center_x - radius, center_x + radius + 1)
+                if 0 <= x < width
+                and 0 <= y < height
+                and not blocked[index(x, y)]
+            ]
+            if candidates:
+                return min(
+                    candidates,
+                    key=lambda cell: math.dist(grid_point(*cell), point),
+                )
+        return None
+
+    # A teleport is a directed, zero-travel-distance edge from every safe
+    # entrance cell to its engine-defined destination. Store the reverse edges
+    # because the distance field grows backward from the winzone.
+    teleport_predecessors: dict[int, list[tuple[int, float]]] = {}
+    for teleport in geometry.teleports:
+        entrance = teleport.entrance
+        xs, ys = grid_bounds(
+            entrance.center[0] - entrance.radius,
+            entrance.center[1] - entrance.radius,
+            entrance.center[0] + entrance.radius,
+            entrance.center[1] + entrance.radius,
+        )
+        for y in ys:
+            for x in xs:
+                source = index(x, y)
+                source_point = grid_point(x, y)
+                if (
+                    blocked[source]
+                    or math.dist(source_point, entrance.center) > entrance.radius
+                ):
+                    continue
+                for destination in teleport.exits_from(
+                    source_point, geometry.axis_directions
+                ):
+                    exit_cell = nearest_safe_cell(destination)
+                    if exit_cell is None:
+                        continue
+                    exit_index = index(*exit_cell)
+                    teleport_predecessors.setdefault(exit_index, []).append(
+                        (
+                            source,
+                            math.dist(destination, grid_point(*exit_cell)),
+                        )
+                    )
+
     while queue:
         distance, current = heapq.heappop(queue)
         if distance != distances[current]:
@@ -535,6 +742,11 @@ def build_route_model(
             if candidate + 1e-9 < distances[previous]:
                 distances[previous] = candidate
                 heapq.heappush(queue, (candidate, previous))
+        for previous, transition_cost in teleport_predecessors.get(current, ()):
+            candidate = distance + transition_cost
+            if candidate + 1e-9 < distances[previous]:
+                distances[previous] = candidate
+                heapq.heappush(queue, (candidate, previous))
 
     return RouteModel(
         geometry=geometry,
@@ -546,6 +758,213 @@ def build_route_model(
         blocked=blocked,
         distances=distances,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class AccelerationCapability:
+    base_speed: float = 0.0
+    decay_below: float = 0.0
+    decay_above: float = 0.0
+    external_acceleration: float = 0.0
+    maximum_speed: float = 0.0
+
+    @classmethod
+    def from_settings(cls, settings: Mapping[str, str]) -> AccelerationCapability:
+        def value(name: str, default: float) -> float:
+            try:
+                parsed = float(settings.get(name, str(default)))
+            except (TypeError, ValueError):
+                return default
+            return parsed if math.isfinite(parsed) else default
+
+        speed_multiplier = max(0.0, value("REAL_CYCLE_SPEED_FACTOR", 1.0))
+        base_speed = max(0.0, value("CYCLE_SPEED", 10.0) * speed_multiplier)
+        cycle_acceleration = max(0.0, value("CYCLE_ACCEL", 10.0))
+        self_acceleration = max(0.0, value("CYCLE_ACCEL_SELF", 1.0))
+        other_acceleration = max(
+            0.0,
+            value("CYCLE_ACCEL_TEAM", 1.0),
+            value("CYCLE_ACCEL_ENEMY", 1.0),
+            value("CYCLE_ACCEL_RIM", 0.0),
+        )
+        single_acceleration = max(self_acceleration, other_acceleration)
+        slingshot_acceleration = (
+            single_acceleration + self_acceleration
+        ) * max(0.0, value("CYCLE_ACCEL_SLINGSHOT", 1.0))
+        tunnel_acceleration = other_acceleration * max(
+            0.0, value("CYCLE_ACCEL_TUNNEL", 1.0)
+        )
+        maximum_multiplier = max(
+            single_acceleration,
+            slingshot_acceleration,
+            tunnel_acceleration,
+        )
+        acceleration_offset = max(
+            1e-6, value("CYCLE_ACCEL_OFFSET", 2.0)
+        )
+        wall_near = max(0.0, value("CYCLE_WALL_NEAR", 6.0))
+        wall_factor = (
+            1.0 / acceleration_offset
+            - 1.0 / (acceleration_offset + wall_near)
+            if wall_near > 0
+            else 0.0
+        )
+        external_acceleration = (
+            speed_multiplier
+            * cycle_acceleration
+            * maximum_multiplier
+            * wall_factor
+        )
+        brake = value("CYCLE_BRAKE", 30.0)
+        if brake < 0:
+            external_acceleration += -brake * speed_multiplier
+        maximum_speed_factor = max(0.0, value("CYCLE_SPEED_MAX", 0.0))
+        return cls(
+            base_speed=base_speed,
+            decay_below=max(0.0, value("CYCLE_SPEED_DECAY_BELOW", 5.0)),
+            decay_above=max(0.0, value("CYCLE_SPEED_DECAY_ABOVE", 0.1)),
+            external_acceleration=max(0.0, external_acceleration),
+            maximum_speed=(
+                base_speed * maximum_speed_factor
+                if maximum_speed_factor > 0
+                else 0.0
+            ),
+        )
+
+
+def _acceleration_phase(
+    initial_speed: float,
+    seconds: float,
+    *,
+    base_speed: float,
+    decay: float,
+    external_acceleration: float,
+    maximum_speed: float,
+) -> tuple[float, float]:
+    seconds = max(0.0, seconds)
+    speed = max(0.0, initial_speed)
+    if seconds <= 0:
+        return 0.0, speed
+    if maximum_speed > 0 and speed >= maximum_speed:
+        return maximum_speed * seconds, maximum_speed
+    if decay <= 1e-9:
+        if external_acceleration <= 1e-9:
+            return speed * seconds, speed
+        cap_time = math.inf
+        if maximum_speed > speed:
+            cap_time = (maximum_speed - speed) / external_acceleration
+        accelerating_time = min(seconds, cap_time)
+        distance = (
+            speed * accelerating_time
+            + 0.5 * external_acceleration * accelerating_time**2
+        )
+        final_speed = speed + external_acceleration * accelerating_time
+        if accelerating_time < seconds:
+            distance += maximum_speed * (seconds - accelerating_time)
+            final_speed = maximum_speed
+        return distance, final_speed
+
+    target_speed = base_speed + external_acceleration / decay
+    cap_time = math.inf
+    if (
+        maximum_speed > speed
+        and target_speed > maximum_speed
+        and target_speed > speed
+    ):
+        cap_time = math.log(
+            (target_speed - speed) / (target_speed - maximum_speed)
+        ) / decay
+    accelerating_time = min(seconds, cap_time)
+    decay_amount = math.exp(-decay * accelerating_time)
+    final_speed = target_speed + (speed - target_speed) * decay_amount
+    distance = (
+        target_speed * accelerating_time
+        + (speed - target_speed) * (1.0 - decay_amount) / decay
+    )
+    if accelerating_time < seconds:
+        distance += maximum_speed * (seconds - accelerating_time)
+        final_speed = maximum_speed
+    return max(0.0, distance), max(0.0, final_speed)
+
+
+def accelerated_travel_distance(
+    initial_speed: float,
+    seconds: float,
+    capability: AccelerationCapability | None,
+) -> float:
+    if capability is None:
+        return max(0.0, initial_speed) * max(0.0, seconds)
+    remaining = max(0.0, seconds)
+    speed = max(0.0, initial_speed)
+    distance = 0.0
+    base_speed = max(0.0, capability.base_speed)
+    maximum_speed = max(0.0, capability.maximum_speed)
+    if speed < base_speed:
+        crossing_time = math.inf
+        if maximum_speed > 0 and maximum_speed <= base_speed:
+            crossing_time = math.inf
+        elif capability.external_acceleration > 1e-9:
+            if capability.decay_below > 1e-9:
+                target = (
+                    base_speed
+                    + capability.external_acceleration / capability.decay_below
+                )
+                crossing_time = math.log(
+                    (target - speed) / (target - base_speed)
+                ) / capability.decay_below
+            else:
+                crossing_time = (
+                    base_speed - speed
+                ) / capability.external_acceleration
+        below_time = min(remaining, crossing_time)
+        below_distance, speed = _acceleration_phase(
+            speed,
+            below_time,
+            base_speed=base_speed,
+            decay=capability.decay_below,
+            external_acceleration=capability.external_acceleration,
+            maximum_speed=maximum_speed,
+        )
+        distance += below_distance
+        remaining -= below_time
+        if remaining <= 1e-9:
+            return distance
+        speed = max(speed, base_speed)
+    above_distance, _ = _acceleration_phase(
+        speed,
+        remaining,
+        base_speed=base_speed,
+        decay=capability.decay_above,
+        external_acceleration=capability.external_acceleration,
+        maximum_speed=maximum_speed,
+    )
+    return distance + above_distance
+
+
+def accelerated_travel_seconds(
+    distance: float,
+    initial_speed: float,
+    capability: AccelerationCapability | None,
+) -> float:
+    distance = max(0.0, distance)
+    if distance <= 0:
+        return 0.0
+    high = 1.0
+    while (
+        high < 86_400.0
+        and accelerated_travel_distance(initial_speed, high, capability) < distance
+    ):
+        high *= 2.0
+    if accelerated_travel_distance(initial_speed, high, capability) < distance:
+        return math.inf
+    low = 0.0
+    for _ in range(48):
+        middle = (low + high) / 2.0
+        if accelerated_travel_distance(initial_speed, middle, capability) >= distance:
+            high = middle
+        else:
+            low = middle
+    return high
 
 
 @dataclasses.dataclass(frozen=True)
@@ -568,6 +987,7 @@ class PlayerProgressState:
     violation_started_at: float | None = None
     last_reason: str = ""
     killed: bool = False
+    travel_distance: float = 0.0
 
     def clear_violation(self) -> None:
         self.warned_at = None
@@ -580,17 +1000,24 @@ def assess_progress(
     *,
     remaining_seconds: float,
     route_slack_distance: float = 2.0,
+    acceleration_capability: AccelerationCapability | None = None,
 ) -> ProgressAssessment | None:
     if len(samples) < 2:
         return None
     duration = samples[-1][0] - samples[0][0]
     if duration <= 0:
         return None
-    path_distance = sum(
-        math.hypot(current[1] - previous[1], current[2] - previous[2])
-        for previous, current in zip(samples, samples[1:])
+    recent_start = 0
+    for index, sample in enumerate(samples[:-1]):
+        if samples[-1][0] - sample[0] <= min(3.0, duration):
+            recent_start = index
+            break
+    recent_duration = samples[-1][0] - samples[recent_start][0]
+    ground_speed = (
+        max(0.0, samples[-1][4] - samples[recent_start][4]) / recent_duration
+        if recent_duration > 1e-9
+        else 0.0
     )
-    ground_speed = path_distance / duration
 
     # A least-squares slope is more resistant to one raster-cell jump than a
     # first-to-last comparison.  Negative distance slope means goal progress.
@@ -613,13 +1040,16 @@ def assess_progress(
         if available_seconds > 1e-9
         else math.inf
     )
-    projected_seconds = (
-        remaining_distance / ground_speed if ground_speed > 1e-9 else math.inf
+    projected_seconds = accelerated_travel_seconds(
+        remaining_distance,
+        ground_speed,
+        acceleration_capability,
     )
 
-    # Reachability is intentionally optimistic: it uses the racer's measured
-    # ground speed over the wall-aware remaining route. Direction is evaluated
-    # independently below, so a fast circle cannot pass merely by moving fast.
+    # Reachability is intentionally optimistic: it uses the racer's recent
+    # measured speed and maximum configured acceleration capability over the
+    # wall-aware remaining route. Direction is evaluated independently below,
+    # so a fast circle cannot pass merely by moving fast.
     can_finish = projected_seconds <= available_seconds
     making_progress = (
         net_progress > slack_distance
@@ -630,13 +1060,11 @@ def assess_progress(
         return None
     if not can_finish and not making_progress:
         reason = (
-            "your current speed is too low to reach the winzone before time "
-            "expires and you are not making consistent progress toward it"
+            "your projected pace cannot reach the winzone before time expires "
+            "and you are not making consistent progress toward it"
         )
     elif not can_finish:
-        reason = (
-            "your current speed is too low to reach the winzone before time expires"
-        )
+        reason = "your projected pace cannot reach the winzone before time expires"
     else:
         reason = "you are not making consistent progress toward the winzone"
     return ProgressAssessment(
