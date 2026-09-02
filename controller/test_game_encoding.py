@@ -34,6 +34,20 @@ class GameEncodingTests(unittest.IsolatedAsyncioTestCase):
                 "utf-8",
             )
 
+    def test_encoding_detection_does_not_scan_a_large_ladderlog_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ladderlog = Path(tmp) / "ladderlog.txt"
+            ladderlog.write_bytes(
+                b"ENCODING utf8\n"
+                + b"PLAYER_GRIDPOS racer 1 2 3 4\n" * 80_000
+                + b"ENCODING latin1\n"
+            )
+
+            self.assertEqual(
+                detect_game_text_encoding(ladderlog),
+                canonical_game_text_encoding("ISO-8859-1"),
+            )
+
     def test_latin1_player_name_round_trips_without_replacement(self):
         raw = b"0xaaaaffn\xe9lg (H\xd6NK)"
         encoding = canonical_game_text_encoding("latin1")
