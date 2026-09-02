@@ -139,6 +139,10 @@ install -d -o root -g root -m 0755 /opt/TronnerRacing
 rsync -a --delete --exclude __pycache__ "$repository_dir/controller/" /opt/TronnerRacing/
 chown -R root:root /opt/TronnerRacing
 chmod 0755 /opt/TronnerRacing/TronnerRacing.py
+# The service account cannot write beneath /opt. Compile during installation so
+# a graceful reload does not have to parse the large server script at low CPU
+# priority before it can resume players.
+python3 -m compileall -q /opt/TronnerRacing
 
 game_config_dir=/opt/armagetronad/etc/games/armagetronad-dedicated
 install -d -o root -g armagetron -m 0755 "$game_config_dir"
