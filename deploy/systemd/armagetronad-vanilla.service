@@ -1,5 +1,5 @@
 [Unit]
-Description=Unfederated vanilla Armagetron dedicated server
+Description=Vanilla Armagetron dedicated server
 Documentation=https://github.com/ArmagetronAd/armagetronad
 Wants=network-online.target
 After=network-online.target

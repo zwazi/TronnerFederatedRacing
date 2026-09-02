@@ -1,6 +1,6 @@
 [Unit]
 Description=Tronner Racing controller and map mirror
-Documentation=https://github.com/zwazi/TronnerFederatedRacing
+Documentation=https://github.com/zwazi/TronnerRacing
 Requires=armagetronad.service
 Wants=network-online.target
 After=network-online.target armagetronad.service

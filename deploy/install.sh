@@ -87,13 +87,6 @@ import json,sys
 print(int(bool(json.load(open(sys.argv[1], encoding="utf-8"))["firebaseEnabled"])))
 PY
 )
-federation_enabled=$(
-    python3 - "$render_dir/manifest.json" <<'PY'
-import json,sys
-print(int(bool(json.load(open(sys.argv[1], encoding="utf-8"))["federationEnabled"])))
-PY
-)
-
 if ((${#required_secrets[@]} || firebase_enabled)); then
     [[ -n "$secrets_dir" && -d "$secrets_dir" ]] || {
         echo "This node requires --secrets-dir." >&2
@@ -144,31 +137,19 @@ fi
 
 install -d -o root -g root -m 0755 /opt/TronnerRacing
 rsync -a --delete --exclude __pycache__ "$repository_dir/controller/" /opt/TronnerRacing/
-install -m 0755 "$repository_dir/tools/check_federation_health.py" \
-    /opt/TronnerRacing/check_federation_health.py
 chown -R root:root /opt/TronnerRacing
-chmod 0755 /opt/TronnerRacing/TronnerRacing.py \
-    /opt/TronnerRacing/federation_sidecar.py \
-    /opt/TronnerRacing/check_federation_health.py
+chmod 0755 /opt/TronnerRacing/TronnerRacing.py
 
 game_config_dir=/opt/armagetronad/etc/games/armagetronad-dedicated
 install -d -o root -g armagetron -m 0755 "$game_config_dir"
 install -m 0644 "$repository_dir/config/tronner-racing.cfg" "$game_config_dir/tronner-racing.cfg"
 install -m 0644 "$render_dir/server.cfg" "$game_config_dir/server.cfg"
-install -m 0644 "$render_dir/federation.cfg" "$game_config_dir/federation.cfg"
 ln -sfn "$game_config_dir" /etc/armagetronad-dedicated
 
 install -d -o root -g armagetron -m 0750 /etc/tronner-racing
 install -m 0640 -o root -g armagetron "$render_dir/controller.json" /etc/tronner-racing/config.json
 install -m 0644 -o root -g root "$repository_dir/config/helpful_messages.txt" /etc/tronner-racing/helpful_messages.txt
 
-install -d -o root -g armagetron -m 0750 /etc/tronner-federation /etc/tronner-federation/keys
-if ((federation_enabled)); then
-    install -m 0640 -o root -g armagetron "$render_dir/federation.json" /etc/tronner-federation/config.json
-    for name in "${required_secrets[@]}"; do
-        install -m 0640 -o root -g armagetron "$secrets_dir/$name" "/etc/tronner-federation/keys/$name"
-    done
-fi
 if ((firebase_enabled)); then
     install -m 0640 -o root -g armagetron \
         "$secrets_dir/firebase-service-account.json" \
@@ -182,23 +163,13 @@ install -d -o armagetron -g armagetron -m 0755 \
 touch /var/lib/armagetronad/console.in /var/lib/armagetronad/ladderlog.txt
 chown armagetron:armagetron /var/lib/armagetronad/console.in /var/lib/armagetronad/ladderlog.txt
 
-for unit in armagetronad.service tronner-racing.service tronner-federation.service; do
+for unit in armagetronad.service tronner-racing.service; do
     install -m 0644 "$repository_dir/deploy/systemd/$unit" "/etc/systemd/system/$unit"
 done
 systemctl daemon-reload
 systemctl enable armagetronad.service tronner-racing.service
-if ((federation_enabled)); then
-    systemctl enable tronner-federation.service
-    runuser -u armagetron -- python3 /opt/TronnerRacing/federation_sidecar.py \
-        --config /etc/tronner-federation/config.json --check
-else
-    systemctl disable tronner-federation.service >/dev/null 2>&1 || true
-fi
 
 if ((start_services)); then
-    if ((federation_enabled)); then
-        systemctl restart tronner-federation.service
-    fi
     systemctl restart armagetronad.service
     systemctl restart tronner-racing.service
 fi

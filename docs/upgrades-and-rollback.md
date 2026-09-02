@@ -1,17 +1,13 @@
 # Upgrades and rollback
 
-Pin production nodes to a tagged release. Before an upgrade, save checksums of
-the installed engine and five controller modules, back up runtime state through
-the private operations system, and run the release tests without contacting
-production services.
+Run the full tests and render the intended production configuration before an
+upgrade. Back up the controller database, map overrides, and configuration;
+never copy credentials into Git.
 
-Upgrade the follower first while it remains unlisted, verify protocol
-compatibility, then upgrade the leader in an approved maintenance window. An
-engine replacement disconnects players; a controller/sidecar change may still
-affect live synchronization and must not be treated as a harmless file copy.
+Deploy controller-only changes with the graceful controller reload path so
+active runs finish. Engine or game-configuration changes require the explicit
+server restart countdown. Verify the game process, controller process, live
+dashboard age, map, player snapshot, and one completed run afterward.
 
-Keep the prior engine binary and controller modules in a root-only timestamped
-directory. Rollback restores the complete matching set, not an individual
-module from another release. Verify hashes, configuration checks, service
-health, federation heartbeat, and one synchronized natural map transition
-before declaring the rollout complete.
+Rollback by reinstalling the previously pinned release and restoring only a
+schema-compatible database backup. Keep immutable map/replay resources intact.

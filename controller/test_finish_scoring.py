@@ -45,6 +45,13 @@ class FinishScoringTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 controller.sink.commands.count("KILL_SILENT racer"), 1
             )
+            self.assertTrue(
+                any(command.startswith("PLAYER_MESSAGE racer ") for command in controller.sink.commands)
+            )
+            self.assertFalse(
+                any(command.startswith("CONSOLE_MESSAGE ") and "Finish:" in command
+                    for command in controller.sink.commands)
+            )
 
             player.alive = True
             player.attempt_started_game = 20.0
@@ -62,6 +69,33 @@ class FinishScoringTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT COUNT(*) FROM finishes"
             ).fetchone()[0]
             self.assertEqual(finishes, 2)
+            controller.store.close()
+
+    async def test_results_command_hides_and_restores_finish_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = object.__new__(Controller)
+            controller.sink = self.Sink()
+            controller.store = StateStore(Path(tmp) / "state.sqlite3")
+            racer = Player("racer", "Racer")
+            viewer = Player("viewer", "Viewer")
+            controller.players = {"racer": racer, "viewer": viewer}
+            controller.result_message_preferences = {}
+
+            await controller._command_results(viewer)
+            self.assertFalse(
+                controller.result_message_preferences[viewer.identity_key]
+            )
+            controller.sink.commands.clear()
+            await controller.result_message("Finish: 12.345, Rank: 1")
+            self.assertTrue(any(command.startswith("PLAYER_MESSAGE racer ")
+                                for command in controller.sink.commands))
+            self.assertFalse(any(command.startswith("PLAYER_MESSAGE viewer ")
+                                 for command in controller.sink.commands))
+
+            await controller._command_results(viewer)
+            self.assertTrue(
+                controller.result_message_preferences[viewer.identity_key]
+            )
             controller.store.close()
 
     async def test_no_cp_time_is_displayed_but_never_persisted(self):

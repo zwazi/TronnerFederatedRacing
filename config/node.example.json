@@ -11,8 +11,5 @@
   "game_bind": "0.0.0.0",
   "game_port": 4534,
   "resource_bind": "0.0.0.0",
-  "resource_port": 8080,
-  "federation": {
-    "enabled": false
-  }
+  "resource_port": 8080
 }

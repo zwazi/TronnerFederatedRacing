@@ -1,120 +1,27 @@
-# Installation
+# Standalone installation
 
-The installer targets a fresh Ubuntu 24.04 host. Review it before running it;
-it installs packages, builds the patched engine, creates a restricted service
-account, installs systemd services, and writes `/opt`, `/etc`, and `/var/lib`.
-
-## 1. Prepare operator configuration
-
-Keep configuration outside the repository:
-
-```sh
-install -d -m 0700 /secure/tronner-node
-cp config/cluster.example.json /secure/tronner-node/cluster.json
-cp config/node.example.json /secure/tronner-node/node.json
-```
-
-Replace all example domains and IDs. `public_base_url` must be reachable by old
-game clients over HTTP if those clients cannot download HTTPS map resources.
-Leave `master_list` false during commissioning.
-
-Render without changing the host:
+The installer supports Ubuntu and creates one game process plus one racing
+controller. Render examples first; production rendering rejects example
+identities and hostnames.
 
 ```sh
 python3 deploy/render_node.py \
-  --cluster /secure/tronner-node/cluster.json \
-  --node /secure/tronner-node/node.json \
+  --cluster /secure/operator/service.json \
+  --node /secure/operator/server.json \
   --output /tmp/tronner-rendered \
   --production
+
+sudo deploy/install.sh \
+  --cluster /secure/operator/service.json \
+  --node /secure/operator/server.json \
+  --secrets-dir /secure/operator/secrets
 ```
 
-Inspect every rendered file. The renderer rejects duplicate JSON keys,
-malformed identifiers, unsafe key filenames, non-literal federation addresses,
-same-direction key reuse, example hostnames in production mode, and inconsistent
-leader/follower roles.
+Add `--start` only after inspecting the rendered files, firewall, service
+users, secret permissions, and public master-list setting. The installer never
+ships production inventory or credentials.
 
-## 2. Enroll a federated node
-
-Follow [Adding a region](adding-a-region.md). Place only the approved node's
-directional key files in a local mode-`0700` secrets directory. If Firebase
-is explicitly enabled, add `firebase-service-account.json` to that directory.
-
-## 3. Install without starting
-
-```sh
-sudo ./deploy/install.sh \
-  --cluster /secure/tronner-node/cluster.json \
-  --node /secure/tronner-node/node.json \
-  --secrets-dir /secure/tronner-node/secrets
-```
-
-Installation does not enable the public master-list flag beyond the value in
-the reviewed node configuration and does not automatically alter the firewall.
-
-On memory-constrained hosts, build the pinned engine on a compatible build
-machine, copy the resulting install prefix to `/opt/armagetronad` over an
-authenticated channel, verify its checksum, and use `--skip-engine-build`.
-Run `ldd` and `--version` on the candidate before trusting the artifact: matching
-CPU architecture does not guarantee a matching shared-library ABI. Building
-C++ on a small production node can exhaust memory and is not required for a
-reproducible install; CI still proves the patch builds from source. If a
-compatible builder is unavailable, add bounded swap and build with one job
-while the candidate remains unlisted.
-
-## 4. Firewall and private transport
-
-Keep SSH access verified before changing firewall rules. Open the game and map
-ports to players. Permit the federation port only over the private overlay and
-only from expected peers. Example follower policy, which must be adapted to the
-operator's interface and addresses:
-
-```sh
-ufw allow OpenSSH
-ufw allow 4534/udp
-ufw allow 8080/tcp
-ufw allow in on wg0 from 10.77.0.1 to 10.77.0.2 port 4540 proto udp
-ufw enable
-```
-
-Do not copy this example blindly or expose UDP/4540 globally.
-
-## 5. Validate and start
-
-```sh
-runuser -u armagetron -- python3 /opt/TronnerRacing/federation_sidecar.py \
-  --config /etc/tronner-federation/config.json --check
-systemctl start tronner-federation armagetronad tronner-racing
-systemctl --no-pager --full status \
-  tronner-federation armagetronad tronner-racing
-```
-
-Run the bidirectional, three-region transport, and synchronized-round smoke
-tests while the node is
-unlisted as described in [Validation](validation.md). Confirm map/resource
-downloads from an external client. Only then set
-`master_list` to true, rerender, reinstall, and deliberately reload the server
-during an approved maintenance window.
-
-## Standalone development install
-
-`node.example.json` is intentionally inert. It can be rendered for local
-inspection with `--allow-examples`, but the installer refuses to combine that
-flag with `--start`.
-
-## Stage a clean vanilla server without starting it
-
-To prepare an unpatched upstream engine alongside an existing Tronner install,
-use a separate prefix:
-
-```sh
-TRONNER_ENGINE_PREFIX=/opt/armagetronad-vanilla \
-  ./deploy/build_vanilla_engine.sh
-```
-
-Install `config/vanilla-unlisted.cfg` as
-`/etc/armagetronad-vanilla/server.cfg` and
-`deploy/systemd/armagetronad-vanilla.service` as a disabled unit. The unit is
-fail-closed: it cannot start until an operator deliberately creates
-`/etc/armagetronad-vanilla/READY_TO_START`. The staging configuration disables
-master-list advertising and contains no federation, racing-controller,
-Firebase, Vectron, or website-management integration.
+Installed units are `armagetronad.service` and `tronner-racing.service`.
+Configuration is under `/etc/tronner-racing` and the Armagetron config
+directory; mutable state is under `/var/lib/armagetronad` and
+`/var/lib/tronner-racing`.

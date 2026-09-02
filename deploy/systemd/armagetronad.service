@@ -1,6 +1,6 @@
 [Unit]
 Description=Tronner Racing Armagetron dedicated server
-Documentation=https://github.com/zwazi/TronnerFederatedRacing
+Documentation=https://github.com/zwazi/TronnerRacing
 Wants=network-online.target
 After=network-online.target
 

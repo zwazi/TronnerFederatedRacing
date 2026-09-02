@@ -50,6 +50,5 @@ time-dependent grace period, the controller sends `KILL_SILENT` once and logs
 the measured ground speed, route speed, required speed, reason, map, stable
 player identity, and remaining time.
 
-The guard is local to each region. The leader federates the countdown duration
-and reference time, while each regional controller evaluates and, if necessary,
-kills only cycles attached to its own engine.
+The standalone controller evaluates the guard and, if necessary, kills only
+the stalled local cycle.

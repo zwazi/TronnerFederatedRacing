@@ -39,26 +39,6 @@ jobs:
           TRONNER_ENGINE_BUILD_DIR: ${{ runner.temp }}/engine-build
           TRONNER_ENGINE_PREFIX: ${{ runner.temp }}/armagetronad
         run: ./deploy/build_engine.sh
-      - name: Build disposable protocol probes
-        env:
-          TRONNER_ENGINE_SOURCE_DIR: ${{ runner.temp }}/engine-source
-          TRONNER_ENGINE_BUILD_DIR: ${{ runner.temp }}/engine-build
-          SMOKE_PROBE_DIR: ${{ runner.temp }}/smoke-probes
-        run: ./deploy/smoke/build_probes.sh
-      - name: Verify synchronized round release
-        env:
-          TRONNER_ENGINE_BUILD_DIR: ${{ runner.temp }}/engine-build
-          TRONNER_ENGINE_DATA_DIR: ${{ runner.temp }}/armagetronad/share/games/armagetronad-dedicated
-          TRONNER_ENGINE_CONFIG_DIR: ${{ runner.temp }}/armagetronad/etc/games/armagetronad-dedicated
-          SMOKE_PROBE_DIR: ${{ runner.temp }}/smoke-probes
-        run: ./deploy/smoke/run_round_sync_smoke.sh
-      - name: Verify names, colors, cycles, and server-info pairing
-        env:
-          TRONNER_ENGINE_BUILD_DIR: ${{ runner.temp }}/engine-build
-          TRONNER_ENGINE_DATA_DIR: ${{ runner.temp }}/armagetronad/share/games/armagetronad-dedicated
-          TRONNER_ENGINE_CONFIG_DIR: ${{ runner.temp }}/armagetronad/etc/games/armagetronad-dedicated
-          SMOKE_PROBE_DIR: ${{ runner.temp }}/smoke-probes
-        run: ./deploy/smoke/run_bidirectional_smoke.sh
       - name: Upload test binary
         uses: actions/upload-artifact@v7
         with:
