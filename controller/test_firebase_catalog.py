@@ -47,6 +47,7 @@ class FakeCatalog(FirebaseCatalogClient):
         self.state = state
         self.queries = []
         self.commits = []
+        self.uploads = []
         self.submissions = {}
 
     def get_document(self, collection, document_id):
@@ -77,6 +78,9 @@ class FakeCatalog(FirebaseCatalogClient):
 
     def _commit(self, writes):
         self.commits.append(writes)
+
+    def _upload_object(self, storage_path, data, metadata):
+        self.uploads.append((storage_path, data, metadata))
 
 
 class FirebaseCatalogCostTests(unittest.TestCase):
@@ -149,6 +153,43 @@ class FirebaseCatalogCostTests(unittest.TestCase):
         self.assertEqual(written["appliedCatalogVersion"], 9)
         self.assertEqual(written["appliedGeneration"], "generation-9")
         self.assertEqual(written["mapCount"], 446)
+
+    def test_generic_xml_revision_is_immutable_and_audited(self):
+        original = map_bytes()
+        revised = original.replace(b'version="v1"', b'version="v2"')
+        document = map_document(original)
+        document["_update_time"] = "2026-09-02T00:00:00Z"
+        client = FakeCatalog([document], {}, {})
+
+        result = client.publish_xml_revision(
+            map_id="map-id",
+            expected_revision_id="revision-id",
+            data=revised,
+            identity={
+                "authorName": "Tester",
+                "category": "maps",
+                "mapName": "Race",
+                "mapVersion": "v2",
+            },
+            operation="xml-correction",
+            review_reason="Convert target zone to win zone",
+            audit_action="map.xml-correction",
+        )
+
+        self.assertEqual(len(client.uploads), 1)
+        self.assertEqual(client.uploads[0][1], revised)
+        self.assertEqual(client.uploads[0][2]["operation"], "xml-correction")
+        self.assertEqual(len(client.commits), 1)
+        self.assertEqual(len(client.commits[0]), 4)
+        submission = _decode_document(client.commits[0][0]["update"])
+        updated_map = _decode_document(client.commits[0][1]["update"])
+        audit = _decode_document(client.commits[0][3]["update"])
+        self.assertEqual(submission["status"], "approved")
+        self.assertEqual(submission["operation"], "xml-correction")
+        self.assertEqual(updated_map["mapVersion"], "v2")
+        self.assertEqual(updated_map["previousRevisionId"], "revision-id")
+        self.assertEqual(audit["action"], "map.xml-correction")
+        self.assertEqual(result["resourcePath"], "Tester/maps/Race-v2.aamap.xml")
 
     def test_excluded_maps_move_to_review_in_one_commit(self):
         data = map_bytes()

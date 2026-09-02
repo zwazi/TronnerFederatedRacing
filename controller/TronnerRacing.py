@@ -4164,6 +4164,7 @@ class TronnerRacing:
         self.final_countdown_route_model: RouteModel | None = None
         self.final_countdown_route_map_key: str | None = None
         self.final_countdown_route_building = False
+        self.final_countdown_route_tasks: set[asyncio.Task] = set()
         self.final_countdown_progress_states: dict[int, PlayerProgressState] = {}
         self.final_countdown_duration_seconds: float | None = None
         self.final_countdown_acceleration_capability: AccelerationCapability | None
@@ -8691,10 +8692,11 @@ class TronnerRacing:
             return None
         return AccelerationCapability.from_settings(settings) if settings else None
 
-    async def _prepare_final_countdown_guard(
-        self,
-        duration: float,
-    ) -> None:
+    def _finish_final_countdown_route_build(self, map_key: str) -> None:
+        if getattr(self, "final_countdown_route_map_key", None) == map_key:
+            self.final_countdown_route_building = False
+
+    def _schedule_final_countdown_guard(self, duration: float) -> None:
         self.final_countdown_progress_states = {}
         self.final_countdown_duration_seconds = max(1.0, float(duration))
         self.final_countdown_acceleration_capability = None
@@ -8710,6 +8712,49 @@ class TronnerRacing:
         ):
             return
         map_key = self.current.key
+        self.final_countdown_route_building = True
+        task = asyncio.create_task(
+            self._prepare_final_countdown_guard(
+                duration,
+                map_key=map_key,
+                map_path=Path(map_path),
+            ),
+            name=f"final-countdown-route:{map_key}",
+        )
+        tasks = getattr(self, "final_countdown_route_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self.final_countdown_route_tasks = tasks
+        tasks.add(task)
+        def route_finished(completed: asyncio.Task) -> None:
+            tasks.discard(completed)
+            if completed.cancelled():
+                self._finish_final_countdown_route_build(map_key)
+                return
+            error = completed.exception()
+            if error is not None:
+                self._finish_final_countdown_route_build(map_key)
+                LOG.error(
+                    "unexpected final-countdown route build failure map=%s",
+                    map_key,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+        task.add_done_callback(route_finished)
+
+    async def _prepare_final_countdown_guard(
+        self,
+        duration: float,
+        *,
+        map_key: str,
+        map_path: Path,
+    ) -> None:
+        if (
+            not self.current
+            or self.current.key != map_key
+            or self.final_countdown_route_map_key != map_key
+        ):
+            self._finish_final_countdown_route_build(map_key)
+            return
         self.final_countdown_acceleration_capability = (
             self._active_acceleration_capability()
         )
@@ -8769,16 +8814,20 @@ class TronnerRacing:
                 size_multiplier=size_multiplier,
             )
         except asyncio.CancelledError:
-            self.final_countdown_route_building = False
+            self._finish_final_countdown_route_build(map_key)
             raise
         except (OSError, ET.ParseError, TypeError, ValueError):
-            self.final_countdown_route_building = False
+            self._finish_final_countdown_route_build(map_key)
             LOG.exception(
                 "unable to build final-countdown route model map=%s", map_key
             )
             return
-        if not self.current or self.current.key != map_key:
-            self.final_countdown_route_building = False
+        if (
+            not self.current
+            or self.current.key != map_key
+            or self.final_countdown_route_map_key != map_key
+        ):
+            self._finish_final_countdown_route_build(map_key)
             return
         if model is not None and model.reference_distance <= 0:
             retry_maximum_cells = min(
@@ -8823,7 +8872,7 @@ class TronnerRacing:
                         narrow_passage_guides=True,
                     )
                 except asyncio.CancelledError:
-                    self.final_countdown_route_building = False
+                    self._finish_final_countdown_route_build(map_key)
                     raise
                 except (OSError, ET.ParseError, TypeError, ValueError):
                     LOG.exception(
@@ -8831,7 +8880,9 @@ class TronnerRacing:
                         map_key,
                     )
                     model = None
-        self.final_countdown_route_building = False
+        self._finish_final_countdown_route_build(map_key)
+        if self.final_countdown_route_map_key != map_key:
+            return
         if model is not None and model.reference_distance <= 0:
             model = None
         self.final_countdown_route_model = model
@@ -9309,7 +9360,10 @@ class TronnerRacing:
             # Cap that additional window independently at the configured map
             # maximum (five minutes by default).
             duration = min(duration, self._map_play_seconds(self.current))
-        await self._prepare_final_countdown_guard(duration)
+        # Route certification can take tens of seconds on unusually complex
+        # maps. Arm and announce the countdown immediately; build its progress
+        # guard in a worker thread while racers continue their runs.
+        self._schedule_final_countdown_guard(duration)
         now = time.time()
 
         if not resume or not self.final_countdown_end_epoch:

@@ -662,20 +662,39 @@ class FirebaseCatalogClient:
             "currentDocument": {"exists": False},
         }
 
-    def publish_size_revision(
+    def publish_xml_revision(
         self,
         *,
         map_id: str,
         expected_revision_id: str,
         data: bytes,
         identity: dict,
-        size_factor: float,
+        operation: str,
+        review_reason: str,
+        audit_action: str,
+        extra_fields: dict | None = None,
     ) -> dict:
+        """Publish one immutable, audited XML revision of an active map."""
+        operation = operation.strip()
+        review_reason = review_reason.strip()
+        audit_action = audit_action.strip()
+        if not operation or not review_reason or not audit_action:
+            raise ValueError("revision operation, review reason, and audit action are required")
+        extra_fields = dict(extra_fields or {})
+        protected_fields = {
+            "activeRevisionId", "mapId", "operation", "previousRevisionId",
+            "recordKey", "resourcePath", "sha256", "storagePath",
+        }
+        overlap = protected_fields.intersection(extra_fields)
+        if overlap:
+            raise ValueError(
+                "extra revision fields cannot replace " + ", ".join(sorted(overlap))
+            )
         current = self.get_document("maps", map_id)
         if current.get("status") != "active":
             raise FirebaseCatalogError("cannot revise an inactive map")
         if current.get("activeRevisionId") != expected_revision_id:
-            raise FirebaseCatalogError("map changed in Firebase; reload before changing size")
+            raise FirebaseCatalogError("map changed in Firebase; reload before revising it")
         resource_path = "/".join(
             [
                 identity["authorName"],
@@ -699,17 +718,18 @@ class FirebaseCatalogClient:
                 "category": identity["category"],
                 "mapName": identity["mapName"],
                 "mapVersion": identity["mapVersion"],
-                "operation": "size",
+                "operation": operation,
                 "sha256": sha256,
             },
         )
         now = _timestamp()
+        server_actor = f"server:{self.server_id}"
         submission = {
             "submissionId": revision_id,
             "mapId": map_id,
-            "operation": "size",
+            "operation": operation,
             "status": "approved",
-            "submittedBy": f"server:{self.server_id}",
+            "submittedBy": server_actor,
             "submittedByName": self.server_id,
             "authorId": current["authorId"],
             **identity,
@@ -718,12 +738,12 @@ class FirebaseCatalogClient:
             "sourceMapId": map_id,
             "sha256": sha256,
             "contentBytes": len(data),
-            "sizeFactor": size_factor,
+            **extra_fields,
             "createdAt": now,
             "updatedAt": now,
             "reviewedAt": now,
-            "reviewedBy": f"server:{self.server_id}",
-            "reviewReason": "Approved server /size command",
+            "reviewedBy": server_actor,
+            "reviewReason": review_reason,
             "historyVisible": True,
         }
         updated_map = {
@@ -738,26 +758,27 @@ class FirebaseCatalogClient:
                 "previousRevisionId": current["activeRevisionId"],
                 "recordKey": resource_path,
                 "sha256": sha256,
-                "sizeFactor": size_factor,
+                **extra_fields,
                 "updatedAt": now,
             }
         )
         audit_id = f"server_{uuid.uuid4().hex}"
         audit = {
-            "actorUid": f"server:{self.server_id}",
+            "actorUid": server_actor,
             "actorName": self.server_id,
-            "action": "map.size",
+            "action": audit_action,
             "targetType": "map",
             "targetId": map_id,
+            "reason": review_reason,
             "before": {
                 "revisionId": current["activeRevisionId"],
                 "resourcePath": current["resourcePath"],
-                "sizeFactor": current.get("sizeFactor"),
+                **{key: current.get(key) for key in extra_fields},
             },
             "after": {
                 "revisionId": revision_id,
                 "resourcePath": resource_path,
-                "sizeFactor": size_factor,
+                **extra_fields,
             },
             "createdAt": now,
         }
@@ -772,7 +793,7 @@ class FirebaseCatalogClient:
         }
         self._commit(
             [
-                self._update_write(_document(
+                self._create_write(_document(
                     self.project, "mapSubmissions", revision_id, submission
                 )),
                 self._update_write(
@@ -785,7 +806,7 @@ class FirebaseCatalogClient:
                     resource_id,
                     resource_reservation,
                 )),
-                self._update_write(_document(
+                self._create_write(_document(
                     self.project, "auditEvents", audit_id, audit
                 )),
             ]
@@ -797,6 +818,26 @@ class FirebaseCatalogClient:
             "resourcePath": resource_path,
             "sha256": sha256,
         }
+
+    def publish_size_revision(
+        self,
+        *,
+        map_id: str,
+        expected_revision_id: str,
+        data: bytes,
+        identity: dict,
+        size_factor: float,
+    ) -> dict:
+        return self.publish_xml_revision(
+            map_id=map_id,
+            expected_revision_id=expected_revision_id,
+            data=data,
+            identity=identity,
+            operation="size",
+            review_reason="Approved server /size command",
+            audit_action="map.size",
+            extra_fields={"sizeFactor": size_factor},
+        )
 
     def set_map_status(self, map_id: str, status: str, reason: str) -> None:
         if status not in {"active", "inactive"}:
