@@ -1802,6 +1802,8 @@ class UserMergeResult:
 
 
 class StateStore:
+    FINISH_HISTORY_BACKFILL_KEY = "schema:finish-history-backfill-v1"
+
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
@@ -1835,6 +1837,8 @@ class StateStore:
                 turns INTEGER,
                 finished_at REAL NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS finishes_by_map_identity_time
+                ON finishes(map_key, identity_key, seconds);
             CREATE TABLE IF NOT EXISTS ratings (
                 map_key TEXT NOT NULL,
                 identity_key TEXT NOT NULL,
@@ -1932,21 +1936,31 @@ class StateStore:
         }
         if "turns" not in finish_columns:
             self.connection.execute("ALTER TABLE finishes ADD COLUMN turns INTEGER")
-        # Older databases may contain personal-best rows from before complete
-        # finish history was introduced. Backfill each missing best once while
-        # leaving every already-recorded finish untouched.
-        self.connection.execute(
-            "INSERT INTO finishes(map_key, identity_key, username, authenticated, "
-            "seconds, turns, finished_at) "
-            "SELECT records.map_key, records.identity_key, records.username, "
-            "records.authenticated, records.best_seconds, records.best_turns, "
-            "records.achieved_at FROM records WHERE NOT EXISTS ("
-            "SELECT 1 FROM finishes WHERE finishes.map_key=records.map_key "
-            "AND finishes.identity_key=records.identity_key "
-            "AND finishes.seconds=records.best_seconds "
-            "AND (finishes.turns=records.best_turns OR "
-            "(finishes.turns IS NULL AND records.best_turns IS NULL)))"
-        )
+        backfill_complete = self.connection.execute(
+            "SELECT 1 FROM metadata WHERE key=?",
+            (self.FINISH_HISTORY_BACKFILL_KEY,),
+        ).fetchone()
+        if backfill_complete is None:
+            # Older databases may contain personal-best rows from before complete
+            # finish history was introduced. This migration used to scan the full
+            # finish table at every server-script start; the indexed, durable
+            # marker keeps it off the reload path after the one required pass.
+            self.connection.execute(
+                "INSERT INTO finishes(map_key, identity_key, username, authenticated, "
+                "seconds, turns, finished_at) "
+                "SELECT records.map_key, records.identity_key, records.username, "
+                "records.authenticated, records.best_seconds, records.best_turns, "
+                "records.achieved_at FROM records WHERE NOT EXISTS ("
+                "SELECT 1 FROM finishes WHERE finishes.map_key=records.map_key "
+                "AND finishes.identity_key=records.identity_key "
+                "AND finishes.seconds=records.best_seconds "
+                "AND (finishes.turns=records.best_turns OR "
+                "(finishes.turns IS NULL AND records.best_turns IS NULL)))"
+            )
+            self.connection.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, 'true')",
+                (self.FINISH_HISTORY_BACKFILL_KEY,),
+            )
         replay_run_columns = {
             row[1] for row in self.connection.execute("PRAGMA table_info(replay_runs)")
         }
