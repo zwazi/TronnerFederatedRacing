@@ -47,12 +47,21 @@ class FakeCatalog(FirebaseCatalogClient):
         self.state = state
         self.queries = []
         self.commits = []
+        self.submissions = {}
 
     def get_document(self, collection, document_id):
         if collection == "catalogSettings":
             return {"ready": True}
         if collection == "catalogState":
             return dict(self.state)
+        if collection == "maps":
+            return next(
+                dict(item)
+                for item in self.maps
+                if item.get("mapId") == document_id
+            )
+        if collection == "mapSubmissions":
+            return dict(self.submissions[document_id])
         raise AssertionError((collection, document_id))
 
     def list_documents(self, collection):
@@ -140,6 +149,82 @@ class FirebaseCatalogCostTests(unittest.TestCase):
         self.assertEqual(written["appliedCatalogVersion"], 9)
         self.assertEqual(written["appliedGeneration"], "generation-9")
         self.assertEqual(written["mapCount"], 446)
+
+    def test_excluded_maps_move_to_review_in_one_commit(self):
+        data = map_bytes()
+        active = map_document(data)
+        active["_update_time"] = "2026-09-01T00:00:00Z"
+        inactive = map_document(data, status="inactive")
+        inactive.update({
+            "_id": "map-id-2",
+            "mapId": "map-id-2",
+            "mapName": "RaceTwo",
+            "activeRevisionId": "revision-id-2",
+            "resourcePath": "Tester/maps/RaceTwo-v1.aamap.xml",
+            "recordKey": "Tester/maps/RaceTwo-v1.aamap.xml",
+            "_update_time": "2026-09-01T00:00:01Z",
+        })
+        client = FakeCatalog([active, inactive], {}, {})
+
+        reviews = client.submit_excluded_map_reviews([
+            {
+                "mapId": active["mapId"],
+                "resourcePath": active["resourcePath"],
+                "reason": "Needs a route check",
+            },
+            {
+                "mapId": inactive["mapId"],
+                "resourcePath": inactive["resourcePath"],
+                "reason": "",
+            },
+        ])
+
+        self.assertEqual(len(reviews), 2)
+        self.assertEqual(len(client.commits), 1)
+        self.assertEqual(len(client.commits[0]), 6)
+        first_submission = _decode_document(client.commits[0][0]["update"])
+        first_map = _decode_document(client.commits[0][1]["update"])
+        first_audit = _decode_document(client.commits[0][2]["update"])
+        second_submission = _decode_document(client.commits[0][3]["update"])
+        second_map = _decode_document(client.commits[0][4]["update"])
+        second_audit = _decode_document(client.commits[0][5]["update"])
+        self.assertEqual(first_submission["operation"], "server-review")
+        self.assertEqual(first_submission["submissionReason"], "Needs a route check")
+        self.assertEqual(first_map["status"], "inactive")
+        self.assertEqual(first_audit["before"], {"status": "active", "excluded": True})
+        self.assertEqual(
+            second_submission["submissionReason"],
+            "Moved from the server exclusion list for Vectron review",
+        )
+        self.assertEqual(second_map["status"], "inactive")
+        self.assertEqual(second_audit["before"], {"status": "inactive", "excluded": True})
+
+    def test_already_linked_exclusion_is_idempotent(self):
+        data = map_bytes()
+        inactive = map_document(data, status="inactive")
+        inactive["reviewSubmissionId"] = "review-id"
+        review = {
+            "_id": "review-id",
+            "submissionId": "review-id",
+            "mapId": inactive["mapId"],
+            "operation": "server-review",
+            "status": "pending",
+            "sourceResourcePath": inactive["resourcePath"],
+        }
+        client = FakeCatalog([inactive], {}, {})
+        client.submissions["review-id"] = review
+
+        self.assertEqual(
+            client.submit_excluded_map_reviews([
+                {
+                    "mapId": inactive["mapId"],
+                    "resourcePath": inactive["resourcePath"],
+                    "reason": "Already queued",
+                }
+            ]),
+            [review],
+        )
+        self.assertEqual(client.commits, [])
 
 
 if __name__ == "__main__":
