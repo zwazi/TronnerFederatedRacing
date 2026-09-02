@@ -1,3 +1,4 @@
+import asyncio
 import time
 import tempfile
 import unittest
@@ -169,6 +170,60 @@ class RequestedBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     reasons, ["all racers finished final countdown"]
                 )
             finally:
+                controller.store.close()
+
+    async def test_final_countdown_does_not_wait_for_route_certification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = object.__new__(TronnerRacing)
+            controller.sink = Sink()
+            controller.store = StateStore(Path(tmp) / "countdown.sqlite3")
+            controller.config = {"final_countdown_grief_detection_enabled": True}
+            controller.current = SimpleNamespace(
+                key="complex-map",
+                rating_key="complex-map",
+                local_path=Path(tmp) / "complex.aamap.xml",
+            )
+            controller.transitioning = False
+            controller.final_countdown_active = False
+            controller.final_countdown_end_epoch = None
+            controller.final_countdown_map_key = None
+            controller.final_countdown_announcement = None
+            controller.finalists = set()
+            controller.respawn_tasks = {}
+            controller.freeze_tasks = {}
+            controller.players = {}
+            controller.final_countdown_route_tasks = set()
+            route_started = asyncio.Event()
+            release_route = asyncio.Event()
+
+            async def slow_route_build(duration, *, map_key, map_path):
+                route_started.set()
+                await release_route.wait()
+
+            controller._prepare_final_countdown_guard = slow_route_build
+            reasons = []
+
+            async def activate(reason):
+                reasons.append(reason)
+                controller.final_countdown_active = False
+
+            controller.activate_next_map = activate
+            try:
+                await asyncio.wait_for(controller._run_final_countdown(), timeout=0.2)
+                await asyncio.wait_for(route_started.wait(), timeout=0.2)
+                self.assertFalse(release_route.is_set())
+                self.assertIn(
+                    "CONSOLE_MESSAGE Map time expired. Respawning is disabled. "
+                    "Final countdown: 90 seconds. Current rating: unrated. "
+                    "Use /rate # for the current map or /rate [map] # "
+                    "for a specific map.",
+                    [plain_console_text(command) for command in controller.sink.commands],
+                )
+                self.assertEqual(reasons, ["all racers finished final countdown"])
+            finally:
+                release_route.set()
+                if controller.final_countdown_route_tasks:
+                    await asyncio.gather(*controller.final_countdown_route_tasks)
                 controller.store.close()
 
 
