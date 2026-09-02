@@ -25,14 +25,14 @@ class Sink:
 
 class TipStyleTests(unittest.TestCase):
     def test_tip_is_white_and_double_quoted_contents_are_highlighted(self):
-        styled = style_tip_message('Type "/q Map Name" and then say "ready".')
+        styled = style_tip_message('Type "/q add Map Name" and then say "ready".')
 
         self.assertTrue(styled.startswith(COLOR_RESET))
-        self.assertIn(f'"{COLOR_COMMAND}/q Map Name{COLOR_RESET}"', styled)
+        self.assertIn(f'"{COLOR_COMMAND}/q add Map Name{COLOR_RESET}"', styled)
         self.assertIn(f'"{COLOR_COMMAND}ready{COLOR_RESET}"', styled)
         self.assertEqual(
             plain_console_text(styled),
-            'Type "/q Map Name" and then say "ready".',
+            'Type "/q add Map Name" and then say "ready".',
         )
 
     def test_custom_tip_loader_validates_and_sorts_stable_ids(self):
@@ -73,7 +73,7 @@ class TipCommandTests(unittest.IsolatedAsyncioTestCase):
                 "/tip",
                 admin,
                 20,
-                'add Try "/q Map Name" next.',
+                'add Try "/q add Map Name" next.',
             )
             self.assertEqual(load_custom_helpful_messages(controller.store), [])
 
@@ -82,7 +82,7 @@ class TipCommandTests(unittest.IsolatedAsyncioTestCase):
                 "/tip",
                 admin,
                 1,
-                'add Try "/q Map Name" next.',
+                'add Try "/q add Map Name" next.',
             )
             await controller.hot_commands.dispatch(
                 controller,
@@ -108,9 +108,9 @@ class TipCommandTests(unittest.IsolatedAsyncioTestCase):
                 plain_console_text(command) for command in controller.sink.commands
             )
             self.assertIn("Only an Owner or Admin may manage tips.", output)
-            self.assertIn('Tip #1 added: Try \\"/q Map Name\\" next.', output)
+            self.assertIn('Tip #1 added: Try \\"/q add Map Name\\" next.', output)
             self.assertIn("#2 - Remember to rate this map.", output)
-            self.assertIn('Tip #1 removed: Try \\"/q Map Name\\" next.', output)
+            self.assertIn('Tip #1 removed: Try \\"/q add Map Name\\" next.', output)
             controller.store.close()
 
 

@@ -1,11 +1,15 @@
 import collections
+import random
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from TronnerRacing import (
     MapEntry,
     MapRepository,
     Player,
+    StateStore,
     TronnerRacing,
     plain_console_text,
 )
@@ -25,6 +29,14 @@ class Store:
 
     def set_json(self, key, value):
         self.values[key] = value
+
+    def map_ranks_for_player(self, map_keys, identity_key):
+        requested = set(map_keys)
+        return {
+            key: rank
+            for key, rank in self.values.get("ranks", {}).items()
+            if key in requested
+        }
 
 
 def map_entry(key, author, version):
@@ -74,8 +86,8 @@ class QueueControlTests(unittest.IsolatedAsyncioTestCase):
         controller, first, second = queue_controller()
         player = Player("racer", "Racer")
 
-        await controller._command_queue(player, "Sprint 1")
-        await controller._command_queue(player, "Sprint 2")
+        await controller._command_queue(player, "add Sprint 1")
+        await controller._command_queue(player, "add Sprint 2")
         self.assertEqual(list(controller.queue), [first.key, second.key])
 
         await controller._command_queue(player, "remove Sprint 1")
@@ -101,6 +113,72 @@ class QueueControlTests(unittest.IsolatedAsyncioTestCase):
         await controller._command_queue(player, "remove Sprint 1")
 
         self.assertEqual(list(controller.queue), [first.key])
+
+    async def test_old_add_format_shows_migration_help_without_queueing(self):
+        controller, first, _ = queue_controller()
+        player = Player("racer", "Racer")
+
+        await controller._command_queue(player, "Sprint 1")
+
+        self.assertEqual(list(controller.queue), [])
+        output = "\n".join(
+            plain_console_text(command) for command in controller.sink.commands
+        )
+        self.assertIn("format changed: use /q add [map]", output)
+        self.assertIn("/q lowest", output)
+
+    async def test_lowest_prioritizes_an_unranked_map(self):
+        controller, first, second = queue_controller()
+        third = MapEntry(
+            "Other/race/Long-1.aamap.xml",
+            "Long",
+            "Other",
+            "1",
+            "race",
+            "Other/race/Long-1.aamap.xml",
+            Path("Other/race/Long-1.aamap.xml"),
+            (),
+        )
+        controller.repository.catalog[third.key] = third
+        controller.store.values["ranks"] = {
+            first.key: 12,
+            second.key: 20,
+        }
+        player = Player("racer", "Racer")
+
+        await controller._command_queue(player, "lowest")
+
+        self.assertEqual(list(controller.queue), [third.key])
+
+    async def test_lowest_randomly_selects_among_equal_worst_ranks(self):
+        controller, first, second = queue_controller()
+        controller.store.values["ranks"] = {first.key: 9, second.key: 9}
+        player = Player("racer", "Racer")
+
+        with mock.patch.object(random, "choice", return_value=second) as choice:
+            await controller._command_queue(player, "lowest")
+
+        choice.assert_called_once_with([first, second])
+        self.assertEqual(list(controller.queue), [second.key])
+
+    def test_state_store_returns_exact_rank_for_each_map(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = StateStore(Path(temporary) / "rank.sqlite3")
+            try:
+                players = [Player(f"p{index}", f"P{index}") for index in range(3)]
+                for seconds, player in zip((10.0, 20.0, 30.0), players):
+                    store.add_finish("map-a", player, seconds)
+                store.add_finish("map-b", players[1], 5.0)
+
+                self.assertEqual(
+                    store.map_ranks_for_player(
+                        ["map-a", "map-b", "map-unranked"],
+                        players[1].identity_key,
+                    ),
+                    {"map-a": 2, "map-b": 1},
+                )
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

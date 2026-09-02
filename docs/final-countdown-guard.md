@@ -12,8 +12,8 @@ whether a player is fast enough to finish.
 
 ## Route model
 
-At countdown start, the server script reads the immutable active map and builds a
-bounded distance-to-finish field. The field:
+When a map becomes active, the server script reads its immutable XML and
+preloads a bounded distance-to-finish field before the countdown. The field:
 
 - uses the map's regular or explicitly configured axis directions;
 - blocks static wall segments, death circles, and death polygons;
@@ -41,6 +41,12 @@ allocating a microscopic grid across the whole arena.
 The supplemental graph is capped by both point count and obstacle complexity;
 very large maps retain the higher-resolution raster without allowing auxiliary
 collision checks to occupy the controller CPU indefinitely.
+
+Completed fields are persisted under the server-script state directory. The cache
+key includes the map XML digest, field algorithm version, size multiplier, and
+all resolution and clearance inputs, so immutable revisions reuse their field
+while any meaningful input change builds a separate entry. Cache retention is
+bounded to 768 entries and 512 MiB by default.
 
 Route distance, rather than straight-line distance, recognizes a necessary
 detour around a wall or death zone as progress along the real route. If the
@@ -70,15 +76,21 @@ episode, another warning is sent with the remaining allowance. When the
 cumulative total reaches five seconds, the server script sends `KILL_SILENT`
 once and records the removal in the controller log.
 
+A continuously stationary cycle receives a private warning after one second
+and is removed after five seconds. Successful replay turn events are also
+tracked during the countdown; a sixteenth consecutive turn in the same
+direction removes the cycle, while switching direction resets that sequence.
+
 The server script no longer kills a player merely because an ETA projection
 says the player is too slow. Cycle acceleration therefore needs no special
 estimate for this rule: actual movement through the wall- and teleport-aware
 route field is authoritative. The ordinary countdown expiry still ends runs
 that do not finish in time.
 
-Field construction runs in a worker thread. Positions received while it is
-building are retained and replayed through the completed field, so tracking
-still begins at countdown start. A route sample that is not represented by the
+Field construction runs in a worker thread. A first-time field that is still
+building when the countdown begins retains player positions and replays them
+through the completed field. Stationary and repeated-turn enforcement does not
+depend on route-field readiness. A route sample that is not represented by the
 field is never replaced with a straight-line guess; that map uses the existing
 input-idle fallback instead.
 

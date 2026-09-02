@@ -47,7 +47,7 @@ from final_countdown_guard import (
     AccelerationCapability,
     PlayerProgressState,
     RouteModel,
-    build_route_model,
+    load_or_build_route_model,
 )
 from live_dashboard import FirebaseLiveDashboardPublisher, public_player_id
 
@@ -1197,7 +1197,8 @@ def redeem_game_account_link(
 
 
 USER_COMMAND_HELP = (
-    ("/q [map]", "Queue a map after the current map."),
+    ("/q add [map]", "Queue a map after the current map."),
+    ("/q lowest", "Queue your lowest-ranked or an unranked map."),
     ("/q remove [map]", "Remove the first matching map from the queue."),
     ("/q clear", "Clear every map from the queue."),
     ("/rate [1-5]", "Rate the current map."),
@@ -2264,6 +2265,32 @@ class StateStore:
             )
             for row in rows
         ]
+
+    def map_ranks_for_player(
+        self,
+        map_keys: Iterable[str],
+        identity_key: str,
+    ) -> dict[str, int]:
+        """Return the player's one-based rank for each map with a PB."""
+        requested = sorted({str(map_key) for map_key in map_keys if map_key})
+        ranks: dict[str, int] = {}
+        connection = self.current_connection()
+        for offset in range(0, len(requested), 500):
+            batch = requested[offset : offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                "SELECT map_key, player_rank FROM (SELECT map_key, identity_key, "
+                "ROW_NUMBER() OVER (PARTITION BY map_key ORDER BY "
+                "best_seconds ASC, best_turns IS NULL ASC, best_turns ASC, "
+                "achieved_at ASC) AS player_rank FROM records WHERE map_key IN ("
+                f"{placeholders})) WHERE identity_key = ?",
+                [*batch, identity_key],
+            ).fetchall()
+            ranks.update(
+                (str(map_key), int(player_rank))
+                for map_key, player_rank in rows
+            )
+        return ranks
 
     def dashboard_record_rows(self) -> list[dict[str, object]]:
         """Return one local SQLite snapshot for precomputed public rankings."""
@@ -4163,6 +4190,7 @@ class TronnerRacing:
         self.final_countdown_route_model: RouteModel | None = None
         self.final_countdown_route_map_key: str | None = None
         self.final_countdown_route_building = False
+        self.final_countdown_route_prepared = False
         self.final_countdown_route_tasks: set[asyncio.Task] = set()
         self.final_countdown_progress_states: dict[int, PlayerProgressState] = {}
         self.final_countdown_duration_seconds: float | None = None
@@ -5634,6 +5662,7 @@ class TronnerRacing:
         self.final_countdown_route_model = None
         self.final_countdown_route_map_key = None
         self.final_countdown_route_building = False
+        self.final_countdown_route_prepared = False
         self.final_countdown_progress_states = {}
         self.final_countdown_duration_seconds = None
         self.final_countdown_acceleration_capability = None
@@ -6854,7 +6883,7 @@ class TronnerRacing:
             elif event == "CYCLE_REPLAY_STATE":
                 self._handle_replay_state(payload)
             elif event == "CYCLE_REPLAY_INPUT":
-                self._handle_replay_input(payload)
+                await self._handle_replay_input(payload)
             elif event == "CYCLE_REPLAY_END":
                 self._handle_replay_end(payload)
             elif event == "CYCLE_REPLAY_SETTINGS":
@@ -6922,6 +6951,8 @@ class TronnerRacing:
             self._reset_attempts()
         self._publish_dashboard_map_change(previous_key or "")
         LOG.info("active map: %s", entry.key)
+        if not getattr(self, "final_countdown_active", False):
+            self._ensure_final_countdown_route_model()
         if (
             self.transitioning
             and self.transition_map_confirmed
@@ -7336,18 +7367,68 @@ class TronnerRacing:
             released=state_kind == "release",
         )
 
-    def _handle_replay_input(self, payload: str) -> None:
+    async def _handle_replay_input(self, payload: str) -> None:
         parts = payload.split()
         if len(parts) < 3:
             return
-        capture = self.replay_captures.get(parts[0])
+        token = parts[0]
+        capture = self.replay_captures.get(token)
         if capture is None:
             return
         try:
             game_time = float(parts[1])
         except ValueError:
             return
-        capture.add_input(game_time, parts[2])
+        action = parts[2]
+        if not capture.add_input(game_time, action) or action not in {"L", "R"}:
+            return
+        player = self.player_for(capture.player_log_name)
+        if (
+            not player
+            or self.active_replay_tokens.get(id(player)) != token
+            or not self._final_countdown_progress_guard_enabled()
+            or not getattr(self, "final_countdown_active", False)
+            or not getattr(self, "final_countdown_end_epoch", None)
+            or id(player) not in getattr(self, "finalists", set())
+            or not player.connected
+            or not player.active
+            or not player.alive
+            or player.is_ai
+        ):
+            return
+        state = self.final_countdown_progress_states.setdefault(
+            id(player), PlayerProgressState()
+        )
+        if state.killed:
+            return
+        limit = max(
+            1,
+            int(
+                self.config.get(
+                    "final_countdown_progress_same_turn_limit", 15
+                )
+            ),
+        )
+        count, exhausted = state.observe_turn(action, limit)
+        if not exhausted:
+            return
+        state.killed = True
+        direction = "left" if action == "L" else "right"
+        await self.private(
+            player,
+            "Your final-countdown run was ended after "
+            f"{count} consecutive {direction} turns.",
+        )
+        await self.sink.send(f"KILL_SILENT {player.target}")
+        LOG.warning(
+            "countdown-progress-guard repeated-turn-removed map=%s player=%s "
+            "direction=%s count=%d limit=%d",
+            self.current.key if self.current else "",
+            player.identity_key,
+            direction,
+            count,
+            limit,
+        )
 
     def _persist_replay_capture(
         self,
@@ -8700,9 +8781,9 @@ class TronnerRacing:
     def _schedule_final_countdown_guard(self, duration: float) -> None:
         self.final_countdown_progress_states = {}
         self.final_countdown_duration_seconds = max(1.0, float(duration))
-        self.final_countdown_route_model = None
-        self.final_countdown_route_map_key = self.current.key if self.current else None
-        self.final_countdown_route_building = False
+        self._ensure_final_countdown_route_model()
+
+    def _ensure_final_countdown_route_model(self) -> None:
         map_path = getattr(self.current, "local_path", None) if self.current else None
         if (
             not self._final_countdown_progress_guard_enabled()
@@ -8711,10 +8792,20 @@ class TronnerRacing:
         ):
             return
         map_key = self.current.key
+        if (
+            getattr(self, "final_countdown_route_map_key", None) == map_key
+            and (
+                getattr(self, "final_countdown_route_building", False)
+                or getattr(self, "final_countdown_route_prepared", False)
+            )
+        ):
+            return
+        self.final_countdown_route_model = None
+        self.final_countdown_route_map_key = map_key
         self.final_countdown_route_building = True
+        self.final_countdown_route_prepared = False
         task = asyncio.create_task(
             self._prepare_final_countdown_guard(
-                duration,
                 map_key=map_key,
                 map_path=Path(map_path),
             ),
@@ -8742,7 +8833,6 @@ class TronnerRacing:
 
     async def _prepare_final_countdown_guard(
         self,
-        duration: float,
         *,
         map_key: str,
         map_path: Path,
@@ -8780,11 +8870,38 @@ class TronnerRacing:
         size_multiplier = 2.0 ** (
             float(getattr(self, "current_size_factor", 0.0) or 0.0) / 2.0
         )
+        cache_value = str(
+            self.config.get(
+                "final_countdown_route_cache_dir",
+                "/var/lib/tronner-racing/route-fields",
+            )
+        ).strip()
+        cache_directory = Path(cache_value) if cache_value else None
+        cache_maximum_entries = max(
+            1,
+            int(
+                self.config.get(
+                    "final_countdown_route_cache_maximum_entries", 768
+                )
+            ),
+        )
+        cache_maximum_bytes = max(
+            1024 * 1024,
+            int(
+                self.config.get(
+                    "final_countdown_route_cache_maximum_bytes",
+                    512 * 1024 * 1024,
+                )
+            ),
+        )
         self.final_countdown_route_building = True
         try:
-            model = await asyncio.to_thread(
-                build_route_model,
+            model, primary_cache_hit = await asyncio.to_thread(
+                load_or_build_route_model,
                 Path(map_path),
+                cache_directory=cache_directory,
+                cache_maximum_entries=cache_maximum_entries,
+                cache_maximum_bytes=cache_maximum_bytes,
                 maximum_cells=maximum_cells,
                 minimum_cell_size=minimum_cell_size,
                 wall_clearance_cells=wall_clearance,
@@ -8800,6 +8917,8 @@ class TronnerRacing:
                 "unable to build final-countdown route model map=%s", map_key
             )
             return
+        if primary_cache_hit:
+            LOG.info("loaded final-countdown route model from cache map=%s", map_key)
         if (
             not self.current
             or self.current.key != map_key
@@ -8840,9 +8959,12 @@ class TronnerRacing:
                     map_key,
                 )
                 try:
-                    model = await asyncio.to_thread(
-                        build_route_model,
+                    model, retry_cache_hit = await asyncio.to_thread(
+                        load_or_build_route_model,
                         Path(map_path),
+                        cache_directory=cache_directory,
+                        cache_maximum_entries=cache_maximum_entries,
+                        cache_maximum_bytes=cache_maximum_bytes,
                         maximum_cells=retry_maximum_cells,
                         minimum_cell_size=retry_minimum_cell_size,
                         wall_clearance_cells=wall_clearance,
@@ -8858,12 +8980,20 @@ class TronnerRacing:
                         map_key,
                     )
                     model = None
+                else:
+                    if retry_cache_hit:
+                        LOG.info(
+                            "loaded high-resolution final-countdown route model "
+                            "from cache map=%s",
+                            map_key,
+                        )
         self._finish_final_countdown_route_build(map_key)
         if self.final_countdown_route_map_key != map_key:
             return
         if model is not None and model.reference_distance <= 0:
             model = None
         self.final_countdown_route_model = model
+        self.final_countdown_route_prepared = True
         if model is None:
             LOG.warning(
                 "final-countdown route model unavailable map=%s; using idle fallback",
@@ -8908,6 +9038,94 @@ class TronnerRacing:
             id(player), PlayerProgressState()
         )
         if state.killed:
+            return
+        first_progress_sample = state.last_position_sample is None
+        stationary_limit = max(
+            0.1,
+            float(
+                self.config.get(
+                    "final_countdown_progress_stationary_limit_seconds", 5.0
+                )
+            ),
+        )
+        stationary_warning_delay = max(
+            0.0,
+            float(
+                self.config.get(
+                    "final_countdown_progress_stationary_warning_delay_seconds",
+                    1.0,
+                )
+            ),
+        )
+        stationary_update = state.observe_position(
+            now,
+            position,
+            limit_seconds=stationary_limit,
+            warning_delay_seconds=stationary_warning_delay,
+            position_epsilon=max(
+                0.0,
+                float(
+                    self.config.get(
+                        "final_countdown_progress_stationary_position_epsilon",
+                        self.config.get("afk_position_epsilon", 0.01),
+                    )
+                ),
+            ),
+            maximum_sample_gap_seconds=max(
+                0.1,
+                float(
+                    self.config.get(
+                        "final_countdown_progress_max_sample_gap_seconds", 2.0
+                    )
+                ),
+            ),
+        )
+        if first_progress_sample:
+            LOG.info(
+                "countdown-progress-guard tracking map=%s player=%s route=%s",
+                self.current.key,
+                player.identity_key,
+                (
+                    "ready"
+                    if model is not None
+                    else "building"
+                    if getattr(self, "final_countdown_route_building", False)
+                    else "idle-fallback"
+                ),
+            )
+        if stationary_update.warning_due:
+            stationary_remaining = max(
+                0.0, stationary_limit - stationary_update.stationary_seconds
+            )
+            await self.private(
+                player,
+                "Countdown progress warning: your cycle is stationary. "
+                f"Move toward the winzone within {stationary_remaining:.1f} seconds.",
+            )
+            LOG.info(
+                "countdown-progress-guard stationary-warning map=%s player=%s "
+                "stationary=%.3f limit=%.3f",
+                self.current.key,
+                player.identity_key,
+                stationary_update.stationary_seconds,
+                stationary_limit,
+            )
+        if stationary_update.exhausted:
+            state.killed = True
+            await self.private(
+                player,
+                "Your final-countdown run was ended because your cycle remained "
+                f"stationary for {stationary_limit:.1f} seconds.",
+            )
+            await self.sink.send(f"KILL_SILENT {player.target}")
+            LOG.warning(
+                "countdown-progress-guard stationary-removed map=%s player=%s "
+                "stationary=%.3f limit=%.3f",
+                self.current.key,
+                player.identity_key,
+                stationary_update.stationary_seconds,
+                stationary_limit,
+            )
             return
         required_checkpoints = set(getattr(self.current, "checkpoint_ids", ()))
         if required_checkpoints.difference(player.checkpoints_collected):
@@ -9171,7 +9389,10 @@ class TronnerRacing:
                 if item.connected
                 and item.active
                 and item.alive
-                and item.respawn_enabled
+                and (
+                    item.respawn_enabled
+                    or id(item) in getattr(self, "finalists", set())
+                )
                 and not item.is_ai
             }.values()
             timeout = max(
@@ -9239,7 +9460,11 @@ class TronnerRacing:
                         0.5,
                         float(
                             self.config.get(
-                                "final_countdown_grief_probe_interval_seconds", 1.0
+                                "final_countdown_progress_probe_interval_seconds",
+                                self.config.get(
+                                    "final_countdown_grief_probe_interval_seconds",
+                                    1.0,
+                                ),
                             )
                         ),
                     )
@@ -9532,14 +9757,20 @@ class TronnerRacing:
 
     async def _command_queue(self, player: Player, query: str) -> None:
         query = query.strip()
+        usage = (
+            "Usage: /q add [map], /q lowest, /q remove [map], or /q clear"
+        )
         if not query:
-            await self.private(
-                player,
-                "Usage: /q [map], /q remove [map], or /q clear",
-            )
+            await self.private(player, usage)
             return
 
-        if query.casefold() == "clear":
+        action, separator, action_query = query.partition(" ")
+        action = action.casefold()
+        action_query = action_query.strip() if separator else ""
+        if action == "clear":
+            if action_query:
+                await self.private(player, usage)
+                return
             removed_count = len(self.queue)
             if not removed_count:
                 await self.private(player, "The map queue is already empty.")
@@ -9552,13 +9783,25 @@ class TronnerRacing:
             )
             return
 
-        action, separator, action_query = query.partition(" ")
-        removing = action.casefold() == "remove"
-        if removing:
-            query = action_query.strip() if separator else ""
-            if not query:
-                await self.private(player, "Usage: /q remove [map name]")
+        if action == "lowest":
+            if action_query:
+                await self.private(player, usage)
                 return
+            await self._queue_lowest_ranked_map(player)
+            return
+
+        if action not in {"add", "remove"}:
+            await self.private(
+                player,
+                "The map queue format changed: use /q add [map]. " + usage,
+            )
+            return
+
+        removing = action == "remove"
+        query = action_query
+        if not query:
+            await self.private(player, f"Usage: /q {action} [map name]")
+            return
 
         matches = self.repository.search(query)
         if not matches:
@@ -9605,6 +9848,49 @@ class TronnerRacing:
         await self.broadcast(
             f"{player.record_name} queued {display_name} by {entry.author} "
             f"(position {len(self.queue)})."
+        )
+
+    async def _queue_lowest_ranked_map(self, player: Player) -> None:
+        unavailable = set(self.queue)
+        if self.current:
+            unavailable.add(self.current.key)
+        candidates = [
+            entry
+            for entry in self.repository.catalog.values()
+            if entry.key not in unavailable
+        ]
+        if not candidates:
+            await self.private(
+                player,
+                "Every available map is already active or in the queue.",
+            )
+            return
+
+        ranks = self.store.map_ranks_for_player(
+            (map_records_key(entry) for entry in candidates),
+            player.identity_key,
+        )
+        unranked = [
+            entry for entry in candidates if map_records_key(entry) not in ranks
+        ]
+        if unranked:
+            choices = unranked
+            rank_text = "unranked"
+        else:
+            lowest_rank = max(ranks[map_records_key(entry)] for entry in candidates)
+            choices = [
+                entry
+                for entry in candidates
+                if ranks[map_records_key(entry)] == lowest_rank
+            ]
+            rank_text = f"rank {lowest_rank}"
+        entry = random.choice(choices)
+        self.queue.append(entry.key)
+        self._save_rotation()
+        await self.broadcast(
+            f"{player.record_name} queued their lowest-ranked map, "
+            f"{self._display_map_name(entry)} by {entry.author} "
+            f"({rank_text}; position {len(self.queue)})."
         )
 
     async def _command_rate(self, player: Player, argument: str) -> None:

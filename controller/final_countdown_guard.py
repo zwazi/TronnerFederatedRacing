@@ -14,10 +14,17 @@ the map's configured axes.
 from __future__ import annotations
 
 import collections
+import contextlib
 import dataclasses
 import functools
+import gzip
+import hashlib
 import heapq
+import json
 import math
+import os
+import pickle
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -25,6 +32,8 @@ from typing import Iterable, Mapping, Sequence
 
 Point = tuple[float, float]
 TimedProgressSample = tuple[float, float, float, float, float]
+ROUTE_MODEL_CACHE_SCHEMA = 1
+ROUTE_MODEL_CACHE_SUFFIX = ".route-model.gz"
 
 
 def _local_name(tag: str) -> str:
@@ -978,6 +987,193 @@ def build_route_model(
     return model
 
 
+def _route_model_cache_key(
+    path: Path,
+    *,
+    maximum_cells: int,
+    minimum_cell_size: float,
+    wall_clearance_cells: float,
+    size_multiplier: float,
+    narrow_passage_guides: bool,
+) -> str:
+    source_digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            source_digest.update(chunk)
+    inputs = json.dumps(
+        {
+            "schema": ROUTE_MODEL_CACHE_SCHEMA,
+            "sourceSha256": source_digest.hexdigest(),
+            "maximumCells": int(maximum_cells),
+            "minimumCellSize": float(minimum_cell_size),
+            "wallClearanceCells": float(wall_clearance_cells),
+            "sizeMultiplier": float(size_multiplier),
+            "narrowPassageGuides": bool(narrow_passage_guides),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(inputs).hexdigest()
+
+
+def _valid_cached_route_model(
+    model: object,
+    maximum_cells: int,
+) -> bool:
+    if model is None:
+        return True
+    if not isinstance(model, RouteModel):
+        return False
+    cells = model.width * model.height
+    return (
+        model.width > 0
+        and model.height > 0
+        and cells <= max(2_000, int(maximum_cells) * 2)
+        and len(model.blocked) == cells
+        and len(model.distances) == cells
+        and len(model.guide_points) == len(model.guide_distances)
+        and len(model.guide_points) <= 6_000
+    )
+
+
+def _prune_route_model_cache(
+    cache_directory: Path,
+    *,
+    maximum_entries: int,
+    maximum_bytes: int,
+) -> None:
+    entries = []
+    for path in cache_directory.glob(f"*{ROUTE_MODEL_CACHE_SUFFIX}"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        entries.append((stat.st_mtime_ns, stat.st_size, path))
+    entries.sort(reverse=True)
+    retained_bytes = 0
+    for index, (_, size, path) in enumerate(entries):
+        retain = (
+            index < max(1, int(maximum_entries))
+            and retained_bytes + size <= max(1024 * 1024, int(maximum_bytes))
+        )
+        if retain:
+            retained_bytes += size
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+
+
+def load_or_build_route_model(
+    path: Path,
+    *,
+    cache_directory: Path | None = None,
+    cache_maximum_entries: int = 768,
+    cache_maximum_bytes: int = 512 * 1024 * 1024,
+    maximum_cells: int = 100_000,
+    minimum_cell_size: float = 1.0,
+    wall_clearance_cells: float = 0.0,
+    size_multiplier: float = 1.0,
+    narrow_passage_guides: bool = False,
+) -> tuple[RouteModel | None, bool]:
+    """Load an immutable route field from disk or build and cache it."""
+    cache_key = _route_model_cache_key(
+        path,
+        maximum_cells=maximum_cells,
+        minimum_cell_size=minimum_cell_size,
+        wall_clearance_cells=wall_clearance_cells,
+        size_multiplier=size_multiplier,
+        narrow_passage_guides=narrow_passage_guides,
+    )
+    cache_path = (
+        cache_directory / f"{cache_key}{ROUTE_MODEL_CACHE_SUFFIX}"
+        if cache_directory is not None
+        else None
+    )
+    if cache_path is not None and cache_path.is_file():
+        try:
+            if cache_path.stat().st_size > 64 * 1024 * 1024:
+                raise ValueError("route-model cache entry is too large")
+            with gzip.open(cache_path, "rb") as handle:
+                payload = pickle.load(handle)
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema") != ROUTE_MODEL_CACHE_SCHEMA
+                or payload.get("key") != cache_key
+                or not _valid_cached_route_model(
+                    payload.get("model"), maximum_cells
+                )
+            ):
+                raise ValueError("route-model cache entry is invalid")
+            with contextlib.suppress(OSError):
+                os.utime(cache_path, None)
+            return payload.get("model"), True
+        except (
+            AttributeError,
+            EOFError,
+            OSError,
+            pickle.UnpicklingError,
+            TypeError,
+            ValueError,
+        ):
+            try:
+                cache_path.unlink()
+            except OSError:
+                pass
+
+    model = build_route_model(
+        path,
+        maximum_cells=maximum_cells,
+        minimum_cell_size=minimum_cell_size,
+        wall_clearance_cells=wall_clearance_cells,
+        size_multiplier=size_multiplier,
+        narrow_passage_guides=narrow_passage_guides,
+    )
+    if cache_path is None:
+        return model, False
+
+    temporary = cache_path.with_name(
+        f".{cache_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        cache_directory.mkdir(parents=True, exist_ok=True)
+        with temporary.open("xb") as raw_handle:
+            with gzip.GzipFile(
+                fileobj=raw_handle,
+                mode="wb",
+                compresslevel=3,
+                mtime=0,
+            ) as compressed:
+                pickle.dump(
+                    {
+                        "schema": ROUTE_MODEL_CACHE_SCHEMA,
+                        "key": cache_key,
+                        "model": model,
+                    },
+                    compressed,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
+        os.replace(temporary, cache_path)
+        _prune_route_model_cache(
+            cache_directory,
+            maximum_entries=cache_maximum_entries,
+            maximum_bytes=cache_maximum_bytes,
+        )
+    except (OSError, pickle.PickleError, TypeError):
+        # The route field remains usable in memory when its optional cache
+        # cannot be written.
+        pass
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return model, False
+
+
 def _bridge_narrow_passages(
     model: RouteModel,
     *,
@@ -1556,6 +1752,14 @@ class WrongWayProgressUpdate:
     exhausted: bool
 
 
+@dataclasses.dataclass(frozen=True)
+class StationaryProgressUpdate:
+    charged_seconds: float
+    stationary_seconds: float
+    warning_due: bool
+    exhausted: bool
+
+
 @dataclasses.dataclass
 class PlayerProgressState:
     samples: collections.deque[TimedProgressSample] = dataclasses.field(
@@ -1573,6 +1777,11 @@ class PlayerProgressState:
     wrong_way_seconds: float = 0.0
     wrong_way_episode_seconds: float = 0.0
     wrong_way_episode_warned: bool = False
+    last_position_sample: tuple[float, float, float] | None = None
+    stationary_seconds: float = 0.0
+    stationary_warned: bool = False
+    last_turn_direction: str = ""
+    consecutive_same_turns: int = 0
 
     def clear_violation(self) -> None:
         self.warned_at = None
@@ -1586,6 +1795,59 @@ class PlayerProgressState:
     def clear_route_baseline(self) -> None:
         self.last_route_sample = None
         self.clear_wrong_way_episode()
+
+    def observe_position(
+        self,
+        now: float,
+        position: Point,
+        *,
+        limit_seconds: float = 5.0,
+        warning_delay_seconds: float = 1.0,
+        position_epsilon: float = 0.01,
+        maximum_sample_gap_seconds: float = 2.0,
+    ) -> StationaryProgressUpdate:
+        """Track one continuous period without meaningful cycle movement."""
+        limit = max(0.1, float(limit_seconds))
+        warning_delay = max(0.0, float(warning_delay_seconds))
+        epsilon = max(0.0, float(position_epsilon))
+        maximum_gap = max(0.1, float(maximum_sample_gap_seconds))
+        previous = self.last_position_sample
+        self.last_position_sample = (float(now), position[0], position[1])
+        charged = 0.0
+        warning_due = False
+        if previous is not None:
+            interval = max(0.0, float(now) - previous[0])
+            movement = math.dist((previous[1], previous[2]), position)
+            if movement <= epsilon:
+                charged = min(interval, maximum_gap)
+                self.stationary_seconds += charged
+                if (
+                    not self.stationary_warned
+                    and self.stationary_seconds >= warning_delay
+                ):
+                    self.stationary_warned = True
+                    warning_due = True
+            else:
+                self.stationary_seconds = 0.0
+                self.stationary_warned = False
+        return StationaryProgressUpdate(
+            charged_seconds=charged,
+            stationary_seconds=self.stationary_seconds,
+            warning_due=warning_due,
+            exhausted=self.stationary_seconds >= limit,
+        )
+
+    def observe_turn(self, direction: str, limit: int = 15) -> tuple[int, bool]:
+        """Count consecutive successful turns in the same direction."""
+        if direction not in {"L", "R"}:
+            return self.consecutive_same_turns, False
+        if direction == self.last_turn_direction:
+            self.consecutive_same_turns += 1
+        else:
+            self.last_turn_direction = direction
+            self.consecutive_same_turns = 1
+        maximum = max(1, int(limit))
+        return self.consecutive_same_turns, self.consecutive_same_turns > maximum
 
     def observe_route_distance(
         self,

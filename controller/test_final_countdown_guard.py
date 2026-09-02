@@ -11,6 +11,7 @@ from final_countdown_guard import (
     accelerated_travel_distance,
     assess_progress,
     build_route_model,
+    load_or_build_route_model,
 )
 from TronnerRacing import Player, TronnerRacing
 
@@ -292,6 +293,40 @@ class RouteModelTests(unittest.TestCase):
         self.assertEqual(teleport.entrance.radius, 10.0)
         self.assertEqual(teleport.destination, (80.0, 100.0))
 
+    def test_route_model_is_loaded_from_immutable_disk_cache(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        path = root / "cached.aamap.xml"
+        path.write_text(
+            test_map(
+                '''
+                <Zone effect="win"><ShapeCircle radius="3"><Point x="20" y="50"/></ShapeCircle></Zone>
+                '''
+            ),
+            encoding="utf-8",
+        )
+        options = {
+            "cache_directory": root / "route-cache",
+            "maximum_cells": 30_000,
+            "minimum_cell_size": 1.0,
+            "narrow_passage_guides": True,
+        }
+
+        built, cache_hit = load_or_build_route_model(path, **options)
+        self.assertIsNotNone(built)
+        self.assertFalse(cache_hit)
+
+        with mock.patch(
+            "final_countdown_guard.build_route_model",
+            side_effect=AssertionError("cache miss"),
+        ):
+            cached, cache_hit = load_or_build_route_model(path, **options)
+
+        self.assertTrue(cache_hit)
+        self.assertEqual(cached.reference_distance, built.reference_distance)
+        self.assertEqual(cached.distances, built.distances)
+
 
 class ProgressAssessmentTests(unittest.TestCase):
     def test_fast_circle_can_reach_but_fails_constant_progress(self):
@@ -469,6 +504,33 @@ class WrongWayAllowanceTests(unittest.TestCase):
         delayed = state.observe_route_distance(9.0, 60.0)
         self.assertEqual(delayed.charged_seconds, 2.0)
 
+    def test_stationary_limit_requires_one_continuous_stop(self):
+        state = PlayerProgressState()
+        state.observe_position(0.0, (1.0, 1.0))
+        first = state.observe_position(1.0, (1.0, 1.0))
+        self.assertTrue(first.warning_due)
+        self.assertEqual(first.stationary_seconds, 1.0)
+
+        moving = state.observe_position(2.0, (2.0, 1.0))
+        self.assertEqual(moving.stationary_seconds, 0.0)
+        for second in range(3, 8):
+            stopped = state.observe_position(float(second), (2.0, 1.0))
+        self.assertTrue(stopped.exhausted)
+        self.assertEqual(stopped.stationary_seconds, 5.0)
+
+    def test_sixteenth_same_direction_turn_exhausts_limit(self):
+        state = PlayerProgressState()
+        for _ in range(15):
+            count, exhausted = state.observe_turn("L")
+            self.assertFalse(exhausted)
+        self.assertEqual(count, 15)
+        self.assertEqual(state.observe_turn("R"), (1, False))
+        for _ in range(14):
+            count, exhausted = state.observe_turn("R")
+            self.assertFalse(exhausted)
+        self.assertEqual(count, 15)
+        self.assertEqual(state.observe_turn("R"), (16, True))
+
 
 class Sink:
     def __init__(self):
@@ -607,6 +669,75 @@ class CountdownEnforcementTests(unittest.IsolatedAsyncioTestCase):
         await controller._record_final_countdown_progress(player, 2.0, (-2.0, 0.0))
 
         self.assertTrue(any("warning" in message.casefold() for message in messages))
+        self.assertEqual(controller.sink.commands, ["KILL_SILENT racer"])
+
+    async def test_stationary_player_is_removed_while_route_field_builds(self):
+        controller = object.__new__(TronnerRacing)
+        controller.config = {
+            "final_countdown_progress_guard_enabled": True,
+            "final_countdown_progress_stationary_limit_seconds": 5,
+            "final_countdown_progress_stationary_warning_delay_seconds": 1,
+        }
+        controller.current = SimpleNamespace(key="Test/maps/Building-v1.aamap.xml")
+        controller.final_countdown_active = True
+        controller.final_countdown_end_epoch = 20.0
+        controller.final_countdown_duration_seconds = 20.0
+        controller.final_countdown_route_model = None
+        controller.final_countdown_route_map_key = controller.current.key
+        controller.final_countdown_route_building = True
+        controller.final_countdown_progress_states = {}
+        controller.sink = Sink()
+        messages = []
+
+        async def private(_player, message):
+            messages.append(message)
+
+        controller.private = private
+        player = Player("racer", "Racer", connected=True, active=True, alive=True)
+        controller.finalists = {id(player)}
+
+        for second in range(6):
+            await controller._record_final_countdown_progress(
+                player, float(second), (10.0, 10.0)
+            )
+
+        self.assertTrue(any("stationary" in message for message in messages))
+        self.assertEqual(controller.sink.commands, ["KILL_SILENT racer"])
+
+    async def test_sixteenth_consecutive_turn_removes_player(self):
+        controller = object.__new__(TronnerRacing)
+        controller.config = {
+            "final_countdown_progress_guard_enabled": True,
+            "final_countdown_progress_same_turn_limit": 15,
+        }
+        controller.current = SimpleNamespace(key="Test/maps/Turns-v1.aamap.xml")
+        controller.final_countdown_active = True
+        controller.final_countdown_end_epoch = 20.0
+        controller.final_countdown_progress_states = {}
+        controller.sink = Sink()
+        controller.players = {}
+        controller.aliases = {}
+        messages = []
+
+        async def private(_player, message):
+            messages.append(message)
+
+        controller.private = private
+        player = Player("racer", "Racer", connected=True, active=True, alive=True)
+        controller.players["racer"] = player
+        controller.finalists = {id(player)}
+        controller.active_replay_tokens = {id(player): "token"}
+        controller.replay_captures = {
+            "token": SimpleNamespace(
+                player_log_name="racer",
+                add_input=lambda _time, _action: True,
+            )
+        }
+
+        for turn in range(16):
+            await controller._handle_replay_input(f"token {turn}.0 L")
+
+        self.assertIn("16 consecutive left turns", messages[-1])
         self.assertEqual(controller.sink.commands, ["KILL_SILENT racer"])
 
     async def test_incomplete_checkpoint_route_is_not_judged_against_winzone(self):
