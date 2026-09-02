@@ -874,6 +874,136 @@ class FirebaseCatalogClient:
             ),
         )
 
+    def submit_excluded_map_reviews(self, exclusions: list[dict]) -> list[dict]:
+        """Atomically move locally excluded published maps into Vectron review."""
+        if not exclusions:
+            return []
+        unique_map_ids: set[str] = set()
+        prepared: list[dict] = []
+        writes: list[dict] = []
+        now = _timestamp()
+        server_actor = f"server:{self.server_id}"
+        for exclusion in exclusions:
+            map_id = str(exclusion.get("mapId") or "").strip()
+            resource_path = str(exclusion.get("resourcePath") or "").strip()
+            reason = str(exclusion.get("reason") or "").strip()
+            if not map_id or not resource_path:
+                raise FirebaseCatalogError(
+                    "each excluded map requires mapId and resourcePath"
+                )
+            if map_id in unique_map_ids:
+                raise FirebaseCatalogError(f"duplicate excluded map: {map_id}")
+            unique_map_ids.add(map_id)
+            if len(reason) > 1000:
+                raise FirebaseCatalogError(
+                    f"exclusion reason for {resource_path} exceeds 1,000 characters"
+                )
+            current = self.get_document("maps", map_id)
+            if current.get("resourcePath") != resource_path:
+                raise FirebaseCatalogError(
+                    f"catalog resource path changed for {resource_path}"
+                )
+            if current.get("status") not in {"active", "inactive"}:
+                raise FirebaseCatalogError(
+                    f"map {resource_path} is not a published catalog map"
+                )
+            linked_review_id = str(current.get("reviewSubmissionId") or "")
+            if linked_review_id:
+                review = self.get_document("mapSubmissions", linked_review_id)
+                if (
+                    review.get("operation") != "server-review"
+                    or review.get("status") not in {"pending", "denied"}
+                    or review.get("mapId") != map_id
+                    or review.get("sourceResourcePath") != resource_path
+                ):
+                    raise FirebaseCatalogError(
+                        f"map {resource_path} is linked to an incompatible review"
+                    )
+                prepared.append(review)
+                continue
+
+            review_reason = reason or "Moved from the server exclusion list for Vectron review"
+            review_id = f"server_review_{uuid.uuid4().hex}"
+            submission = {
+                "submissionId": review_id,
+                "mapId": map_id,
+                "operation": "server-review",
+                "status": "pending",
+                "submittedBy": server_actor,
+                "submittedByName": self.server_id,
+                "authorId": current["authorId"],
+                "authorName": current["authorName"],
+                "category": current["category"],
+                "mapName": current["mapName"],
+                "mapVersion": current["mapVersion"],
+                "storagePath": current["storagePath"],
+                "sourceRevisionId": current["activeRevisionId"],
+                "sourceMapId": map_id,
+                "sourceResourcePath": resource_path,
+                "sha256": current["sha256"],
+                "submissionReason": review_reason,
+                "createdAt": now,
+                "updatedAt": now,
+            }
+            updated_map = {
+                key: value
+                for key, value in current.items()
+                if not key.startswith("_")
+            }
+            updated_map.update(
+                {
+                    "status": "inactive",
+                    "statusReason": review_reason,
+                    "statusUpdatedBy": server_actor,
+                    "statusUpdatedAt": now,
+                    "reviewSubmissionId": review_id,
+                    "updatedAt": now,
+                }
+            )
+            audit_id = f"server_{uuid.uuid4().hex}"
+            audit = {
+                "actorUid": server_actor,
+                "actorName": self.server_id,
+                "action": "map.review.submit",
+                "targetType": "mapSubmission",
+                "targetId": review_id,
+                "mapId": map_id,
+                "reason": review_reason,
+                "before": {
+                    "status": current.get("status"),
+                    "excluded": True,
+                },
+                "after": {"status": "inactive", "reviewStatus": "pending"},
+                "createdAt": now,
+            }
+            writes.extend(
+                [
+                    self._create_write(
+                        _document(
+                            self.project,
+                            "mapSubmissions",
+                            review_id,
+                            submission,
+                        )
+                    ),
+                    self._update_write(
+                        _document(self.project, "maps", map_id, updated_map),
+                        update_time=current["_update_time"],
+                    ),
+                    self._create_write(
+                        _document(self.project, "auditEvents", audit_id, audit)
+                    ),
+                ]
+            )
+            prepared.append({**submission, "_id": review_id})
+        if len(writes) > 500:
+            raise FirebaseCatalogError(
+                "excluded-map migration exceeds Firestore's 500-write commit limit"
+            )
+        if writes:
+            self._commit(writes)
+        return prepared
+
     def submit_map_review(self, map_id: str, reason: str) -> dict:
         """Atomically create a Vectron review and deactivate its published map."""
         current = self.get_document("maps", map_id)
