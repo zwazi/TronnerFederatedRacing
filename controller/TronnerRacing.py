@@ -44,6 +44,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from firebase_catalog import FirebaseCatalogClient, FirebaseCatalogError
 from final_countdown_guard import (
+    AccelerationCapability,
     PlayerProgressState,
     RouteModel,
     assess_progress,
@@ -4165,6 +4166,9 @@ class TronnerRacing:
         self.final_countdown_route_building = False
         self.final_countdown_progress_states: dict[int, PlayerProgressState] = {}
         self.final_countdown_duration_seconds: float | None = None
+        self.final_countdown_acceleration_capability: AccelerationCapability | None
+        self.final_countdown_acceleration_capability = None
+        self.final_countdown_acceleration_identifier: str | None = None
         reload_state = self.store.get_json("controller_reload", {})
         self.controller_reload_state: dict = (
             reload_state if isinstance(reload_state, dict) else {}
@@ -5632,6 +5636,8 @@ class TronnerRacing:
         self.final_countdown_route_building = False
         self.final_countdown_progress_states = {}
         self.final_countdown_duration_seconds = None
+        self.final_countdown_acceleration_capability = None
+        self.final_countdown_acceleration_identifier = None
         self.store.set_json("final_countdown_active", False)
         self.store.set_json("final_countdown_end_epoch", None)
         self.store.set_json("final_countdown_map_key", None)
@@ -8662,12 +8668,37 @@ class TronnerRacing:
             )
         )
 
+    def _active_acceleration_capability(self) -> AccelerationCapability | None:
+        identifier = getattr(self, "active_replay_settings_identifier", None)
+        store = getattr(self, "store", None)
+        if not identifier or store is None:
+            return None
+        try:
+            settings_ref = store.replay_settings_ref(identifier)
+            snapshot = (
+                store.dashboard_replay_settings(settings_ref)
+                if settings_ref is not None
+                else None
+            )
+            rows = snapshot.get("settings", ()) if snapshot else ()
+            settings = {
+                str(row[0]): str(row[1])
+                for row in rows
+                if isinstance(row, (list, tuple)) and len(row) == 2
+            }
+        except (OSError, TypeError, ValueError, sqlite3.Error):
+            LOG.exception("unable to read active cycle acceleration settings")
+            return None
+        return AccelerationCapability.from_settings(settings) if settings else None
+
     async def _prepare_final_countdown_guard(
         self,
         duration: float,
     ) -> None:
         self.final_countdown_progress_states = {}
         self.final_countdown_duration_seconds = max(1.0, float(duration))
+        self.final_countdown_acceleration_capability = None
+        self.final_countdown_acceleration_identifier = None
         self.final_countdown_route_model = None
         self.final_countdown_route_map_key = self.current.key if self.current else None
         self.final_countdown_route_building = False
@@ -8679,6 +8710,28 @@ class TronnerRacing:
         ):
             return
         map_key = self.current.key
+        self.final_countdown_acceleration_capability = (
+            self._active_acceleration_capability()
+        )
+        self.final_countdown_acceleration_identifier = getattr(
+            self, "active_replay_settings_identifier", None
+        )
+        capability = self.final_countdown_acceleration_capability
+        if capability is None:
+            LOG.warning(
+                "active cycle acceleration settings unavailable; final-countdown "
+                "reachability will use measured speed until the engine snapshot arrives"
+            )
+        else:
+            LOG.info(
+                "final-countdown acceleration base=%.3f decay_below=%.3f "
+                "decay_above=%.3f external=%.3f maximum=%.3f",
+                capability.base_speed,
+                capability.decay_below,
+                capability.decay_above,
+                capability.external_acceleration,
+                capability.maximum_speed,
+            )
         maximum_cells = min(
             500_000,
             max(
@@ -8702,6 +8755,9 @@ class TronnerRacing:
                 )
             ),
         )
+        size_multiplier = 2.0 ** (
+            float(getattr(self, "current_size_factor", 0.0) or 0.0) / 2.0
+        )
         self.final_countdown_route_building = True
         try:
             model = await asyncio.to_thread(
@@ -8710,6 +8766,7 @@ class TronnerRacing:
                 maximum_cells=maximum_cells,
                 minimum_cell_size=minimum_cell_size,
                 wall_clearance_cells=wall_clearance,
+                size_multiplier=size_multiplier,
             )
         except asyncio.CancelledError:
             self.final_countdown_route_building = False
@@ -8762,6 +8819,7 @@ class TronnerRacing:
                         maximum_cells=retry_maximum_cells,
                         minimum_cell_size=retry_minimum_cell_size,
                         wall_clearance_cells=wall_clearance,
+                        size_multiplier=size_multiplier,
                     )
                 except asyncio.CancelledError:
                     self.final_countdown_route_building = False
@@ -8784,12 +8842,13 @@ class TronnerRacing:
             return
         LOG.info(
             "final-countdown route model map=%s grid=%dx%d cell=%.3f "
-            "reference_distance=%.3f",
+            "reference_distance=%.3f teleports=%d",
             map_key,
             model.width,
             model.height,
             model.cell_size,
             model.reference_distance,
+            len(model.geometry.teleports),
         )
 
     async def _record_final_countdown_progress(
@@ -8841,7 +8900,24 @@ class TronnerRacing:
         )
         if state.killed:
             return
-        state.samples.append((now, position[0], position[1], route_distance))
+        if state.samples and state.samples[-1][3] <= 0:
+            state.samples.clear()
+            state.travel_distance = 0.0
+            state.clear_violation()
+        if state.samples:
+            state.travel_distance += model.observed_travel_distance(
+                (state.samples[-1][1], state.samples[-1][2]),
+                position,
+            )
+        state.samples.append(
+            (
+                now,
+                position[0],
+                position[1],
+                route_distance,
+                state.travel_distance,
+            )
+        )
 
         remaining = max(
             0.0, float(self.final_countdown_end_epoch) - time.time()
@@ -8874,6 +8950,20 @@ class TronnerRacing:
             state.clear_violation()
             return
 
+        acceleration_capability = getattr(
+            self, "final_countdown_acceleration_capability", None
+        )
+        active_settings_identifier = getattr(
+            self, "active_replay_settings_identifier", None
+        )
+        if (
+            acceleration_capability is None
+            or active_settings_identifier
+            != getattr(self, "final_countdown_acceleration_identifier", None)
+        ):
+            acceleration_capability = self._active_acceleration_capability()
+            self.final_countdown_acceleration_capability = acceleration_capability
+            self.final_countdown_acceleration_identifier = active_settings_identifier
         assessment = assess_progress(
             tuple(state.samples),
             remaining_seconds=remaining,
@@ -8885,6 +8975,7 @@ class TronnerRacing:
                     )
                 ),
             ),
+            acceleration_capability=acceleration_capability,
         )
         if assessment is None:
             state.clear_violation()
@@ -8906,9 +8997,9 @@ class TronnerRacing:
             state.warned_at = now
             await self.private(
                 player,
-                f"Final countdown warning: {assessment.reason}. Your run will be "
-                "ended "
-                f"if this continues for {math.ceil(grace)} seconds.",
+                f"Final countdown warning: {assessment.reason}. "
+                f"Your run will be ended if this continues for "
+                f"{math.ceil(grace)} seconds.",
             )
             LOG.info(
                 "final-countdown warning map=%s player=%s reason=%s "
@@ -8969,7 +9060,14 @@ class TronnerRacing:
         )
         if state.killed:
             return
-        state.samples.append((now, position[0], position[1], 0.0))
+        if state.samples:
+            state.travel_distance += math.dist(
+                (state.samples[-1][1], state.samples[-1][2]),
+                position,
+            )
+        state.samples.append(
+            (now, position[0], position[1], 0.0, state.travel_distance)
+        )
         while state.samples and now - state.samples[0][0] > idle_seconds * 1.2:
             state.samples.popleft()
         duration = (
