@@ -39,6 +39,7 @@ class ServerManagementTest(unittest.IsolatedAsyncioTestCase):
         controller.round_active = False
         controller.transitioning = False
         controller.final_countdown_active = False
+        controller.server_restart_active = False
         controller.controller_reload_state = {}
         controller.respawns_paused = False
         controller.deadline_epoch = None
@@ -82,6 +83,39 @@ class ServerManagementTest(unittest.IsolatedAsyncioTestCase):
             await controller._execute_server_management_command(command)
 
         self.assertEqual(controller.sink.commands, ["CYCLE_SPEED 42.5"])
+
+    async def test_raw_console_command_is_one_bounded_line(self):
+        controller = self.controller()
+        result, details = await controller._execute_server_management_command({
+            "type": "console_command",
+            "requestedBy": "admin-id",
+            "requestedName": "Grid admin",
+            "message": "CYCLE_SPEED 30",
+        })
+        self.assertEqual(result, "Server console command sent.")
+        self.assertEqual(details, {"command": "CYCLE_SPEED 30"})
+        self.assertEqual(controller.sink.commands, ["CYCLE_SPEED 30"])
+
+        with self.assertRaisesRegex(ValueError, "one line"):
+            await controller._execute_server_management_command({
+                "type": "console_command",
+                "requestedBy": "admin-id",
+                "requestedName": "Grid admin",
+                "message": "CYCLE_SPEED 30\nQUIT",
+            })
+
+    async def test_restart_server_starts_normal_countdown(self):
+        controller = self.controller()
+        controller.request_server_restart = lambda requested_by: 37.2
+        result, details = await controller._execute_server_management_command({
+            "type": "restart_server",
+            "requestedBy": "admin-id",
+            "requestedName": "Grid admin",
+        })
+        self.assertEqual(
+            result, "Server restart countdown started for 38 seconds."
+        )
+        self.assertEqual(details, {"countdownSeconds": 38})
 
     async def test_moderation_targets_only_connected_snapshot_players(self):
         controller = self.controller()

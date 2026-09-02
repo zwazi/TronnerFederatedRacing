@@ -147,9 +147,7 @@ class RoundGuardTests(unittest.IsolatedAsyncioTestCase):
 
             controller.transition_map_confirmed = True
             self.assertTrue(await asyncio.wait_for(task, timeout=0.2))
-            self.assertTrue(
-                any("Map: Next | Author: Author" in command for command in controller.sink.commands)
-            )
+            self.assertEqual(controller.sink.commands, [])
             controller.store.close()
 
     async def test_repeated_round_started_advances_instead_of_replaying_map(self):

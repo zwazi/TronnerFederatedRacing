@@ -132,7 +132,9 @@ class RequestedBehaviorTests(unittest.IsolatedAsyncioTestCase):
             controller = object.__new__(TronnerRacing)
             controller.sink = Sink()
             controller.store = StateStore(Path(tmp) / "countdown.sqlite3")
-            controller.current = SimpleNamespace(key="manual-map")
+            controller.current = SimpleNamespace(
+                key="manual-map", rating_key="manual-map"
+            )
             controller.transitioning = False
             controller.final_countdown_active = False
             controller.final_countdown_end_epoch = None
@@ -157,6 +159,7 @@ class RequestedBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(
                     "CONSOLE_MESSAGE Map time expired. "
                     "Respawning is disabled. Final countdown: 90 seconds. "
+                    "Current rating: unrated. "
                     "Use /rate # for the current map or /rate [map] # "
                     "for a specific map.",
                     [

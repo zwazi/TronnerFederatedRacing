@@ -6,17 +6,8 @@ install_prefix=${TRONNER_ENGINE_PREFIX:-/opt/armagetronad}
 jobs=${TRONNER_BUILD_JOBS:-1}
 upstream_url=${TRONNER_ENGINE_UPSTREAM_URL:-https://github.com/ArmagetronAd/armagetronad.git}
 upstream_commit=$(tr -d '[:space:]' < "$repository_dir/engine/UPSTREAM_COMMIT")
-patch_file="$repository_dir/engine/patches/tronner-federation.patch"
-engine_variant=${TRONNER_ENGINE_VARIANT:-federated}
+patch_file="$repository_dir/engine/patches/tronner-racing.patch"
 temporary_workspace=
-
-case "$engine_variant" in
-    federated|vanilla) ;;
-    *)
-        echo "TRONNER_ENGINE_VARIANT must be federated or vanilla." >&2
-        exit 2
-        ;;
-esac
 
 if [[ -n ${TRONNER_ENGINE_SOURCE_DIR:-} || -n ${TRONNER_ENGINE_BUILD_DIR:-} ]]; then
     [[ -n ${TRONNER_ENGINE_SOURCE_DIR:-} && -n ${TRONNER_ENGINE_BUILD_DIR:-} ]] || {
@@ -52,10 +43,8 @@ if ((!new_source)) && [[ -n $(git -C "$source_dir" status --porcelain) ]]; then
 fi
 git -C "$source_dir" fetch --depth 1 origin "$upstream_commit"
 git -C "$source_dir" checkout --detach "$upstream_commit"
-if [[ "$engine_variant" == federated ]]; then
-    git -C "$source_dir" apply --check "$patch_file"
-    git -C "$source_dir" apply "$patch_file"
-fi
+git -C "$source_dir" apply --check "$patch_file"
+git -C "$source_dir" apply "$patch_file"
 
 (
     cd "$source_dir"
@@ -85,4 +74,4 @@ binary="$install_prefix/bin/armagetronad-dedicated"
 test -x "$binary"
 sha256sum "$binary"
 "$binary" --version
-echo "Built $engine_variant engine from upstream commit $upstream_commit."
+echo "Built Tronner Racing engine from upstream commit $upstream_commit."

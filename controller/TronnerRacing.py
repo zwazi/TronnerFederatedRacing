@@ -88,7 +88,6 @@ SERVER_CONSOLE_SENSITIVE_RE = re.compile(
 FEDERATION_LOCAL_COMMANDS = frozenset(
     {
         "/cp",
-        "/display_server_tags",
         "/help",
         "/join",
         "/link",
@@ -121,6 +120,8 @@ SERVER_MANAGEMENT_COMMANDS = frozenset(
         "change_map",
         "reload_maps",
         "restart_round",
+        "restart_server",
+        "console_command",
         "set_engine_option",
         "reload_controller",
         "start_console_stream",
@@ -868,6 +869,10 @@ def padded_center_command(value: object, padding: int = 10) -> str:
     return f"CENTER_MESSAGE {left}{text}{right}"
 
 
+def server_restart_center_command(seconds: int) -> str:
+    return f"CENTER_MESSAGE 0xff0000{int(seconds)}{' ' * 24}0xffffff "
+
+
 def normalized_map_name(value: str) -> str:
     value = unicodedata.normalize("NFKC", value).casefold()
     return "".join(ch for ch in value if ch.isalnum())
@@ -1221,6 +1226,7 @@ USER_COMMAND_HELP = (
     ("/rotation", "Privately show the alphabetical map rotation."),
     ("/exclusion_list", "Privately show maps excluded from rotation."),
     ("/leaderboard", "Privately show the current map's top 10 times."),
+    ("/results", "Toggle finish and rank messages."),
     (
         "/setspawn [#]",
         "Always use a spawn number; omit # for latest or use 0 to clear it.",
@@ -1228,10 +1234,6 @@ USER_COMMAND_HELP = (
     (
         "/start [brake|immediate|countdown [1-60]|respawn]",
         "Choose how your cycle begins moving and optionally set its countdown.",
-    ),
-    (
-        "/display_server_tags",
-        "Toggle server tags on other players' names (off by default).",
     ),
     (
         "/link [6-digit code]",
@@ -2837,6 +2839,15 @@ class StateStore:
         ).fetchone()
         return float(row[0]) if row and row[0] is not None else None
 
+    def rating_summary(self, map_key: str) -> tuple[float, int] | None:
+        row = self.connection.execute(
+            "SELECT AVG(rating), COUNT(*) FROM ratings WHERE map_key=?",
+            (map_key,),
+        ).fetchone()
+        if not row or row[0] is None or int(row[1]) < 1:
+            return None
+        return float(row[0]), int(row[1])
+
     def rating_summaries(self) -> dict[str, tuple[float, int]]:
         """Return every map rating using one bounded aggregate query."""
         rows = self.current_connection().execute(
@@ -4261,6 +4272,18 @@ class TronnerRacing:
             )
             if isinstance(enabled, bool)
         }
+        saved_result_preferences = self.store.get_json(
+            "result_message_preferences", {}
+        )
+        self.result_message_preferences: dict[str, bool] = {
+            str(identity_key): enabled
+            for identity_key, enabled in (
+                saved_result_preferences.items()
+                if isinstance(saved_result_preferences, dict)
+                else ()
+            )
+            if isinstance(enabled, bool)
+        }
         self.spawn_preferences_path = Path(
             config.get(
                 "spawn_preferences_file",
@@ -4362,6 +4385,10 @@ class TronnerRacing:
         self.current: MapEntry | None = None
         self.current_spec: str | None = None
         self.current_size_factor: float | None = None
+        saved_previous_map = self.store.get_json("previous_map_metadata", {})
+        self.previous_map_metadata: dict[str, object] = (
+            saved_previous_map if isinstance(saved_previous_map, dict) else {}
+        )
         self.restoring_saved_map = False
         self.deadline_epoch: float | None = self.store.get_json("deadline_epoch", None)
         self.round_started_epoch: float | None = self.store.get_json(
@@ -4410,6 +4437,8 @@ class TronnerRacing:
         self.respawns_paused = bool(self.controller_reload_state.get("pending"))
         self.controller_reload_draining = False
         self._controller_reload_task: asyncio.Task | None = None
+        self.server_restart_active = False
+        self._server_restart_task: asyncio.Task | None = None
         self.last_game_time: float | None = None
         self.last_game_monotonic: float | None = None
         self.respawn_tasks: dict[int, asyncio.Task] = {}
@@ -6511,6 +6540,8 @@ class TronnerRacing:
             self._helpful_message_task.cancel()
         if self._controller_reload_task:
             self._controller_reload_task.cancel()
+        if self._server_restart_task:
+            self._server_restart_task.cancel()
         for task in self._federation_event_tasks:
             task.cancel()
         self._federation_event_tasks.clear()
@@ -6541,6 +6572,86 @@ class TronnerRacing:
             name="controller-reload-drain",
         )
         return True
+
+    def request_server_restart(self, requested_by: str = "system") -> float | None:
+        if (
+            self.server_restart_active
+            or self.transitioning
+            or self.final_countdown_active
+            or self.controller_reload_draining
+            or self.controller_reload_state.get("pending")
+            or not self.current
+        ):
+            return None
+        records = self.store.records(map_records_key(self.current))
+        duration = final_countdown_seconds(records)
+        self.server_restart_active = True
+        self.respawns_paused = True
+        self._server_restart_task = asyncio.create_task(
+            self._run_server_restart_countdown(duration, requested_by),
+            name="server-restart-countdown",
+        )
+        return duration
+
+    async def _run_server_restart_countdown(
+        self,
+        duration: float,
+        requested_by: str,
+    ) -> None:
+        try:
+            self._clear_all_votes()
+            for task in self.respawn_tasks.values():
+                task.cancel()
+            self.respawn_tasks.clear()
+            held_players: list[Player] = []
+            for player in {
+                id(item): item for item in self.players.values()
+            }.values():
+                if player.pending_respawn:
+                    held_players.append(player)
+                    self._cancel_player_freeze(player)
+            if held_players:
+                await self.sink.send(
+                    *(f"KILL_SILENT {player.target}" for player in held_players)
+                )
+
+            total_seconds = max(1, math.ceil(duration))
+            await self.sink.send(
+                "CONSOLE_MESSAGE 0xff0000SERVER RESTARTING IN "
+                f"{total_seconds} SECONDS"
+            )
+            LOG.info(
+                "server restart countdown requested_by=%s duration=%.3f",
+                clean_console_text(requested_by),
+                duration,
+            )
+            end_monotonic = time.monotonic() + duration
+            last_number: int | None = None
+            while self.server_restart_active:
+                remaining = end_monotonic - time.monotonic()
+                if remaining <= 0:
+                    await self.sink.send(server_restart_center_command(0))
+                    break
+                number = max(1, math.ceil(remaining))
+                if number != last_number:
+                    await self.sink.send(server_restart_center_command(number))
+                    last_number = number
+                await asyncio.sleep(0.05)
+
+            # Accept the same map's first ROUND_STARTED after systemd brings
+            # the processes back. Persisted map state lets the new controller
+            # restore the current map without treating it as a native repeat.
+            self._set_round_started_map(None)
+            self.round_active = False
+            self.server_restart_active = False
+            await self.sink.send("QUIT")
+            await asyncio.sleep(0.1)
+            self.stop_event.set()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._server_restart_task is asyncio.current_task():
+                self._server_restart_task = None
 
     def _controller_reload_alive_players(self) -> list[Player]:
         unique: dict[int, Player] = {}
@@ -8258,6 +8369,7 @@ class TronnerRacing:
             LOG.info("advancing to %s (%s)", entry.key, reason)
             size_reset = self._consume_pending_size_change(entry)
             self._clear_final_countdown_state()
+            self._remember_previous_map(self.current)
             self.current = entry
             self.current_spec = entry.key
             self.current_size_factor = size_factor
@@ -8454,6 +8566,21 @@ class TronnerRacing:
             await self._publish_federation_message(
                 "broadcast", message=message
             )
+
+    async def result_message(self, message: str) -> None:
+        """Deliver race-result chatter only to players who opted in."""
+        delivered: set[str] = set()
+        preferences = getattr(self, "result_message_preferences", {})
+        for player in list(self.players.values()):
+            if (
+                not player.connected
+                or player.is_ai
+                or player.identity_key in delivered
+                or preferences.get(player.identity_key, True) is False
+            ):
+                continue
+            delivered.add(player.identity_key)
+            await self.private(player, message)
 
     async def _write_dashboard_chat(self, message: dict[str, object]) -> None:
         try:
@@ -8655,6 +8782,13 @@ class TronnerRacing:
             "checkpointMode": entry.checkpoint_mode,
         }
 
+    def _remember_previous_map(self, entry: MapEntry | None) -> None:
+        metadata = self._dashboard_map_metadata(entry)
+        if not metadata:
+            return
+        self.previous_map_metadata = metadata
+        self.store.set_json("previous_map_metadata", metadata)
+
     def _dashboard_players(
         self,
     ) -> tuple[list[dict[str, object]], dict[str, list[dict[str, object]]]]:
@@ -8752,6 +8886,7 @@ class TronnerRacing:
         ]
         return {
             "map": map_metadata,
+            "previousMap": dict(self.previous_map_metadata),
             "nextMap": self._dashboard_map_metadata(self._peek_next()),
             "roundActive": self._round_is_active(),
             "timeRemainingSeconds": time_left,
@@ -8839,22 +8974,21 @@ class TronnerRacing:
             max(0.0, now_monotonic - self.last_game_monotonic)
             if self.last_game_monotonic is not None else None
         )
-        federation_age = (
-            max(0.0, now_monotonic - self.federation_last_received_monotonic)
-            if self.federation_last_received_monotonic > 0 else None
-        )
         return {
             "region": str(
                 self.config.get("live_dashboard", {}).get("local_region", "")
             )[:16],
             "online": True,
-            "role": self.federation_role,
+            "role": "standalone",
             "pid": os.getpid(),
             "startedAt": int(self.started_at_epoch * 1000),
             "uptimeSeconds": max(0, int(now_epoch - self.started_at_epoch)),
             "roundActive": self._round_is_active(),
             "transitioning": bool(self.transitioning),
             "finalCountdownActive": bool(self.final_countdown_active),
+            "serverRestartActive": bool(
+                getattr(self, "server_restart_active", False)
+            ),
             "controllerReloadPending": bool(self.controller_reload_state.get("pending")),
             "respawnsPaused": bool(self.respawns_paused),
             "timeRemainingSeconds": max(
@@ -8874,9 +9008,6 @@ class TronnerRacing:
             "catalogMapCount": len(self.repository.catalog),
             "excludedMapCount": len(self.excluded_map_keys),
             "catalogVersion": int(self.repository.firebase_catalog_version),
-            "federationPeerOnline": bool(self.federation_snapshot_received),
-            "federationEventAgeSeconds": round(federation_age, 2)
-            if federation_age is not None else None,
             "gameEventAgeSeconds": round(game_event_age, 2)
             if game_event_age is not None else None,
             "consoleAvailable": bool(
@@ -9183,6 +9314,32 @@ class TronnerRacing:
                 f"{actor.record_name} restarted the round.", federate=False
             )
             return "Round restart requested.", {}
+
+        if command_type == "restart_server":
+            duration = self.request_server_restart(actor.record_name)
+            if duration is None:
+                raise ValueError(
+                    "The server cannot start a restart countdown during another "
+                    "transition, countdown, or reload."
+                )
+            return (
+                f"Server restart countdown started for {math.ceil(duration)} seconds.",
+                {"countdownSeconds": math.ceil(duration)},
+            )
+
+        if command_type == "console_command":
+            raw_message = command.get("message")
+            if not isinstance(raw_message, str) or not raw_message.strip():
+                raise ValueError("Enter one server console command.")
+            if "\r" in raw_message or "\n" in raw_message:
+                raise ValueError("Server console commands must contain one line.")
+            console_command = raw_message.strip()
+            if len(console_command) > 512:
+                raise ValueError("Server console commands are limited to 512 characters.")
+            await self.sink.send(console_command)
+            return "Server console command sent.", {
+                "command": clean_console_text(console_command)[:512]
+            }
 
         if command_type == "set_engine_option":
             option = self._server_management_field(command, "option", 64).upper()
@@ -9802,6 +9959,8 @@ class TronnerRacing:
             # confirmation as well as grant one.
             self.transition_map_confirmed = self.transition_target_key == entry.key
         changed = self.current_spec != spec
+        if previous_key and previous_key != entry.key:
+            self._remember_previous_map(self.current)
         self.current = entry
         self.current_spec = spec
         saved_key = self.store.get_json("current_key", None)
@@ -11053,7 +11212,7 @@ class TronnerRacing:
                 no_cp_seconds=no_cp_seconds,
                 no_cp_rank=no_cp_rank,
             )
-            await self.broadcast(
+            await self.result_message(
                 format_finish_message(
                     player.colored_display_name,
                     seconds,
@@ -11120,6 +11279,9 @@ class TronnerRacing:
                 or not player.connected
                 or not player.active
                 or player.identity_key in delivered
+                or getattr(self, "result_message_preferences", {}).get(
+                    player.identity_key, True
+                ) is False
             ):
                 continue
             delivered.add(player.identity_key)
@@ -11166,10 +11328,6 @@ class TronnerRacing:
                 ],
             )
 
-        # Normally there is at least one active recipient. Preserve the old
-        # server-console output when a delayed display outlives every player.
-        if not recipients:
-            await self.broadcast_block([*common_lines, map_time_line])
         return True
 
     def active_players(self) -> list[Player]:
@@ -12275,6 +12433,14 @@ class TronnerRacing:
                 or "Map time expired."
             )
             self.final_countdown_announcement = None
+            rating_summary = self.store.rating_summary(self.current.rating_key)
+            rating_text = (
+                f"Current rating: {rating_summary[0]:.1f}/5 "
+                f"({rating_summary[1]} "
+                f"{'rating' if rating_summary[1] == 1 else 'ratings'})."
+                if rating_summary
+                else "Current rating: unrated."
+            )
             await self._publish_federation_control(
                 "countdown_state",
                 {
@@ -12288,6 +12454,7 @@ class TronnerRacing:
             await self.broadcast(
                 f"{announcement} Respawning is disabled. "
                 f"Final countdown: {math.ceil(duration)} seconds. "
+                f"{rating_text} "
                 "Use /rate # for the current map or /rate [map] # "
                 "for a specific map."
             )
@@ -12389,12 +12556,12 @@ class TronnerRacing:
             await self._command_suggest(player, arguments, access_level)
         elif command == "/leaderboard":
             await self._command_leaderboard(player)
+        elif command == "/results":
+            await self._command_results(player)
         elif command == "/setspawn":
             await self._command_setspawn(player, arguments)
         elif command == "/start":
             await self._command_start(player, arguments)
-        elif command == "/display_server_tags":
-            await self._command_display_server_tags(player)
         elif command == "/link":
             await self._command_link(player, arguments)
         elif command == "/cp":
@@ -12866,6 +13033,20 @@ class TronnerRacing:
         )
         await self.private_block(player, lines)
 
+    async def _command_results(self, player: Player) -> None:
+        enabled = not self.result_message_preferences.get(
+            player.identity_key, True
+        )
+        self.result_message_preferences[player.identity_key] = enabled
+        self.store.set_json(
+            "result_message_preferences", self.result_message_preferences
+        )
+        await self.private(
+            player,
+            "Finish and rank messages are now "
+            + ("visible." if enabled else "hidden. Use /results to show them again."),
+        )
+
     async def _command_setspawn(self, player: Player, argument: str) -> None:
         if not self.current or not self.current.spawns:
             await self.private(player, "The current map has no selectable spawns.")
@@ -13002,25 +13183,6 @@ class TronnerRacing:
         await self.private(
             player,
             f"Start mode set to {mode}. {descriptions[mode]}{pending}",
-        )
-
-    async def _command_display_server_tags(self, player: Player) -> None:
-        enabled = not self._display_server_tags_for(player)
-        if not hasattr(self, "display_server_tag_preferences"):
-            self.display_server_tag_preferences = {}
-        preference_key = self._set_local_federation_preference(
-            "tags", player.identity_key, enabled
-        )
-        player.display_server_tags = enabled
-        await self._publish_federation_preference_update(preference_key)
-        await self.sink.send(
-            f"FEDERATION_DISPLAY_SERVER_TAGS {player.target} "
-            f"{1 if enabled else 0}"
-        )
-        await self.private(
-            player,
-            "Server tags on other players' names are now "
-            f"{'enabled' if enabled else 'disabled'}.",
         )
 
     def _game_link_secret(self) -> str:

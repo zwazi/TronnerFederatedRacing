@@ -1,9 +1,12 @@
 # Contributing
 
-Contributions must not include production addresses, credentials, runtime
-state, player information, logs, databases, recordings, or generated binaries.
-Use the reserved documentation ranges and `example.invalid` in tests and
-examples.
+Tronner Racing is a standalone New York service. Changes must preserve that
+single-server model unless the product owner explicitly requests a new
+topology.
+
+Do not commit production addresses, credentials, runtime state, player data,
+logs, databases, recordings, or generated binaries. Use reserved documentation
+ranges and `example.invalid` in examples.
 
 Before opening a pull request, run:
 
@@ -14,7 +17,5 @@ python3 -m unittest discover -s tools -p 'test_*.py'
 python3 tools/check_public_tree.py .
 ```
 
-Changes to the wire protocol, authentication, replay handling, federation
-roles, map authority, or round synchronization require focused tests and a
-protocol compatibility note. Production deployments are deliberately absent
-from this repository and cannot be triggered by a pull request.
+Production deployments are absent from CI and cannot be triggered by a pull
+request.

@@ -108,6 +108,11 @@ class MapTimeDisplayTests(unittest.IsolatedAsyncioTestCase):
             final_display,
         )
 
+        controller.result_message_preferences = {racer.identity_key: False}
+        controller.sink.commands.clear()
+        await controller._delayed_round_display()
+        self.assertEqual(controller.sink.commands, [])
+
 
 if __name__ == "__main__":
     unittest.main()

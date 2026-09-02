@@ -1,12 +1,6 @@
 {
   "schema_version": 1,
-  "cluster_id": "example-racing-cluster",
-  "leader_server_id": "region-a",
-  "members": {
-    "region-a": "A",
-    "region-b": "B",
-    "region-c": "C"
-  },
+  "service_id": "example-racing-service",
   "map_repository": {
     "source": "git",
     "url": "https://github.com/example/armagetron-maps.git",
