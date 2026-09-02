@@ -19,6 +19,10 @@ bounded distance-to-finish field. The field:
 - accepts every circular or polygonal winzone as a goal; and
 - is built in a worker thread with a configured cell limit.
 
+Walls use a conservative raster supercover: every grid cell intersected by a
+zero-width XML wall is blocked. This prevents a wall that happens to fall
+between cell centers from disappearing from the navigation field.
+
 Route distance, rather than straight-line distance, permits a player to move
 away from the winzone temporarily when a wall or death zone makes that detour
 necessary. A higher-resolution retry is used for narrow maps. If the bounded

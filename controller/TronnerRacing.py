@@ -8704,7 +8704,7 @@ class TronnerRacing:
             0.0,
             float(
                 self.config.get(
-                    "final_countdown_route_wall_clearance_cells", 0.30
+                    "final_countdown_route_wall_clearance_cells", 0.72
                 )
             ),
         )

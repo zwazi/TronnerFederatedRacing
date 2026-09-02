@@ -311,7 +311,7 @@ def build_route_model(
     *,
     maximum_cells: int = 100_000,
     minimum_cell_size: float = 1.0,
-    wall_clearance_cells: float = 0.30,
+    wall_clearance_cells: float = 0.72,
 ) -> RouteModel | None:
     geometry = parse_map_geometry(path)
     if not geometry.has_goal:
@@ -370,6 +370,10 @@ def build_route_model(
         end_y = min(height - 1, int(math.ceil((high_y - origin_y) / cell_size)))
         return range(start_x, end_x + 1), range(start_y, end_y + 1)
 
+    # A map wall has no thickness.  At less than half a cell's diagonal, a
+    # wall that passes between cell centers can disappear from the raster
+    # entirely.  The default is deliberately just above sqrt(2) / 2 so every
+    # grid cell touched by a wall is blocked (a conservative supercover).
     clearance = max(0.0, wall_clearance_cells) * cell_size
     for start, end in geometry.wall_segments:
         xs, ys = grid_bounds(
