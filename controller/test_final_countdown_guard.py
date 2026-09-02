@@ -7,6 +7,7 @@ from unittest import mock
 
 from final_countdown_guard import (
     AccelerationCapability,
+    PlayerProgressState,
     accelerated_travel_distance,
     assess_progress,
     build_route_model,
@@ -31,6 +32,8 @@ class RouteModelTests(unittest.TestCase):
         field: str,
         axes: str = '<Axes number="4"/>',
         size_multiplier: float = 1.0,
+        maximum_cells: int = 30_000,
+        minimum_cell_size: float = 1.0,
     ):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -38,8 +41,8 @@ class RouteModelTests(unittest.TestCase):
         path.write_text(test_map(field, axes), encoding="utf-8")
         model = build_route_model(
             path,
-            maximum_cells=30_000,
-            minimum_cell_size=1.0,
+            maximum_cells=maximum_cells,
+            minimum_cell_size=minimum_cell_size,
             size_multiplier=size_multiplier,
             narrow_passage_guides=True,
         )
@@ -119,7 +122,9 @@ class RouteModelTests(unittest.TestCase):
             <Wall><Point x="-320" y="-160"/><Point x="320" y="-160"/><Point x="320" y="160"/><Point x="-320" y="160"/><Point x="-320" y="-160"/></Wall>
             <Wall><Point x="-300" y="0.087"/><Point x="300" y="0.087"/></Wall>
             <Wall><Point x="-300" y="0.187"/><Point x="300" y="0.187"/></Wall>
-            '''
+            ''',
+            maximum_cells=500_000,
+            minimum_cell_size=0.1,
         )
 
         self.assertTrue(math.isfinite(model.distance_at((250.0, 0.137))))
@@ -172,6 +177,43 @@ class RouteModelTests(unittest.TestCase):
         )
 
         self.assertTrue(math.isfinite(model.distance_at((80.0, 50.0))))
+
+    def test_subcell_alternate_route_is_enriched_when_primary_route_exists(self):
+        field = '''
+            <Zone effect="win"><ShapeCircle radius="3"><Point x="90" y="90"/></ShapeCircle></Zone>
+            <Wall><Point x="0" y="0"/><Point x="100" y="0"/><Point x="100" y="100"/><Point x="0" y="100"/><Point x="0" y="0"/></Wall>
+            <Wall><Point x="0" y="50"/><Point x="20" y="50"/></Wall>
+            <Wall><Point x="30" y="50"/><Point x="70" y="50"/></Wall>
+            <Wall><Point x="70.15" y="50"/><Point x="100" y="50"/></Wall>
+        '''
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "alternate-route.aamap.xml"
+        path.write_text(test_map(field), encoding="utf-8")
+        coarse = build_route_model(
+            path,
+            maximum_cells=30_000,
+            minimum_cell_size=1.0,
+            narrow_passage_guides=False,
+        )
+        enriched = build_route_model(
+            path,
+            maximum_cells=30_000,
+            minimum_cell_size=1.0,
+            narrow_passage_guides=True,
+        )
+
+        self.assertGreater(
+            coarse.distance_at((68.0, 40.0)),
+            coarse.distance_at((60.0, 40.0)),
+            "The coarse field misses the narrow alternate opening",
+        )
+        self.assertLess(
+            enriched.distance_at((68.0, 40.0)),
+            enriched.distance_at((60.0, 40.0)),
+            "Approaching the real alternate opening must count as progress",
+        )
+        self.assertTrue(enriched.guide_points)
 
     def test_death_zone_is_treated_as_route_obstacle(self):
         model = self.build(
@@ -390,6 +432,44 @@ class ProgressAssessmentTests(unittest.TestCase):
         self.assertEqual(capability.decay_below, 0.2)
 
 
+class WrongWayAllowanceTests(unittest.TestCase):
+    def test_forward_progress_pauses_but_never_refills_allowance(self):
+        state = PlayerProgressState()
+        state.observe_route_distance(0.0, 50.0)
+        first = state.observe_route_distance(1.0, 52.0)
+        self.assertTrue(first.heading_away)
+        self.assertTrue(first.warning_due)
+        self.assertEqual(first.total_wrong_way_seconds, 1.0)
+
+        recovered = state.observe_route_distance(2.0, 49.0)
+        self.assertTrue(recovered.heading_toward)
+        self.assertEqual(recovered.total_wrong_way_seconds, 1.0)
+        self.assertEqual(recovered.remaining_allowance_seconds, 4.0)
+
+        second = state.observe_route_distance(3.0, 51.0)
+        self.assertTrue(second.heading_away)
+        self.assertTrue(second.warning_due)
+        self.assertEqual(second.total_wrong_way_seconds, 2.0)
+
+    def test_five_cumulative_wrong_way_seconds_exhaust_allowance(self):
+        state = PlayerProgressState()
+        state.observe_route_distance(0.0, 50.0)
+        for second in range(1, 6):
+            update = state.observe_route_distance(float(second), 50.0 + second)
+        self.assertTrue(update.exhausted)
+        self.assertEqual(update.total_wrong_way_seconds, 5.0)
+        self.assertEqual(update.remaining_allowance_seconds, 0.0)
+
+    def test_route_jitter_is_neutral_and_delayed_samples_are_bounded(self):
+        state = PlayerProgressState()
+        state.observe_route_distance(0.0, 50.0)
+        neutral = state.observe_route_distance(1.0, 50.2)
+        self.assertFalse(neutral.heading_away)
+        self.assertEqual(neutral.charged_seconds, 0.0)
+        delayed = state.observe_route_distance(9.0, 60.0)
+        self.assertEqual(delayed.charged_seconds, 2.0)
+
+
 class Sink:
     def __init__(self):
         self.commands = []
@@ -421,15 +501,11 @@ class LinearRouteModel:
 
 
 class CountdownEnforcementTests(unittest.IsolatedAsyncioTestCase):
-    async def test_insufficient_finish_pace_is_warned_then_killed(self):
+    async def test_slow_forward_progress_is_not_killed_early(self):
         controller = object.__new__(TronnerRacing)
         controller.config = {
-            "final_countdown_grief_detection_enabled": True,
-            "final_countdown_grief_early_window_seconds": 2,
-            "final_countdown_grief_late_window_seconds": 2,
-            "final_countdown_grief_early_grace_seconds": 1,
-            "final_countdown_grief_late_grace_seconds": 1,
-            "final_countdown_grief_route_slack_distance": 0,
+            "final_countdown_progress_guard_enabled": True,
+            "final_countdown_progress_direction_slack_distance": 0,
         }
         controller.current = SimpleNamespace(key="Test/maps/Pace-v1.aamap.xml")
         controller.final_countdown_active = True
@@ -448,35 +524,28 @@ class CountdownEnforcementTests(unittest.IsolatedAsyncioTestCase):
         player = Player("racer", "Racer", connected=True, active=True, alive=True)
         controller.finalists = {id(player)}
 
-        with mock.patch("TronnerRacing.time.time", return_value=8.0) as clock:
-            await controller._record_final_countdown_progress(player, 0.0, (0.0, 0.0))
-            clock.return_value = 9.0
-            await controller._record_final_countdown_progress(player, 1.0, (1.0, 0.0))
-            clock.return_value = 10.0
-            await controller._record_final_countdown_progress(player, 2.0, (2.0, 0.0))
-            clock.return_value = 11.0
-            await controller._record_final_countdown_progress(player, 3.0, (3.0, 0.0))
+        await controller._record_final_countdown_progress(player, 0.0, (0.0, 0.0))
+        await controller._record_final_countdown_progress(player, 1.0, (1.0, 0.0))
+        await controller._record_final_countdown_progress(player, 2.0, (2.0, 0.0))
+        await controller._record_final_countdown_progress(player, 3.0, (3.0, 0.0))
 
-        self.assertTrue(
-            any("projected pace cannot reach" in message for message in messages)
-        )
-        self.assertEqual(controller.sink.commands, ["KILL_SILENT racer"])
+        self.assertEqual(messages, [])
+        self.assertEqual(controller.sink.commands, [])
 
-    async def test_persistent_non_progress_is_warned_then_killed(self):
+    async def test_cumulative_wrong_way_episodes_warn_then_kill(self):
         controller = object.__new__(TronnerRacing)
         controller.config = {
-            "final_countdown_grief_detection_enabled": True,
-            "final_countdown_grief_early_window_seconds": 2,
-            "final_countdown_grief_late_window_seconds": 2,
-            "final_countdown_grief_early_grace_seconds": 1,
-            "final_countdown_grief_late_grace_seconds": 1,
-            "final_countdown_grief_route_slack_distance": 0,
+            "final_countdown_progress_guard_enabled": True,
+            "final_countdown_progress_wrong_way_allowance_seconds": 5,
+            "final_countdown_progress_warning_delay_seconds": 1,
+            "final_countdown_progress_direction_slack_distance": 0,
+            "final_countdown_progress_max_sample_gap_seconds": 2,
         }
         controller.current = SimpleNamespace(key="Test/maps/Guard-v1.aamap.xml")
         controller.final_countdown_active = True
         controller.final_countdown_end_epoch = 20.0
         controller.final_countdown_duration_seconds = 20.0
-        controller.final_countdown_route_model = ConstantRouteModel()
+        controller.final_countdown_route_model = LinearRouteModel()
         controller.final_countdown_route_map_key = controller.current.key
         controller.final_countdown_progress_states = {}
         controller.sink = Sink()
@@ -489,14 +558,53 @@ class CountdownEnforcementTests(unittest.IsolatedAsyncioTestCase):
         player = Player("racer", "Racer", connected=True, active=True, alive=True)
         controller.finalists = {id(player)}
 
-        with mock.patch("TronnerRacing.time.time", return_value=7.0) as clock:
-            await controller._record_final_countdown_progress(player, 0.0, (0.0, 0.0))
-            clock.return_value = 8.0
-            await controller._record_final_countdown_progress(player, 1.0, (10.0, 0.0))
-            clock.return_value = 9.0
-            await controller._record_final_countdown_progress(player, 2.0, (10.0, 10.0))
-            clock.return_value = 10.0
-            await controller._record_final_countdown_progress(player, 3.0, (0.0, 10.0))
+        positions = (0.0, -1.0, 0.0, -1.0, -2.0, -3.0, -4.0)
+        for second, x_position in enumerate(positions):
+            await controller._record_final_countdown_progress(
+                player, float(second), (x_position, 0.0)
+            )
+
+        warnings = [message for message in messages if "warning" in message.casefold()]
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("4.0 of 5.0 wrong-way seconds left", warnings[0])
+        self.assertIn("3.0 of 5.0 wrong-way seconds left", warnings[1])
+        self.assertEqual(controller.sink.commands, ["KILL_SILENT racer"])
+        self.assertEqual(
+            controller.final_countdown_progress_states[id(player)].wrong_way_seconds,
+            5.0,
+        )
+
+    async def test_positions_are_tracked_while_route_field_is_building(self):
+        controller = object.__new__(TronnerRacing)
+        controller.config = {
+            "final_countdown_progress_guard_enabled": True,
+            "final_countdown_progress_wrong_way_allowance_seconds": 2,
+            "final_countdown_progress_warning_delay_seconds": 1,
+            "final_countdown_progress_direction_slack_distance": 0,
+        }
+        controller.current = SimpleNamespace(key="Test/maps/Pending-v1.aamap.xml")
+        controller.final_countdown_active = True
+        controller.final_countdown_end_epoch = 20.0
+        controller.final_countdown_duration_seconds = 20.0
+        controller.final_countdown_route_model = None
+        controller.final_countdown_route_map_key = controller.current.key
+        controller.final_countdown_route_building = True
+        controller.final_countdown_progress_states = {}
+        controller.sink = Sink()
+        messages = []
+
+        async def private(_player, message):
+            messages.append(message)
+
+        controller.private = private
+        player = Player("racer", "Racer", connected=True, active=True, alive=True)
+        controller.finalists = {id(player)}
+
+        await controller._record_final_countdown_progress(player, 0.0, (0.0, 0.0))
+        await controller._record_final_countdown_progress(player, 1.0, (-1.0, 0.0))
+        controller.final_countdown_route_model = LinearRouteModel()
+        controller.final_countdown_route_building = False
+        await controller._record_final_countdown_progress(player, 2.0, (-2.0, 0.0))
 
         self.assertTrue(any("warning" in message.casefold() for message in messages))
         self.assertEqual(controller.sink.commands, ["KILL_SILENT racer"])
