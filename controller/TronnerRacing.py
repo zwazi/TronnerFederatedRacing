@@ -319,6 +319,7 @@ COLOR_NAME_HEADER = "0xfff2a8"
 COLOR_DATA = "0xe8f7ff"
 COLOR_VALUE = "0xfff2a8"
 COLOR_COMMAND = "0xc4b5ff"
+COLOR_CHAT = "0xffff88"
 COLOR_SUCCESS = "0x7dff9b"
 COLOR_ERROR = "0xff8c8c"
 COLOR_WARNING = "0xffc46b"
@@ -6457,7 +6458,7 @@ class TronnerRacing:
             if not plain_message:
                 raise ValueError("Enter a chat message.")
             rendered = (
-                f"{COLOR_COMMAND}[Web] {display_name}{COLOR_RESET}: "
+                f"{COLOR_COMMAND}[Web] {display_name}{COLOR_CHAT}: "
                 f"{plain_message}"
             )
             await self.sink.send(

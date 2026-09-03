@@ -179,7 +179,7 @@ class ServerManagementTest(unittest.IsolatedAsyncioTestCase):
             controller.sink.commands,
             [
                 "CONSOLE_MESSAGE 0xc4b5ff[Web] 0xff8800Grid "
-                "0x00ffffAdmin0xffffff: Hello racers"
+                "0x00ffffAdmin0xffff88: Hello racers"
             ],
         )
         self.assertEqual(result, "Web chat message delivered as Grid Admin.")
