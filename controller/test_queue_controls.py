@@ -124,7 +124,7 @@ class QueueControlTests(unittest.IsolatedAsyncioTestCase):
         output = "\n".join(
             plain_console_text(command) for command in controller.sink.commands
         )
-        self.assertIn("format changed: use /q add [map]", output)
+        self.assertIn("format changed: use /q add [map name]", output)
         self.assertIn("/q lowest", output)
 
     async def test_lowest_prioritizes_an_unranked_map(self):

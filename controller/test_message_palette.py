@@ -35,7 +35,7 @@ class Sink:
 class MessagePaletteTests(unittest.IsolatedAsyncioTestCase):
     def test_help_uses_two_left_aligned_columns(self):
         entries = (
-            ("/q add [map]", "Queue a map."),
+            ("/q add [map name]", "Queue a map."),
             ("/leaderboard", "Show the current leaderboard."),
             ("/help", "Show commands."),
         )
