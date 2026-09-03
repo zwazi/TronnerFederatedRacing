@@ -126,6 +126,26 @@ class QueueControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(preview[0]["queuedVia"], "server")
         self.assertFalse(preview[1]["queued"])
 
+    def test_current_map_preview_retains_queue_attribution(self):
+        controller, first, _ = queue_controller()
+        controller.current = first
+        controller.current_size_factor = None
+        controller.current_map_selection = controller._selection_for_map(
+            first,
+            queued=True,
+            queued_by="Racer@forums",
+            queued_via="server",
+            queued_at=1_700_000_000_000,
+        )
+
+        metadata = controller._dashboard_current_map_metadata()
+
+        self.assertEqual(metadata["mapKey"], first.key)
+        self.assertTrue(metadata["queued"])
+        self.assertEqual(metadata["queuedBy"], "Racer@forums")
+        self.assertEqual(metadata["queuedVia"], "server")
+        self.assertEqual(metadata["queuedAt"], 1_700_000_000_000)
+
     async def test_remove_deletes_only_the_first_repeated_queue_entry(self):
         controller, first, _ = queue_controller()
         player = Player("racer", "Racer")
