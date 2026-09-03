@@ -161,6 +161,48 @@ class ServerManagementTest(unittest.IsolatedAsyncioTestCase):
         controller.broadcast.assert_awaited_once_with("Server maintenance soon.")
         self.assertTrue(controller.live_dashboard_authority)
 
+    async def test_web_chat_preserves_name_colors_and_publishes_one_chat_event(self):
+        controller = self.controller()
+        controller.config = {"live_dashboard": {"local_region": "NY"}}
+        controller.server_id = "nyc1"
+        controller._write_dashboard_chat = AsyncMock()
+
+        result, details = await controller._execute_server_management_command({
+            "type": "web_chat",
+            "requestedBy": "admin-id",
+            "requestedName": "Site administrator",
+            "target": "0xff8800Grid 0x00ffffAdmin",
+            "message": "Hello 0xff0000racers",
+        })
+
+        self.assertEqual(
+            controller.sink.commands,
+            [
+                "CONSOLE_MESSAGE 0xc4b5ff[Web] 0xff8800Grid "
+                "0x00ffffAdmin0xffffff: Hello racers"
+            ],
+        )
+        self.assertEqual(result, "Web chat message delivered as Grid Admin.")
+        self.assertEqual(details, {"displayName": "Grid Admin"})
+        controller._write_dashboard_chat.assert_awaited_once_with({
+            "kind": "web_chat",
+            "serverId": "nyc1",
+            "region": "NY",
+            "name": "Grid Admin",
+            "coloredName": "0xff8800Grid 0x00ffffAdmin",
+            "message": "Hello racers",
+            "authenticated": True,
+        })
+
+        with self.assertRaisesRegex(ValueError, "display name"):
+            await controller._execute_server_management_command({
+                "type": "web_chat",
+                "requestedBy": "admin-id",
+                "requestedName": "Site administrator",
+                "target": "0xff0000",
+                "message": "Hello",
+            })
+
     async def test_console_stream_is_temporary_and_replays_only_a_bounded_tail(self):
         controller = self.controller()
         controller.server_console_entries = collections.deque(

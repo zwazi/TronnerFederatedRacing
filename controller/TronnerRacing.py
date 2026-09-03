@@ -94,6 +94,7 @@ SERVER_MANAGEMENT_COMMANDS = frozenset(
         "reload_maps",
         "restart_round",
         "restart_server",
+        "web_chat",
         "console_command",
         "set_engine_option",
         "reload_server_script",
@@ -1214,7 +1215,7 @@ def redeem_game_account_link(
 
 
 USER_COMMAND_HELP = (
-    ("/q add [map]", "Queue a map after the current map."),
+    ("/q add [map name]", "Queue a map after the current map."),
     ("/q lowest", "Queue your lowest-ranked or an unranked map."),
     ("/q remove [map]", "Remove the first matching map from the queue."),
     ("/q clear", "Clear every map from the queue."),
@@ -6235,6 +6236,38 @@ class TronnerRacing:
             await self.broadcast(message)
             return "Announcement delivered.", {"scope": "local"}
 
+        if command_type == "web_chat":
+            display_name = normalize_console_colors(target[:80])
+            plain_name = plain_console_text(display_name).strip()
+            plain_message = plain_console_text(message).strip()
+            if not plain_name:
+                raise ValueError("Enter a web chat display name.")
+            if not plain_message:
+                raise ValueError("Enter a chat message.")
+            rendered = (
+                f"{COLOR_COMMAND}[Web] {display_name}{COLOR_RESET}: "
+                f"{plain_message}"
+            )
+            await self.sink.send(
+                f"CONSOLE_MESSAGE {readline_console_text(rendered)}"
+            )
+            live_config = self.config.get("live_dashboard", {})
+            await self._write_dashboard_chat({
+                "kind": "web_chat",
+                "serverId": clean_console_text(self.server_id)[:32],
+                "region": clean_console_text(
+                    str(live_config.get("local_region", "LOCAL"))
+                )[:16],
+                "name": plain_name[:128],
+                "coloredName": display_name,
+                "message": plain_message[:512],
+                "authenticated": True,
+            })
+            return (
+                f"Web chat message delivered as {plain_name}.",
+                {"displayName": plain_name},
+            )
+
         if command_type == "start_console_stream":
             now = time.monotonic()
             if now >= getattr(
@@ -9775,7 +9808,7 @@ class TronnerRacing:
     async def _command_queue(self, player: Player, query: str) -> None:
         query = query.strip()
         usage = (
-            "Usage: /q add [map], /q lowest, /q remove [map], or /q clear"
+            "Usage: /q add [map name], /q lowest, /q remove [map], or /q clear"
         )
         if not query:
             await self.private(player, usage)
@@ -9810,7 +9843,7 @@ class TronnerRacing:
         if action not in {"add", "remove"}:
             await self.private(
                 player,
-                "The map queue format changed: use /q add [map]. " + usage,
+                "The map queue format changed: use /q add [map name]. " + usage,
             )
             return
 
