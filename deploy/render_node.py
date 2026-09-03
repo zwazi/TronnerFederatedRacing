@@ -230,6 +230,8 @@ def render(cluster: dict[str, Any], node: dict[str, Any], *, production: bool) -
         "respawn_delay_seconds": 2.0,
         "checkpoint_respawn_delay_seconds": 0.1,
         "checkpoint_double_respawn_seconds": 1.5,
+        "practice_probe_interval_seconds": 0.25,
+        "practice_max_rewind_seconds": 300,
         "go_message_seconds": 1.0,
         "final_countdown_idle_seconds": 10,
         "final_countdown_progress_guard_enabled": True,

@@ -72,6 +72,8 @@ DEFAULT_START_COUNTDOWN_SECONDS = 3
 MIN_START_COUNTDOWN_SECONDS = 1
 MAX_START_COUNTDOWN_SECONDS = 60
 START_MODES = frozenset({"brake", "immediate", "countdown", "respawn"})
+PRACTICE_MODES = frozenset({"reset", "maintain"})
+DEFAULT_PRACTICE_MAX_REWIND_SECONDS = 300.0
 SERVER_CONSOLE_SENSITIVE_RE = re.compile(
     r"(?i)\b(?:admin[_-]?pass|password|passphrase|secret|api[_-]?key|"
     r"authorization|bearer|private[_-]?key)\b"
@@ -1239,6 +1241,11 @@ USER_COMMAND_HELP = (
         "Choose how your cycle begins moving and optionally set its countdown.",
     ),
     (
+        "/practice [reset|maintain] [seconds]",
+        "Practice this map; rewind after death without recording times.",
+    ),
+    ("/practice off", "Disable practice mode."),
+    (
         "/link [6-digit code]",
         "Link your authenticated in-game name to your tronner.io account.",
     ),
@@ -1625,6 +1632,17 @@ class CheckpointSnapshot:
     no_cp_elapsed: float
 
 
+@dataclasses.dataclass(frozen=True)
+class PracticeSnapshot:
+    game_time: float
+    x: float
+    y: float
+    xdir: float
+    ydir: float
+    speed: float
+    turns: int
+
+
 @dataclasses.dataclass
 class Player:
     log_name: str
@@ -1678,6 +1696,20 @@ class Player:
     no_cp_segment_started_game: float | None = None
     last_checkpoint_respawn_monotonic: float | None = None
     last_checkpoint_game: float | None = None
+    practice_mode: str = "off"
+    practice_rewind_seconds: float = 0.0
+    practice_map_key: str = ""
+    practice_samples: collections.deque[PracticeSnapshot] = dataclasses.field(
+        default_factory=collections.deque
+    )
+    practice_respawn_snapshot: PracticeSnapshot | None = None
+    practice_start_respawn_pending: bool = False
+    practice_finish_pending: bool = False
+    practice_attempt_tainted: bool = False
+    cycle_xdir: float = 1.0
+    cycle_ydir: float = 0.0
+    cycle_speed: float = 0.0
+    cycle_turns: int = 0
 
     @property
     def target(self) -> str:
@@ -4604,6 +4636,7 @@ class TronnerRacing:
         requested_by: str,
     ) -> None:
         try:
+            await self._disable_practice_for_countdown()
             self._clear_all_votes()
             for task in self.respawn_tasks.values():
                 task.cancel()
@@ -5566,6 +5599,7 @@ class TronnerRacing:
             task.cancel()
         self.center_clear_tasks.clear()
         for player in self.players.values():
+            self._clear_player_practice(player)
             player.generation += 1
             player.pending_respawn = False
             player.alive = False
@@ -5637,6 +5671,184 @@ class TronnerRacing:
         player.attempt_started_game = event_game
         player.no_cp_segment_started_game = event_game
         player.attempt_number += 1
+
+    def _practice_active(self, player: Player) -> bool:
+        current = getattr(self, "current", None)
+        return bool(
+            current
+            and getattr(player, "practice_mode", "off") in PRACTICE_MODES
+            and getattr(player, "practice_map_key", "") == current.key
+        )
+
+    @staticmethod
+    def _clear_player_practice(
+        player: Player,
+        *,
+        preserve_current_attempt: bool = False,
+    ) -> None:
+        player.practice_mode = "off"
+        player.practice_rewind_seconds = 0.0
+        player.practice_map_key = ""
+        player.practice_samples.clear()
+        player.practice_respawn_snapshot = None
+        player.practice_start_respawn_pending = False
+        player.practice_finish_pending = False
+        if not preserve_current_attempt:
+            player.practice_attempt_tainted = False
+
+    async def _disable_practice_for_countdown(self) -> None:
+        disabled: list[tuple[Player, bool]] = []
+        for player in {
+            id(item): item
+            for item in getattr(self, "players", {}).values()
+        }.values():
+            if not self._practice_active(player):
+                continue
+            current_life_tainted = player.alive
+            self._clear_player_practice(
+                player,
+                preserve_current_attempt=current_life_tainted,
+            )
+            disabled.append((player, current_life_tainted))
+        for player, current_life_tainted in disabled:
+            await self.private(
+                player,
+                (
+                    "Practice mode was disabled for the countdown. Your current "
+                    "life is still ineligible to record a time."
+                    if current_life_tainted
+                    else "Practice mode was disabled for the countdown."
+                ),
+            )
+
+    def _record_practice_snapshot(
+        self,
+        player: Player,
+        game_time: float,
+        x: float,
+        y: float,
+        *,
+        xdir: float | None = None,
+        ydir: float | None = None,
+        speed: float | None = None,
+        turns: int | None = None,
+    ) -> PracticeSnapshot | None:
+        if not self._practice_active(player):
+            return None
+        values = (game_time, x, y)
+        if not all(math.isfinite(value) for value in values):
+            return None
+        samples = player.practice_samples
+        previous = samples[-1] if samples else None
+
+        direction_length = math.hypot(xdir or 0.0, ydir or 0.0)
+        if direction_length > 1e-9:
+            normalized_xdir = float(xdir) / direction_length
+            normalized_ydir = float(ydir) / direction_length
+        else:
+            direction_length = math.hypot(player.cycle_xdir, player.cycle_ydir)
+            if direction_length > 1e-9:
+                normalized_xdir = player.cycle_xdir / direction_length
+                normalized_ydir = player.cycle_ydir / direction_length
+            elif previous is not None:
+                normalized_xdir = previous.xdir
+                normalized_ydir = previous.ydir
+            else:
+                normalized_xdir, normalized_ydir = 1.0, 0.0
+
+        resolved_speed = speed
+        if resolved_speed is None or not math.isfinite(resolved_speed) or resolved_speed < 0:
+            resolved_speed = player.cycle_speed
+            if previous is not None:
+                elapsed = game_time - previous.game_time
+                if elapsed > 1e-4:
+                    distance = math.hypot(x - previous.x, y - previous.y)
+                    if distance > 1e-6:
+                        resolved_speed = distance / elapsed
+        resolved_speed = max(0.0, float(resolved_speed))
+        resolved_turns = player.cycle_turns if turns is None else int(turns)
+        resolved_turns = max(0, min(65535, resolved_turns))
+        snapshot = PracticeSnapshot(
+            game_time=float(game_time),
+            x=float(x),
+            y=float(y),
+            xdir=normalized_xdir,
+            ydir=normalized_ydir,
+            speed=resolved_speed,
+            turns=resolved_turns,
+        )
+        if previous is not None and abs(previous.game_time - game_time) <= 1e-6:
+            samples[-1] = snapshot
+        else:
+            samples.append(snapshot)
+        player.cycle_xdir = normalized_xdir
+        player.cycle_ydir = normalized_ydir
+        player.cycle_speed = resolved_speed
+        player.cycle_turns = resolved_turns
+
+        retention = max(
+            1.0,
+            float(
+                self.config.get(
+                    "practice_max_rewind_seconds",
+                    DEFAULT_PRACTICE_MAX_REWIND_SECONDS,
+                )
+            ),
+        ) + 2.0
+        while samples and game_time - samples[0].game_time > retention:
+            samples.popleft()
+        return snapshot
+
+    def _practice_rewind_target(
+        self,
+        player: Player,
+        death_snapshot: PracticeSnapshot,
+    ) -> PracticeSnapshot:
+        target_time = (
+            death_snapshot.game_time
+            - max(0.0, float(player.practice_rewind_seconds))
+        )
+        return min(
+            player.practice_samples or (death_snapshot,),
+            key=lambda sample: abs(sample.game_time - target_time),
+        )
+
+    def _prepare_practice_respawn(
+        self,
+        player: Player,
+        game_time: float,
+        x: float,
+        y: float,
+        xdir: float,
+        ydir: float,
+        *,
+        speed: float | None = None,
+        turns: int | None = None,
+    ) -> None:
+        death_snapshot = self._record_practice_snapshot(
+            player,
+            game_time,
+            x,
+            y,
+            xdir=xdir,
+            ydir=ydir,
+            speed=speed,
+            turns=turns,
+        )
+        if death_snapshot is not None:
+            player.practice_respawn_snapshot = self._practice_rewind_target(
+                player, death_snapshot
+            )
+
+    def _observe_cycle_turn(self, player: Player, action: str) -> None:
+        axes = max(1, int(getattr(self.current, "axes", 4) or 4))
+        angle = (2.0 * math.pi / axes) * (1 if action == "L" else -1)
+        cosine = math.cos(angle)
+        sine = math.sin(angle)
+        xdir, ydir = player.cycle_xdir, player.cycle_ydir
+        player.cycle_xdir = xdir * cosine - ydir * sine
+        player.cycle_ydir = xdir * sine + ydir * cosine
+        player.cycle_turns = min(65535, player.cycle_turns + 1)
 
     @staticmethod
     def _resume_checkpoint_attempt(player: Player, event_game: float) -> bool:
@@ -7282,6 +7494,20 @@ class TronnerRacing:
             return
         if not all(math.isfinite(value) for value in (game_time, x, y, xdir, ydir, speed)):
             return
+        player.cycle_xdir = xdir
+        player.cycle_ydir = ydir
+        player.cycle_speed = max(0.0, speed)
+        player.cycle_turns = max(0, min(65535, turns))
+        self._record_practice_snapshot(
+            player,
+            game_time,
+            x,
+            y,
+            xdir=xdir,
+            ydir=ydir,
+            speed=speed,
+            turns=turns,
+        )
         previous_token = self.active_replay_tokens.get(id(player))
         previous = self.replay_captures.get(previous_token or "")
         if previous is not None and previous.outcome == "death":
@@ -7425,6 +7651,35 @@ class TronnerRacing:
             turns,
             released=state_kind == "release",
         )
+        player = self.player_for(capture.player_log_name)
+        if player is None:
+            return
+        player.cycle_xdir = xdir
+        player.cycle_ydir = ydir
+        player.cycle_speed = max(0.0, speed)
+        player.cycle_turns = max(0, min(65535, turns))
+        if state_kind == "death":
+            self._prepare_practice_respawn(
+                player,
+                game_time,
+                x,
+                y,
+                xdir,
+                ydir,
+                speed=speed,
+                turns=turns,
+            )
+        else:
+            self._record_practice_snapshot(
+                player,
+                game_time,
+                x,
+                y,
+                xdir=xdir,
+                ydir=ydir,
+                speed=speed,
+                turns=turns,
+            )
 
     async def _handle_replay_input(self, payload: str) -> None:
         parts = payload.split()
@@ -7439,9 +7694,13 @@ class TronnerRacing:
         except ValueError:
             return
         action = parts[2]
-        if not capture.add_input(game_time, action) or action not in {"L", "R"}:
+        if not capture.add_input(game_time, action):
             return
         player = self.player_for(capture.player_log_name)
+        if player and action in {"L", "R"}:
+            self._observe_cycle_turn(player, action)
+        if action not in {"L", "R"}:
+            return
         if (
             not player
             or self.active_replay_tokens.get(id(player)) != token
@@ -7551,6 +7810,7 @@ class TronnerRacing:
             return
         player = self.player_for(parts[0], create=True)
         assert player
+        player.practice_attempt_tainted = self._practice_active(player)
         was_active = player.active
         player.alive = True
         player.dead_since_monotonic = None
@@ -7558,8 +7818,17 @@ class TronnerRacing:
         player.activity_cycle_alive = True
         player.activity_run_samples.clear()
         player.afk_recovery_samples.clear()
+        if self._practice_active(player):
+            player.practice_samples.clear()
+            player.practice_respawn_snapshot = None
+            player.practice_finish_pending = False
         with contextlib.suppress(ValueError):
             position = (float(parts[1]), float(parts[2]))
+            xdir, ydir = float(parts[3]), float(parts[4])
+            player.cycle_xdir = xdir
+            player.cycle_ydir = ydir
+            player.cycle_speed = 0.0
+            player.cycle_turns = 0
             now = time.monotonic()
             player.last_activity_position = position
             player.activity_run_samples.append((now, *position))
@@ -7696,6 +7965,26 @@ class TronnerRacing:
         player.alive = False
         if player.is_ai:
             return
+        if self._practice_active(player):
+            if player.practice_start_respawn_pending:
+                player.practice_samples.clear()
+                player.practice_respawn_snapshot = None
+            elif len(parts) >= 7:
+                try:
+                    x, y, xdir, ydir = map(float, parts[1:5])
+                    death_game_time = float(parts[6])
+                except ValueError:
+                    pass
+                else:
+                    self._prepare_practice_respawn(
+                        player,
+                        death_game_time,
+                        x,
+                        y,
+                        xdir,
+                        ydir,
+                    )
+            player.practice_finish_pending = False
         held_cycle_destroyed = (
             player.pending_respawn and player.respawn_created_game is not None
         )
@@ -7757,6 +8046,21 @@ class TronnerRacing:
         player: Player,
         empty_arena: bool = False,
     ) -> None:
+        if self._practice_active(player):
+            delay_seconds: float | None = None
+            if player.practice_start_respawn_pending:
+                delay_seconds = 0.0
+            elif empty_arena:
+                delay_seconds = float(
+                    self.config.get(
+                        "empty_arena_respawn_delay_seconds", 0.1
+                    )
+                )
+            self._schedule_respawn(
+                player,
+                delay_seconds=delay_seconds,
+            )
+            return
         if player.manual_restart_pending:
             self._schedule_respawn(player, delay_seconds=0.0)
             return
@@ -7846,6 +8150,20 @@ class TronnerRacing:
             await self.center_private(player, "Type /restart to respawn")
             return
         player.manual_restart_pending = False
+        practice_start_respawn = (
+            self._practice_active(player)
+            and player.practice_start_respawn_pending
+        )
+        player.practice_start_respawn_pending = False
+        if practice_start_respawn:
+            player.practice_respawn_snapshot = None
+            player.practice_samples.clear()
+        elif (
+            self._practice_active(player)
+            and player.practice_respawn_snapshot is not None
+        ):
+            await self._respawn_from_practice(player)
+            return
         if player.checkpoint_respawn_requested:
             if player.checkpoint_snapshot is not None:
                 await self._respawn_from_checkpoint(player)
@@ -7957,6 +8275,58 @@ class TronnerRacing:
         self.freeze_tasks[id(player)] = asyncio.create_task(
             wait_for_start
         )
+
+    async def _respawn_from_practice(self, player: Player) -> None:
+        snapshot = player.practice_respawn_snapshot
+        if snapshot is None or not self._practice_active(player):
+            return
+        reset_commands = self._checkpoint_color_reset_commands(player)
+        self._clear_checkpoint_run(player)
+        player.practice_respawn_snapshot = None
+        player.practice_samples.clear()
+        player.generation += 1
+        generation = player.generation
+        player.pending_respawn = True
+        player.respawn_created_game = None
+        player.pending_respawn_kind = "practice"
+        player.attempt_started_game = None
+        start_mode = self._start_mode_for(player)
+        countdown_seconds = player.start_countdown_seconds
+        player.pending_start_mode = start_mode
+        speed = snapshot.speed if player.practice_mode == "maintain" else 0.0
+        spawn_arguments = (
+            f"{player.target} false {snapshot.x:.9g} {snapshot.y:.9g} "
+            f"{snapshot.xdir:.9g} {snapshot.ydir:.9g} "
+            f"{speed:.9g} {snapshot.turns}"
+        )
+        if start_mode in {"immediate", "respawn"}:
+            await self.sink.send(
+                *reset_commands,
+                f"RESPAWN_PLAYER_CHECKPOINT {spawn_arguments}",
+            )
+            return
+        if start_mode == "countdown":
+            await self.sink.send(
+                *reset_commands,
+                f"RESPAWN_PLAYER_CHECKPOINT_HELD {spawn_arguments}",
+                f"FREEZE_PLAYER {player.target} {countdown_seconds}",
+            )
+        else:
+            await self.sink.send(
+                *reset_commands,
+                f"RESPAWN_PLAYER_CHECKPOINT_HELD {spawn_arguments}",
+            )
+        old_task = self.freeze_tasks.pop(id(player), None)
+        if old_task:
+            old_task.cancel()
+        wait_for_start = (
+            self._wait_for_countdown_start(
+                player, generation, countdown_seconds
+            )
+            if start_mode == "countdown"
+            else self._wait_for_brake_start(player, generation)
+        )
+        self.freeze_tasks[id(player)] = asyncio.create_task(wait_for_start)
 
     async def _wait_for_brake_start(self, player: Player, generation: int) -> None:
         try:
@@ -8125,6 +8495,28 @@ class TronnerRacing:
             # so their repeated zone ticks are already rejected above.
             return
         await self._record_player_activity(player)
+        practice_finish = (
+            self._practice_active(player)
+            or player.practice_attempt_tainted
+        )
+        if practice_finish:
+            if player.practice_finish_pending:
+                return
+            player.practice_finish_pending = True
+            await self.private(
+                player,
+                "Practice finish reached; no time or score was recorded."
+                if self._practice_active(player)
+                else (
+                    "This life used practice mode, so no time or score was "
+                    "recorded. Your next life can record normally."
+                ),
+            )
+            await self.sink.send(
+                *self._checkpoint_color_reset_commands(player),
+                f"KILL_SILENT {player.target}",
+            )
+            return
         missing_checkpoints = self._missing_checkpoints(player)
         if missing_checkpoints:
             mode = getattr(self.current, "checkpoint_mode", "ordered") or "ordered"
@@ -8513,6 +8905,7 @@ class TronnerRacing:
         self.store.set_json("final_countdown_active", True)
         self.store.set_json("final_countdown_end_epoch", None)
         self.store.set_json("final_countdown_map_key", self.current.key)
+        await self._disable_practice_for_countdown()
         idle_seconds = float(
             getattr(self, "config", {}).get("final_countdown_idle_seconds", 10)
         )
@@ -8748,6 +9141,42 @@ class TronnerRacing:
             position = (float(parts[3]), float(parts[4]))
         except ValueError:
             return
+        snapshot_game_time = (
+            self.estimate_game_time()
+            if self._practice_active(player)
+            else None
+        )
+        snapshot_direction: tuple[float, float] | None = None
+        snapshot_speed: float | None = None
+        snapshot_turns: int | None = None
+        if len(parts) >= 10:
+            try:
+                exact_game_time = float(parts[5])
+                exact_xdir = float(parts[6])
+                exact_ydir = float(parts[7])
+                exact_speed = float(parts[8])
+                exact_turns = int(parts[9])
+            except ValueError:
+                return
+            if (
+                not all(
+                    math.isfinite(value)
+                    for value in (
+                        exact_game_time,
+                        exact_xdir,
+                        exact_ydir,
+                        exact_speed,
+                    )
+                )
+                or exact_speed < 0
+                or exact_turns < 0
+                or exact_turns > 65535
+            ):
+                return
+            snapshot_game_time = exact_game_time
+            snapshot_direction = (exact_xdir, exact_ydir)
+            snapshot_speed = exact_speed
+            snapshot_turns = exact_turns
         now = time.monotonic()
         candidate_activity = now - native_idle_seconds
         previous_position = player.last_activity_position
@@ -8761,6 +9190,18 @@ class TronnerRacing:
                 player.dead_since_monotonic = now
             player.afk_recovery_samples.clear()
             return
+
+        if snapshot_game_time is not None:
+            self._record_practice_snapshot(
+                player,
+                snapshot_game_time,
+                position[0],
+                position[1],
+                xdir=(snapshot_direction[0] if snapshot_direction else None),
+                ydir=(snapshot_direction[1] if snapshot_direction else None),
+                speed=snapshot_speed,
+                turns=snapshot_turns,
+            )
 
         moved = False
         if cycle_alive and previous_position is not None and was_alive:
@@ -9442,6 +9883,7 @@ class TronnerRacing:
         last_final_countdown_idle_check = 0.0
         while True:
             now = time.monotonic()
+            probe_settle_seconds = 0.0
             players = {
                 id(item): item
                 for item in getattr(self, "players", {}).values()
@@ -9483,6 +9925,22 @@ class TronnerRacing:
                 and id(player) in getattr(self, "finalists", set())
                 for player in players
             )
+            practice_racers = any(
+                self._practice_active(player) for player in players
+            )
+            practice_probe_interval = max(
+                0.25,
+                float(
+                    self.config.get(
+                        "practice_probe_interval_seconds", 0.25
+                    )
+                ),
+            )
+            loop_interval = (
+                min(interval, practice_probe_interval)
+                if practice_racers
+                else interval
+            )
             fallback_idle_seconds = float(
                 self.config.get("final_countdown_idle_seconds", 10)
             )
@@ -9506,6 +9964,7 @@ class TronnerRacing:
                     or at_risk
                     or recovering_afk
                     or final_countdown_racers
+                    or practice_racers
                 )
             )
             if should_probe:
@@ -9515,7 +9974,9 @@ class TronnerRacing:
                     float(self.config.get("afk_probe_interval_seconds", 5)),
                 )
                 probe_interval = (
-                    max(
+                    practice_probe_interval
+                    if practice_racers
+                    else max(
                         0.5,
                         float(
                             self.config.get(
@@ -9533,9 +9994,12 @@ class TronnerRacing:
                 self.next_activity_probe_monotonic = now + probe_interval
                 # Let the ladderlog consumer apply the requested snapshot
                 # before evaluating the AFK threshold.
-                await asyncio.sleep(min(0.2, interval / 2))
+                probe_settle_seconds = min(0.2, loop_interval / 2)
+                await asyncio.sleep(probe_settle_seconds)
             await self._check_afk_players()
-            await asyncio.sleep(interval)
+            await asyncio.sleep(
+                max(0.01, loop_interval - probe_settle_seconds)
+            )
 
     def _alive_finalists(self) -> list[Player]:
         unique: dict[int, Player] = {}
@@ -9633,6 +10097,7 @@ class TronnerRacing:
                 for player in self.active_players()
                 if player.alive and player.respawn_enabled
             }
+            await self._disable_practice_for_countdown()
             runout_players = (
                 self._clock_runout_players(records)
                 if enforce_clock_runout
@@ -9689,6 +10154,7 @@ class TronnerRacing:
                 for player in self.active_players()
                 if player.alive and player.respawn_enabled
             }
+            await self._disable_practice_for_countdown()
         last_number: int | None = None
         while (
             self.final_countdown_active
@@ -9764,6 +10230,8 @@ class TronnerRacing:
             await self._command_setspawn(player, arguments)
         elif command == "/start":
             await self._command_start(player, arguments)
+        elif command == "/practice":
+            await self._command_practice(player, arguments)
         elif command == "/link":
             await self._command_link(player, arguments)
         elif command == "/cp":
@@ -10433,6 +10901,108 @@ class TronnerRacing:
             f"Start mode set to {mode}. {descriptions[mode]}{pending}",
         )
 
+    async def _command_practice(self, player: Player, argument: str) -> None:
+        usage = (
+            "Usage: /practice reset [seconds], /practice maintain [seconds], "
+            "or /practice off."
+        )
+        parts = argument.strip().casefold().split()
+        if not parts:
+            if self._practice_active(player):
+                await self.private(
+                    player,
+                    f"Practice mode: {player.practice_mode}, rewinding "
+                    f"{player.practice_rewind_seconds:g} seconds after death. "
+                    "No times are recorded. " + usage,
+                )
+            else:
+                await self.private(player, "Practice mode is off. " + usage)
+            return
+        if parts[0] == "off":
+            if len(parts) != 1:
+                await self.private(player, usage)
+                return
+            was_active = self._practice_active(player)
+            current_life_tainted = bool(
+                player.alive and player.practice_attempt_tainted
+            )
+            self._clear_player_practice(
+                player,
+                preserve_current_attempt=current_life_tainted,
+            )
+            await self.private(
+                player,
+                (
+                    "Practice mode disabled. This life still cannot record a "
+                    "time; your next life can."
+                    if current_life_tainted
+                    else "Practice mode disabled."
+                )
+                if was_active
+                else "Practice mode is already off.",
+            )
+            return
+        if len(parts) != 2 or parts[0] not in PRACTICE_MODES:
+            await self.private(player, usage)
+            return
+        try:
+            rewind_seconds = float(parts[1])
+        except ValueError:
+            await self.private(player, usage)
+            return
+        maximum = max(
+            0.0,
+            float(
+                self.config.get(
+                    "practice_max_rewind_seconds",
+                    DEFAULT_PRACTICE_MAX_REWIND_SECONDS,
+                )
+            ),
+        )
+        if (
+            not math.isfinite(rewind_seconds)
+            or rewind_seconds < 0
+            or rewind_seconds > maximum
+        ):
+            await self.private(
+                player,
+                f"Practice rewind must be from 0 to {maximum:g} seconds.",
+            )
+            return
+        if not self.current or not self.round_active or self.transitioning:
+            await self.private(player, "Practice mode requires an active map.")
+            return
+        if self.final_countdown_active or getattr(
+            self, "server_restart_active", False
+        ):
+            await self.private(
+                player,
+                "Practice mode cannot be enabled during a countdown.",
+            )
+            return
+        player.practice_mode = parts[0]
+        player.practice_rewind_seconds = rewind_seconds
+        player.practice_map_key = self.current.key
+        player.practice_samples.clear()
+        player.practice_respawn_snapshot = None
+        player.practice_start_respawn_pending = False
+        player.practice_finish_pending = False
+        player.practice_attempt_tainted = True
+        self.next_activity_probe_monotonic = 0.0
+        await self.sink.send("GET_PLAYER_ACTIVITY")
+        speed_text = (
+            "Speed will be reset to 0"
+            if player.practice_mode == "reset"
+            else "Speed will be restored"
+        )
+        await self.private(
+            player,
+            f"Practice mode enabled for {self._display_map_name(self.current)}. "
+            f"Deaths rewind {rewind_seconds:g} seconds. {speed_text}, your "
+            "/start setting is used, and finishes do not record a time. "
+            "A manual respawn returns to the map start.",
+        )
+
     def _game_link_secret(self) -> str:
         secret = os.environ.get("GAME_LINK_SERVER_SECRET", "").strip()
         if secret:
@@ -10785,6 +11355,7 @@ class TronnerRacing:
             self.store.set_json("final_countdown_active", True)
             self.store.set_json("final_countdown_end_epoch", None)
             self.store.set_json("final_countdown_map_key", entry.key)
+            await self._disable_practice_for_countdown()
             idle_seconds = float(
                 self.config.get("final_countdown_idle_seconds", 10)
             )
@@ -11240,6 +11811,7 @@ class TronnerRacing:
             self.store.set_json("final_countdown_active", True)
             self.store.set_json("final_countdown_end_epoch", None)
             self.store.set_json("final_countdown_map_key", old_entry.key)
+            await self._disable_practice_for_countdown()
             idle_seconds = float(
                 self.config.get("final_countdown_idle_seconds", 10)
             )
@@ -11257,6 +11829,9 @@ class TronnerRacing:
             )
 
     async def _command_checkpoint_respawn(self, player: Player) -> None:
+        if self._practice_active(player):
+            await self._command_practice_start_respawn(player)
+            return
         if getattr(self, "respawns_paused", False):
             await self.private(
                 player,
@@ -11317,6 +11892,9 @@ class TronnerRacing:
             await self.sink.send(f"KILL_SILENT {player.target}")
 
     async def _command_restart(self, player: Player) -> None:
+        if self._practice_active(player):
+            await self._command_practice_start_respawn(player)
+            return
         if getattr(self, "respawns_paused", False):
             await self.private(
                 player,
@@ -11346,6 +11924,9 @@ class TronnerRacing:
         await self._respawn_player(player)
 
     async def _command_respawn(self, player: Player, kill_first: bool) -> None:
+        if self._practice_active(player) and (kill_first or not player.alive):
+            await self._command_practice_start_respawn(player)
+            return
         if getattr(self, "respawns_paused", False):
             await self.private(
                 player,
@@ -11377,6 +11958,36 @@ class TronnerRacing:
             await self.private(player, "Respawn already scheduled.")
         else:
             await self.private(player, "Respawning enabled.")
+
+    async def _command_practice_start_respawn(self, player: Player) -> None:
+        if getattr(self, "respawns_paused", False):
+            await self.private(
+                player,
+                "Respawns are paused for a server script reload; your run will resume shortly.",
+            )
+            return
+        if self.final_countdown_active:
+            await self.private(
+                player, "Respawning is disabled during the final countdown."
+            )
+            return
+        if not player.connected:
+            await self.private(player, "Join the grid before respawning.")
+            return
+        player.respawn_enabled = True
+        if not player.active:
+            player.forced_racing = True
+            player.active = True
+        self._cancel_player_freeze(player)
+        player.practice_start_respawn_pending = True
+        player.practice_respawn_snapshot = None
+        player.practice_samples.clear()
+        player.practice_finish_pending = False
+        player.manual_restart_pending = True
+        if player.alive:
+            await self.sink.send(f"KILL_SILENT {player.target}")
+            return
+        await self._respawn_player(player)
 
     async def _announce_time_left(self, now: float) -> None:
         if (
