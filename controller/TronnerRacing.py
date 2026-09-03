@@ -18,6 +18,7 @@ import datetime
 import functools
 import hashlib
 import http.server
+import ipaddress
 import json
 import logging
 import math
@@ -68,6 +69,8 @@ SERVER_CONSOLE_INITIAL_LINES = 100
 SERVER_CONSOLE_BATCH_SIZE = 25
 SERVER_CONSOLE_STREAM_SECONDS = 90.0
 SERVER_CONSOLE_MAX_FILE_BYTES = 8 * 1024 * 1024
+MAP_HISTORY_LIMIT = 25
+UPCOMING_ROTATION_LIMIT = 25
 DEFAULT_START_COUNTDOWN_SECONDS = 3
 MIN_START_COUNTDOWN_SECONDS = 1
 MAX_START_COUNTDOWN_SECONDS = 60
@@ -263,6 +266,24 @@ def local_name(tag: str) -> str:
 
 def clean_console_text(value: object) -> str:
     return str(value).replace("\r", " ").replace("\n", " ").strip()
+
+
+def normalized_connection_ip(value: object) -> str:
+    """Extract one canonical IP from a ladderlog connection address."""
+    address = clean_console_text(value)
+    candidates = [address]
+    if address.startswith("[") and "]" in address:
+        candidates.insert(0, address[1:address.index("]")])
+    elif address.count(":") == 1:
+        host, port = address.rsplit(":", 1)
+        if port.isdigit():
+            candidates.insert(0, host)
+    for candidate in candidates:
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            continue
+    return address[:128]
 
 
 def quote_console(value: object) -> str:
@@ -1651,6 +1672,8 @@ class Player:
     auth_name: str | None = None
     colored_name: str | None = None
     color_code: str | None = None
+    connection_address: str = ""
+    ip_address: str = ""
     owner_id: int | None = None
     connected: bool = True
     active: bool = True
@@ -4172,6 +4195,16 @@ class TronnerRacing:
         self.queue: collections.deque[str] = collections.deque(
             self.store.get_json("queue", [])
         )
+        saved_queue_attribution = self.store.get_json("queue_attribution", {})
+        self.queue_attribution: dict[str, dict[str, object]] = (
+            {
+                str(key): dict(value)
+                for key, value in saved_queue_attribution.items()
+                if isinstance(value, dict)
+            }
+            if isinstance(saved_queue_attribution, dict)
+            else {}
+        )
         saved_pending_size_change = self.store.get_json(
             "pending_size_change", {}
         )
@@ -4203,6 +4236,26 @@ class TronnerRacing:
         self.previous_map_metadata: dict[str, object] = (
             saved_previous_map if isinstance(saved_previous_map, dict) else {}
         )
+        saved_map_history = self.store.get_json("map_history", [])
+        self.map_history: collections.deque[dict[str, object]] = collections.deque(
+            (
+                dict(item)
+                for item in saved_map_history
+                if isinstance(item, dict) and item.get("mapKey")
+            ),
+            maxlen=MAP_HISTORY_LIMIT,
+        ) if isinstance(saved_map_history, list) else collections.deque(
+            maxlen=MAP_HISTORY_LIMIT
+        )
+        saved_current_selection = self.store.get_json(
+            "current_map_selection", {}
+        )
+        self.current_map_selection: dict[str, object] = (
+            dict(saved_current_selection)
+            if isinstance(saved_current_selection, dict)
+            else {}
+        )
+        self.next_map_selection: dict[str, object] = {}
         self.restoring_saved_map = False
         self.deadline_epoch: float | None = self.store.get_json("deadline_epoch", None)
         self.round_started_epoch: float | None = self.store.get_json(
@@ -5027,9 +5080,117 @@ class TronnerRacing:
         return False
 
     def _save_rotation(self) -> None:
+        queued_keys = set(self.queue)
+        self.queue_attribution = {
+            key: value
+            for key, value in getattr(self, "queue_attribution", {}).items()
+            if key in queued_keys and isinstance(value, dict)
+        }
         self.store.set_json("rotation", list(self.rotation))
         self.store.set_json("queue", list(self.queue))
+        self.store.set_json("queue_attribution", self.queue_attribution)
         self.store.set_json("cycle_played", sorted(self.cycle_played))
+
+    def _attribute_queued_map(
+        self,
+        key: str,
+        queued_by: str,
+        queued_via: str,
+    ) -> None:
+        if not hasattr(self, "queue_attribution"):
+            self.queue_attribution = {}
+        self.queue_attribution[key] = {
+            "queued": True,
+            "queuedBy": plain_console_text(queued_by).strip()[:128] or "Unknown",
+            "queuedVia": clean_console_text(queued_via)[:32] or "server",
+            "queuedAt": int(time.time() * 1000),
+        }
+
+    def _selection_for_map(
+        self,
+        entry: MapEntry,
+        *,
+        queued: bool = False,
+        queued_by: str = "",
+        queued_via: str = "rotation",
+        queued_at: int | None = None,
+    ) -> dict[str, object]:
+        return {
+            "resourcePath": entry.key,
+            "queued": bool(queued),
+            "queuedBy": plain_console_text(queued_by).strip()[:128],
+            "queuedVia": clean_console_text(queued_via)[:32] or "rotation",
+            "queuedAt": max(0, int(queued_at or 0)),
+        }
+
+    def _set_current_map_selection(self, entry: MapEntry) -> None:
+        selection = dict(getattr(self, "next_map_selection", {}))
+        if selection.get("resourcePath") != entry.key:
+            selection = self._selection_for_map(entry, queued_via="native")
+        selection["selectedAt"] = int(time.time() * 1000)
+        self.current_map_selection = selection
+        self.next_map_selection = {}
+        self.store.set_json("current_map_selection", selection)
+
+    def _dashboard_upcoming_rotation(
+        self,
+        limit: int = UPCOMING_ROTATION_LIMIT,
+    ) -> list[dict[str, object]]:
+        maximum = max(1, min(int(limit), UPCOMING_ROTATION_LIMIT))
+        # Refill at the same boundary used by _peek_next so the preview and the
+        # map the controller will actually take cannot disagree.
+        self._peek_next()
+        upcoming: list[dict[str, object]] = []
+        current_key = self.current.key if self.current else None
+        pending_size_key = self._pending_size_target_key()
+        if pending_size_key and pending_size_key != current_key:
+            pending_entry = self.repository.catalog.get(pending_size_key)
+            if pending_entry:
+                attribution = getattr(self, "queue_attribution", {}).get(
+                    pending_size_key, {}
+                )
+                upcoming.append({
+                    **self._dashboard_map_metadata(pending_entry),
+                    **self._selection_for_map(
+                        pending_entry,
+                        queued=bool(attribution),
+                        queued_by=str(attribution.get("queuedBy", "")),
+                        queued_via=str(
+                            attribution.get("queuedVia", "scheduled resize")
+                        ),
+                        queued_at=int(attribution.get("queuedAt", 0) or 0),
+                    ),
+                })
+        for key in self.queue:
+            if len(upcoming) >= maximum or key == current_key:
+                continue
+            entry = self.repository.catalog.get(key)
+            if not entry:
+                continue
+            attribution = getattr(self, "queue_attribution", {}).get(key, {})
+            upcoming.append({
+                **self._dashboard_map_metadata(entry),
+                **self._selection_for_map(
+                    entry,
+                    queued=True,
+                    queued_by=str(attribution.get("queuedBy", "Unknown")),
+                    queued_via=str(attribution.get("queuedVia", "server")),
+                    queued_at=int(attribution.get("queuedAt", 0) or 0),
+                ),
+            })
+        queued_keys = set(self.queue)
+        for key in self.rotation:
+            if len(upcoming) >= maximum:
+                break
+            if key == current_key or key in queued_keys or key == pending_size_key:
+                continue
+            entry = self.repository.catalog.get(key)
+            if entry:
+                upcoming.append({
+                    **self._dashboard_map_metadata(entry),
+                    **self._selection_for_map(entry),
+                })
+        return upcoming[:maximum]
 
     def _pending_size_target_key(self) -> str | None:
         pending = getattr(self, "pending_size_change", {})
@@ -5315,10 +5476,23 @@ class TronnerRacing:
     def _take_next(self) -> MapEntry | None:
         current_key = self.current.key if self.current else None
         key = None
+        selection: dict[str, object] = {}
         pending_size_key = self._pending_size_target_key()
         if pending_size_key and pending_size_key != current_key:
             if pending_size_key in self.repository.catalog:
                 key = pending_size_key
+                attribution = getattr(self, "queue_attribution", {}).get(
+                    pending_size_key, {}
+                )
+                selection = self._selection_for_map(
+                    self.repository.catalog[pending_size_key],
+                    queued=bool(attribution),
+                    queued_by=str(attribution.get("queuedBy", "")),
+                    queued_via=str(
+                        attribution.get("queuedVia", "scheduled resize")
+                    ),
+                    queued_at=int(attribution.get("queuedAt", 0) or 0),
+                )
                 self.queue = collections.deque(
                     item for item in self.queue if item != pending_size_key
                 )
@@ -5337,6 +5511,16 @@ class TronnerRacing:
                 LOG.warning("discarding current map from next-map queue: %s", candidate)
                 continue
             key = candidate
+            entry = self.repository.catalog.get(key)
+            attribution = getattr(self, "queue_attribution", {}).get(key, {})
+            if entry:
+                selection = self._selection_for_map(
+                    entry,
+                    queued=True,
+                    queued_by=str(attribution.get("queuedBy", "Unknown")),
+                    queued_via=str(attribution.get("queuedVia", "server")),
+                    queued_at=int(attribution.get("queuedAt", 0) or 0),
+                )
             with contextlib.suppress(ValueError):
                 self.rotation.remove(key)
         if key is None:
@@ -5348,6 +5532,9 @@ class TronnerRacing:
                     LOG.warning("discarding current map from rotation head: %s", candidate)
                     continue
                 key = candidate
+                entry = self.repository.catalog.get(key)
+                if entry:
+                    selection = self._selection_for_map(entry)
         if key is None:
             # A restored rotation can contain only the active map at the end
             # of a shuffle cycle. Refill once after discarding it so another
@@ -5355,8 +5542,12 @@ class TronnerRacing:
             self._refill_rotation()
             if self.rotation:
                 key = self.rotation.popleft()
+                entry = self.repository.catalog.get(key)
+                if entry:
+                    selection = self._selection_for_map(entry)
         if key:
             self.cycle_played.add(key)
+        self.next_map_selection = selection
         self._save_rotation()
         return self.repository.catalog.get(key) if key else None
 
@@ -5554,6 +5745,7 @@ class TronnerRacing:
             self._clear_final_countdown_state()
             self._remember_previous_map(self.current)
             self.current = entry
+            self._set_current_map_selection(entry)
             self.current_spec = entry.key
             self.current_size_factor = size_factor
             self.round_started_epoch = None
@@ -5953,6 +6145,53 @@ class TronnerRacing:
         except Exception:
             LOG.exception("unable to publish live dashboard activity")
 
+    async def _write_admin_audit(self, event: dict[str, object]) -> None:
+        try:
+            dashboard = getattr(self, "live_dashboard_chat", None)
+            if dashboard is None:
+                return
+            await asyncio.to_thread(
+                dashboard.publish_admin_audit,
+                self.server_id,
+                event,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.exception("unable to publish private player audit event")
+
+    def _publish_player_audit(
+        self,
+        action: str,
+        player: Player,
+        **details: object,
+    ) -> None:
+        if getattr(self, "live_dashboard_chat", None) is None or player.is_ai:
+            return
+        live_config = self.config.get("live_dashboard", {})
+        event: dict[str, object] = {
+            "action": action,
+            "region": clean_console_text(
+                str(live_config.get("local_region", "LOCAL"))
+            )[:16],
+            "playerId": public_player_id(player.identity_key),
+            "logName": plain_console_text(player.log_name).strip()[:128],
+            "displayName": plain_console_text(player.display_name).strip()[:128],
+            "authName": plain_console_text(player.auth_name or "").strip()[:128],
+            "ipAddress": clean_console_text(
+                getattr(player, "ip_address", "")
+            )[:128],
+            "active": bool(player.active),
+            "authenticated": bool(player.auth_name),
+            **details,
+        }
+        task = asyncio.create_task(
+            self._write_admin_audit(event),
+            name=f"admin-audit-{action}",
+        )
+        self._live_dashboard_tasks.add(task)
+        task.add_done_callback(self._live_dashboard_tasks.discard)
+
     def _publish_dashboard_map_change(self, previous_key: str) -> None:
         if (
             getattr(self, "live_dashboard", None) is None
@@ -6034,6 +6273,7 @@ class TronnerRacing:
         )
         self._live_dashboard_tasks.add(task)
         task.add_done_callback(self._live_dashboard_tasks.discard)
+        self._publish_player_audit(action, player, message=message)
 
     def _publish_dashboard_finish_activity(
         self,
@@ -6112,6 +6352,16 @@ class TronnerRacing:
         )
         self._live_dashboard_tasks.add(task)
         task.add_done_callback(self._live_dashboard_tasks.discard)
+        self._publish_player_audit(
+            "finish",
+            player,
+            mapKey=payload.get("mapKey", ""),
+            mapName=payload.get("mapName", ""),
+            seconds=payload["seconds"],
+            turns=turns,
+            rank=payload["rank"],
+            personalBest=bool(improved),
+        )
 
     def _dashboard_map_metadata(self, entry: MapEntry | None) -> dict[str, object]:
         if entry is None:
@@ -6133,8 +6383,32 @@ class TronnerRacing:
         metadata = self._dashboard_map_metadata(entry)
         if not metadata:
             return
-        self.previous_map_metadata = metadata
-        self.store.set_json("previous_map_metadata", metadata)
+        now_ms = int(time.time() * 1000)
+        selection = dict(getattr(self, "current_map_selection", {}))
+        history_entry = {
+            **metadata,
+            "startedAt": max(
+                0,
+                int(
+                    selection.get("selectedAt")
+                    or ((getattr(self, "round_started_epoch", None) or 0) * 1000)
+                ),
+            ),
+            "endedAt": now_ms,
+            "queued": bool(selection.get("queued", False)),
+            "queuedBy": plain_console_text(
+                selection.get("queuedBy", "")
+            ).strip()[:128],
+            "queuedVia": clean_console_text(
+                selection.get("queuedVia", "rotation")
+            )[:32] or "rotation",
+        }
+        self.previous_map_metadata = history_entry
+        if not hasattr(self, "map_history"):
+            self.map_history = collections.deque(maxlen=MAP_HISTORY_LIMIT)
+        self.map_history.appendleft(history_entry)
+        self.store.set_json("previous_map_metadata", history_entry)
+        self.store.set_json("map_history", list(self.map_history))
 
     def _dashboard_players(
         self,
@@ -6179,10 +6453,13 @@ class TronnerRacing:
             }
             for rank, record in enumerate(current_records[:10], 1)
         ]
+        upcoming_rotation = self._dashboard_upcoming_rotation()
         return {
             "map": map_metadata,
             "previousMap": dict(self.previous_map_metadata),
-            "nextMap": self._dashboard_map_metadata(self._peek_next()),
+            "nextMap": dict(upcoming_rotation[0]) if upcoming_rotation else {},
+            "mapHistory": list(self.map_history),
+            "upcomingRotation": upcoming_rotation,
             "roundActive": self._round_is_active(),
             "timeRemainingSeconds": time_left,
             "leaderboard": current_leaderboard,
@@ -6211,6 +6488,9 @@ class TronnerRacing:
                 "playerId": public_player_id(player.identity_key),
                 "name": plain_console_text(player.display_name).strip()[:128],
                 "authName": plain_console_text(player.auth_name or "").strip()[:128],
+                "ipAddress": clean_console_text(
+                    getattr(player, "ip_address", "")
+                )[:128],
                 "active": bool(player.active),
                 "alive": bool(player.alive),
                 "afk": bool(player.afk),
@@ -6226,12 +6506,17 @@ class TronnerRacing:
         queued = []
         for position, key in enumerate(list(self.queue)[:25], 1):
             entry = self.repository.catalog.get(key)
+            attribution = getattr(self, "queue_attribution", {}).get(key, {})
             queued.append({
                 "position": position,
                 "mapKey": key,
                 "name": self._display_map_name(entry) if entry else key,
                 "author": entry.author if entry else "Unknown",
                 "version": entry.version if entry else "",
+                "queued": True,
+                "queuedBy": str(attribution.get("queuedBy", "Unknown"))[:128],
+                "queuedVia": str(attribution.get("queuedVia", "server"))[:32],
+                "queuedAt": max(0, int(attribution.get("queuedAt", 0) or 0)),
             })
         try:
             disk = shutil.disk_usage(self.store.path.parent)
@@ -6476,6 +6761,21 @@ class TronnerRacing:
                 "message": plain_message[:512],
                 "authenticated": True,
             })
+            await self._write_admin_audit({
+                "action": "website_chat",
+                "region": clean_console_text(
+                    str(live_config.get("local_region", "LOCAL"))
+                )[:16],
+                "websiteUid": self._server_management_field(
+                    command, "requestedBy", 128
+                ),
+                "websiteName": self._server_management_field(
+                    command, "requestedName", 80
+                ),
+                "displayName": plain_name[:128],
+                "message": plain_message[:512],
+                "authenticated": True,
+            })
             return (
                 f"Web chat message delivered as {plain_name}.",
                 {"displayName": plain_name},
@@ -6544,6 +6844,7 @@ class TronnerRacing:
                 if entry.key not in self.queue:
                     raise ValueError("That map is not currently queued.")
                 self.queue.remove(entry.key)
+                getattr(self, "queue_attribution", {}).pop(entry.key, None)
                 self._save_rotation()
                 return f"Removed {self._display_map_name(entry)} from the queue.", {}
             if self.current and entry.key == self.current.key:
@@ -6552,6 +6853,9 @@ class TronnerRacing:
                 self.queue.remove(entry.key)
             if command_type == "change_map":
                 self.queue.appendleft(entry.key)
+                self._attribute_queued_map(
+                    entry.key, actor.record_name, "website"
+                )
                 self._save_rotation()
                 await self.broadcast(
                     f"{actor.record_name} selected {self._display_map_name(entry)} by {entry.author}."
@@ -6559,6 +6863,9 @@ class TronnerRacing:
                 await self.activate_next_map("admin web console")
                 return f"Changing to {self._display_map_name(entry)}.", {"mapKey": entry.key}
             self.queue.append(entry.key)
+            self._attribute_queued_map(
+                entry.key, actor.record_name, "website"
+            )
             self._save_rotation()
             await self.broadcast(
                 f"{actor.record_name} queued {self._display_map_name(entry)} by {entry.author} "
@@ -6569,6 +6876,7 @@ class TronnerRacing:
         if command_type == "clear_queue":
             count = len(self.queue)
             self.queue.clear()
+            self.queue_attribution = {}
             self._save_rotation()
             if count:
                 await self.broadcast(f"{actor.record_name} cleared {count} map(s) from the queue.")
@@ -6716,6 +7024,17 @@ class TronnerRacing:
                             "failed",
                             result=str(exc),
                         )
+                        await self._write_admin_audit({
+                            "action": "admin_command_failed",
+                            "region": clean_console_text(
+                                str(live_config.get("local_region", "LOCAL"))
+                            )[:16],
+                            "websiteUid": command.get("requestedBy", ""),
+                            "websiteName": command.get("requestedName", ""),
+                            "command": command.get("type", ""),
+                            "target": command.get("target", ""),
+                            "result": str(exc),
+                        })
                     else:
                         LOG.info(
                             "admin command completed: server=%s id=%s type=%s actor=%s",
@@ -6730,6 +7049,17 @@ class TronnerRacing:
                             result=result,
                             details=details,
                         )
+                        await self._write_admin_audit({
+                            "action": "admin_command",
+                            "region": clean_console_text(
+                                str(live_config.get("local_region", "LOCAL"))
+                            )[:16],
+                            "websiteUid": command.get("requestedBy", ""),
+                            "websiteName": command.get("requestedName", ""),
+                            "command": command.get("type", ""),
+                            "target": command.get("target", ""),
+                            "result": result,
+                        })
                 await self._publish_server_console(dashboard, server_id)
                 if monotonic_now >= next_prune:
                     await asyncio.to_thread(
@@ -7080,11 +7410,33 @@ class TronnerRacing:
                 self._handle_player_left(payload)
                 await self._resolve_votes_after_eligibility_change()
             elif event == "PLAYER_LOGIN":
-                self._handle_player_login(payload)
+                player = self._handle_player_login(payload)
+                if player:
+                    self._publish_player_audit("login", player)
             elif event == "PLAYER_LOGOUT":
-                self._handle_player_logout(payload)
+                parts = payload.split()
+                player = self.player_for(parts[0]) if parts else None
+                previous_auth_name = player.auth_name if player else ""
+                player = self._handle_player_logout(payload)
+                if player:
+                    self._publish_player_audit(
+                        "logout",
+                        player,
+                        authName=previous_auth_name or "",
+                        authenticated=bool(previous_auth_name),
+                    )
             elif event == "PLAYER_RENAMED":
-                self._handle_player_renamed(payload)
+                parts = payload.split(maxsplit=1)
+                player = self.player_for(parts[0]) if parts else None
+                previous_name = (
+                    player.display_name
+                    if player else parts[0] if parts else ""
+                )
+                player = self._handle_player_renamed(payload)
+                if player:
+                    self._publish_player_audit(
+                        "rename", player, previousName=previous_name
+                    )
             elif event == "PLAYER_COLORED_NAME":
                 self._handle_player_colored_name(payload)
             elif event == "CHAT":
@@ -7101,6 +7453,12 @@ class TronnerRacing:
                             parts[1],
                             bool(player.auth_name),
                         )
+                        if not clean_console_text(parts[1]).startswith("/"):
+                            self._publish_player_audit(
+                                "chat",
+                                player,
+                                message=plain_console_text(parts[1]).strip()[:512],
+                            )
             elif event == "PLAYER_ACTIVITY":
                 await self._handle_player_activity_snapshot(payload)
             elif event == "ONLINE_PLAYER":
@@ -7208,6 +7566,11 @@ class TronnerRacing:
         if previous_key and previous_key != entry.key:
             self._remember_previous_map(self.current)
         self.current = entry
+        if getattr(self, "current_map_selection", {}).get("resourcePath") != entry.key:
+            self.next_map_selection = self._selection_for_map(
+                entry, queued_via="native"
+            )
+            self._set_current_map_selection(entry)
         self.current_spec = spec
         saved_key = self.store.get_json("current_key", None)
         if previous_key and previous_key != entry.key:
@@ -7254,6 +7617,9 @@ class TronnerRacing:
         assert player
         player.log_name = log_name
         player.display_name = display_name
+        if len(parts) > 2:
+            player.connection_address = clean_console_text(parts[1])[:128]
+            player.ip_address = normalized_connection_ip(parts[1])
         player.connected = True
         player.forced_racing = False
         player.active = active
@@ -10211,6 +10577,11 @@ class TronnerRacing:
             self._start_mode_for(player)
             self.players[player_name.casefold()] = player
             self.register_alias(player, player_name)
+        self._publish_player_audit(
+            "command",
+            player,
+            command=command,
+        )
         await self._dispatch_command(command, player, access_level, arguments)
 
     async def _dispatch_command(
@@ -10310,6 +10681,7 @@ class TronnerRacing:
                 await self.private(player, "The map queue is already empty.")
                 return
             self.queue.clear()
+            self.queue_attribution = {}
             self._save_rotation()
             await self.broadcast(
                 f"{player.record_name} cleared {removed_count} "
@@ -10363,6 +10735,8 @@ class TronnerRacing:
         if removing:
             position = list(self.queue).index(entry.key) + 1
             self.queue.remove(entry.key)
+            if entry.key not in self.queue:
+                getattr(self, "queue_attribution", {}).pop(entry.key, None)
             self._save_rotation()
             await self.broadcast(
                 f"{player.record_name} removed {display_name} by {entry.author} "
@@ -10378,6 +10752,7 @@ class TronnerRacing:
             return
 
         self.queue.append(entry.key)
+        self._attribute_queued_map(entry.key, player.record_name, "server")
         self._save_rotation()
         await self.broadcast(
             f"{player.record_name} queued {display_name} by {entry.author} "
@@ -10420,6 +10795,7 @@ class TronnerRacing:
             rank_text = f"rank {lowest_rank}"
         entry = random.choice(choices)
         self.queue.append(entry.key)
+        self._attribute_queued_map(entry.key, player.record_name, "server")
         self._save_rotation()
         await self.broadcast(
             f"{player.record_name} queued their lowest-ranked map, "
@@ -11106,6 +11482,13 @@ class TronnerRacing:
         website_name = clean_console_text(
             result.get("websiteDisplayName", "your website account")
         ).strip()[:80] or "your website account"
+        website_uid = clean_console_text(result.get("websiteUid", ""))[:128]
+        self._publish_player_audit(
+            "account_link",
+            player,
+            websiteUid=website_uid,
+            websiteName=website_name,
+        )
         await self.private(
             player,
             f"Linked {game_username} to {website_name} on tronner.io.",
@@ -11796,6 +12179,9 @@ class TronnerRacing:
                     if key not in {old_entry.key, revision.key}
                 )
                 self.queue.appendleft(revision.key)
+                self._attribute_queued_map(
+                    revision.key, player.record_name, "server"
+                )
                 self._save_rotation()
                 await asyncio.to_thread(self.repository.cache_for_server, revision)
             except Exception as exc:

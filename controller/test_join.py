@@ -2,7 +2,13 @@ import asyncio
 import unittest
 from pathlib import Path
 
-from TronnerRacing import MapEntry, Player, SpawnPoint, TronnerRacing
+from TronnerRacing import (
+    MapEntry,
+    Player,
+    SpawnPoint,
+    TronnerRacing,
+    normalized_connection_ip,
+)
 
 
 class Sink:
@@ -54,6 +60,10 @@ async def finish_spawn(controller, player):
 
 
 class JoinTests(unittest.IsolatedAsyncioTestCase):
+    def test_connection_addresses_are_canonicalized_for_private_audit(self):
+        self.assertEqual(normalized_connection_ip("127.0.0.1:4534"), "127.0.0.1")
+        self.assertEqual(normalized_connection_ip("[2001:db8::8]:4534"), "2001:db8::8")
+
     async def test_one_stale_online_snapshot_does_not_cancel_new_arrival(self):
         controller = arrival_controller()
 
@@ -104,6 +114,7 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(player.active)
         self.assertTrue(player.respawn_enabled)
+        self.assertEqual(player.ip_address, "127.0.0.1")
         self.assertIn(
             "RESPAWN_PLAYER racer false 3 4 0 1", controller.sink.commands
         )

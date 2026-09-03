@@ -26,6 +26,7 @@ HISTORY_ENTRY_LIMIT = 2500
 ADMIN_COMMAND_LIMIT = 10
 ADMIN_HISTORY_LIMIT = 200
 ADMIN_CONSOLE_BATCH_LIMIT = 12
+ADMIN_AUDIT_LIMIT = 1000
 
 
 def _canonical(value: object) -> bytes:
@@ -302,6 +303,64 @@ class FirebaseLiveDashboardPublisher:
             "publishedAt",
             {"serverId": server, "entries": bounded},
             ADMIN_CONSOLE_BATCH_LIMIT,
+        )
+
+    def publish_admin_audit(
+        self,
+        server_id: str,
+        event: dict[str, object],
+    ) -> str:
+        """Publish one bounded private player/audit event.
+
+        Only an explicit field allowlist crosses this boundary.  In particular,
+        intercepted command arguments and server credentials must never be
+        copied into the browser-readable audit stream.
+        """
+        server = re.sub(r"[^A-Za-z0-9_-]", "_", server_id)[:64]
+        if not server:
+            raise ValueError("admin audit event requires a server identifier")
+        text_fields = {
+            "action": 48,
+            "region": 16,
+            "playerId": 64,
+            "logName": 128,
+            "displayName": 128,
+            "previousName": 128,
+            "authName": 128,
+            "websiteUid": 128,
+            "websiteName": 80,
+            "ipAddress": 128,
+            "message": 512,
+            "command": 64,
+            "target": 128,
+            "result": 512,
+            "mapKey": 1024,
+            "mapName": 128,
+            "queuedBy": 128,
+            "queuedVia": 32,
+        }
+        payload: dict[str, object] = {
+            "source": "server",
+            "serverId": server,
+        }
+        for field, maximum in text_fields.items():
+            value = str(event.get(field, "")).replace("\x00", "").strip()
+            if value:
+                payload[field] = value[:maximum]
+        for field in ("active", "authenticated", "personalBest", "queued"):
+            if field in event:
+                payload[field] = bool(event[field])
+        for field in ("seconds", "turns", "rank"):
+            value = event.get(field)
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                payload[field] = value
+        if not payload.get("action"):
+            raise ValueError("admin audit event requires an action")
+        return self._publish_bounded_event(
+            "racing/admin/audit/events",
+            "occurredAt",
+            payload,
+            ADMIN_AUDIT_LIMIT,
         )
 
     def queued_admin_commands(
