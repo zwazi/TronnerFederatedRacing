@@ -71,6 +71,10 @@ SERVER_CONSOLE_STREAM_SECONDS = 90.0
 SERVER_CONSOLE_MAX_FILE_BYTES = 8 * 1024 * 1024
 MAP_HISTORY_LIMIT = 25
 UPCOMING_ROTATION_LIMIT = 25
+FINAL_COUNTDOWN_CENTER_PADDING = 20
+PLAYER_MESSAGE_LIMIT = 512
+PLAYER_MESSAGE_PENDING_LIMIT = 25
+PLAYER_MESSAGE_GLOBAL_LIMIT = 5000
 DEFAULT_START_COUNTDOWN_SECONDS = 3
 MIN_START_COUNTDOWN_SECONDS = 1
 MAX_START_COUNTDOWN_SECONDS = 60
@@ -882,6 +886,30 @@ def server_restart_center_command(seconds: int) -> str:
     return f"CENTER_MESSAGE 0xff0000{int(seconds)}{' ' * 24}0xffffff "
 
 
+def final_countdown_center_command(seconds: int, highest: int) -> str:
+    """Render a left-offset countdown fading green through yellow to red."""
+    number = max(0, int(seconds))
+    maximum = max(1, int(highest))
+    if maximum == 1:
+        progress = 0.0 if number >= maximum else 1.0
+    else:
+        progress = max(
+            0.0,
+            min(1.0, (maximum - min(number, maximum)) / (maximum - 1)),
+        )
+    if progress <= 0.5:
+        red = round(510 * progress)
+        green = 255
+    else:
+        red = 255
+        green = round(510 * (1.0 - progress))
+    color = f"0x{red:02x}{green:02x}00"
+    return (
+        f"CENTER_MESSAGE {color}{number}"
+        f"{' ' * FINAL_COUNTDOWN_CENTER_PADDING}0xffffff "
+    )
+
+
 def normalized_map_name(value: str) -> str:
     value = unicodedata.normalize("NFKC", value).casefold()
     return "".join(ch for ch in value if ch.isalnum())
@@ -1297,6 +1325,11 @@ ADMIN_COMMAND_HELP = (
         "records_admin_access_level",
         "/reset [user] [map]",
         "Delete one user's time; map defaults to current.",
+    ),
+    (
+        "records_admin_access_level",
+        "/message [player] [message]",
+        "Save a private message for a player's next authenticated login.",
     ),
     (
         "map_admin_access_level",
@@ -1886,6 +1919,17 @@ class UserMergeResult:
     replay_runs_moved: int = 0
 
 
+@dataclasses.dataclass(frozen=True)
+class SavedPlayerMessage:
+    id: int
+    recipient_identity_key: str
+    recipient_name: str
+    sender_identity_key: str
+    sender_name: str
+    message: str
+    created_at: float
+
+
 class StateStore:
     FINISH_HISTORY_BACKFILL_KEY = "schema:finish-history-backfill-v1"
 
@@ -1943,6 +1987,17 @@ class StateStore:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS player_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipient_identity_key TEXT NOT NULL,
+                recipient_name TEXT NOT NULL,
+                sender_identity_key TEXT NOT NULL,
+                sender_name TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS player_messages_by_recipient
+                ON player_messages(recipient_identity_key, id);
             CREATE TABLE IF NOT EXISTS replay_maps (
                 id INTEGER PRIMARY KEY,
                 map_identifier TEXT NOT NULL,
@@ -2091,6 +2146,89 @@ class StateStore:
             (key, encoded),
         )
         connection.commit()
+
+    def save_player_message(
+        self,
+        recipient: StoredIdentity,
+        sender: StoredIdentity,
+        message: str,
+        *,
+        created_at: float | None = None,
+    ) -> SavedPlayerMessage:
+        if (
+            not recipient.authenticated
+            or not recipient.identity_key.startswith("auth:")
+        ):
+            raise ValueError("saved messages require an authenticated recipient")
+        text = plain_console_text(message).strip()
+        if not text:
+            raise ValueError("saved message is empty")
+        if len(text) > PLAYER_MESSAGE_LIMIT:
+            raise ValueError(
+                f"saved messages may be at most {PLAYER_MESSAGE_LIMIT} characters"
+            )
+        connection = self.current_connection()
+        recipient_count = int(connection.execute(
+            "SELECT COUNT(*) FROM player_messages WHERE recipient_identity_key=?",
+            (recipient.identity_key,),
+        ).fetchone()[0])
+        if recipient_count >= PLAYER_MESSAGE_PENDING_LIMIT:
+            raise OverflowError("that player already has the maximum pending messages")
+        global_count = int(connection.execute(
+            "SELECT COUNT(*) FROM player_messages"
+        ).fetchone()[0])
+        if global_count >= PLAYER_MESSAGE_GLOBAL_LIMIT:
+            raise OverflowError("the server message queue is full")
+        timestamp = time.time() if created_at is None else float(created_at)
+        cursor = connection.execute(
+            "INSERT INTO player_messages("
+            "recipient_identity_key, recipient_name, sender_identity_key, "
+            "sender_name, message, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+            (
+                recipient.identity_key,
+                recipient.username,
+                sender.identity_key,
+                sender.username,
+                text,
+                timestamp,
+            ),
+        )
+        connection.commit()
+        return SavedPlayerMessage(
+            int(cursor.lastrowid),
+            recipient.identity_key,
+            recipient.username,
+            sender.identity_key,
+            sender.username,
+            text,
+            timestamp,
+        )
+
+    def pending_player_messages(
+        self,
+        identity_key: str,
+        limit: int = PLAYER_MESSAGE_PENDING_LIMIT,
+    ) -> list[SavedPlayerMessage]:
+        rows = self.current_connection().execute(
+            "SELECT id, recipient_identity_key, recipient_name, "
+            "sender_identity_key, sender_name, message, created_at "
+            "FROM player_messages WHERE recipient_identity_key=? "
+            "ORDER BY id LIMIT ?",
+            (
+                identity_key,
+                max(1, min(int(limit), PLAYER_MESSAGE_PENDING_LIMIT)),
+            ),
+        ).fetchall()
+        return [SavedPlayerMessage(*row) for row in rows]
+
+    def delete_player_message(self, message_id: int, identity_key: str) -> bool:
+        connection = self.current_connection()
+        cursor = connection.execute(
+            "DELETE FROM player_messages WHERE id=? AND recipient_identity_key=?",
+            (int(message_id), identity_key),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
 
     def add_replay_settings(
         self,
@@ -7413,6 +7551,7 @@ class TronnerRacing:
                 player = self._handle_player_login(payload)
                 if player:
                     self._publish_player_audit("login", player)
+                    await self._deliver_saved_player_messages(player)
             elif event == "PLAYER_LOGOUT":
                 parts = payload.split()
                 player = self.player_for(parts[0]) if parts else None
@@ -10537,6 +10676,15 @@ class TronnerRacing:
                 if player.alive and player.respawn_enabled
             }
             await self._disable_practice_for_countdown()
+        highest_number = max(
+            1,
+            math.ceil(
+                float(
+                    getattr(self, "final_countdown_duration_seconds", 0.0)
+                    or duration
+                )
+            ),
+        )
         last_number: int | None = None
         while (
             self.final_countdown_active
@@ -10554,12 +10702,16 @@ class TronnerRacing:
                 continue
             remaining = float(self.final_countdown_end_epoch or now) - time.time()
             if remaining <= 0:
-                await self.center_broadcast("0")
+                await self.sink.send(
+                    final_countdown_center_command(0, highest_number)
+                )
                 await self.activate_next_map("final countdown expired")
                 return
             number = max(1, math.ceil(remaining))
             if number != last_number:
-                await self.center_broadcast(str(number))
+                await self.sink.send(
+                    final_countdown_center_command(number, highest_number)
+                )
                 last_number = number
             await asyncio.sleep(0.1)
 
@@ -10653,6 +10805,8 @@ class TronnerRacing:
             await self._command_reset_all_times(player, access_level)
         elif command == "/reset":
             await self._command_reset_time(player, access_level, arguments)
+        elif command == "/message":
+            await self._command_message(player, access_level, arguments)
         elif command == "/review":
             await self._command_review(player, access_level, arguments)
         elif command == "/exclude":
@@ -10913,6 +11067,121 @@ class TronnerRacing:
             player,
             ["TronnerRacing commands:", *build_help_lines(entries)],
         )
+
+    def _saved_message_recipient(self, query: str) -> StoredIdentity:
+        target = plain_console_text(query).strip()
+        if not target or any(character.isspace() for character in target):
+            raise ValueError("Choose one player name or exact auth:name identity.")
+        folded = target.casefold()
+        players = {
+            id(item): item for item in getattr(self, "players", {}).values()
+        }.values()
+        direct: dict[str, StoredIdentity] = {}
+        fallback: dict[str, StoredIdentity] = {}
+        for candidate in players:
+            if not candidate.auth_name:
+                continue
+            identity = self.store.identity_for_player(candidate)
+            if candidate.auth_name.casefold() == folded:
+                direct[identity.identity_key.casefold()] = identity
+            if folded in {
+                candidate.log_name.casefold(),
+                plain_console_text(candidate.display_name).strip().casefold(),
+            }:
+                fallback[identity.identity_key.casefold()] = identity
+        connected_matches = direct or fallback
+        if len(connected_matches) == 1:
+            return next(iter(connected_matches.values()))
+        if len(connected_matches) > 1:
+            raise ValueError(
+                "That player name is ambiguous; use their exact auth:name identity."
+            )
+
+        stored = [
+            identity
+            for identity in self.store.matching_user_identities(target)
+            if identity.authenticated and identity.identity_key.startswith("auth:")
+        ]
+        if len(stored) == 1:
+            return stored[0]
+        if len(stored) > 1:
+            raise ValueError("That saved player name is ambiguous; use auth:name.")
+
+        explicit = self.store.explicit_user_identity(target)
+        if explicit and explicit.authenticated:
+            return explicit
+        if "@" in target:
+            return StoredIdentity(f"auth:{folded}", target, True)
+        raise ValueError(
+            "Authenticated player not found. Use their current name or exact "
+            "auth:name identity."
+        )
+
+    async def _command_message(
+        self,
+        player: Player,
+        access_level: int,
+        arguments: str,
+    ) -> None:
+        maximum_access = int(self.config.get("records_admin_access_level", 1))
+        if access_level > maximum_access:
+            await self.private(player, "Administrator access is required for /message.")
+            return
+        target, separator, raw_message = arguments.strip().partition(" ")
+        message = plain_console_text(raw_message).strip()
+        if not target or not separator or not message:
+            await self.private(player, "Usage: /message [player] [message]")
+            return
+        if len(message) > PLAYER_MESSAGE_LIMIT:
+            await self.private(
+                player,
+                f"Messages may be at most {PLAYER_MESSAGE_LIMIT} characters.",
+            )
+            return
+        try:
+            recipient = self._saved_message_recipient(target)
+            saved = self.store.save_player_message(
+                recipient,
+                self.store.identity_for_player(player),
+                message,
+            )
+        except (ValueError, OverflowError) as exc:
+            await self.private(player, str(exc))
+            return
+        await self.private(
+            player,
+            f"Message queued for {saved.recipient_name}'s next authenticated login.",
+        )
+        self._publish_player_audit(
+            "offline_message_queued",
+            player,
+            target=saved.recipient_name,
+            message=saved.message,
+        )
+
+    async def _deliver_saved_player_messages(self, player: Player) -> int:
+        if not player.auth_name:
+            return 0
+        delivered = 0
+        for saved in self.store.pending_player_messages(player.identity_key):
+            timestamp = datetime.datetime.fromtimestamp(
+                saved.created_at,
+                tz=datetime.timezone.utc,
+            ).strftime("%Y-%m-%d %H:%M UTC")
+            await self.private(
+                player,
+                f"Saved message from {saved.sender_name} ({timestamp}): "
+                f"{saved.message}",
+            )
+            if self.store.delete_player_message(saved.id, player.identity_key):
+                delivered += 1
+                self._publish_player_audit(
+                    "offline_message_delivered",
+                    player,
+                    target=saved.sender_name,
+                    message=saved.message,
+                )
+        return delivered
 
     def _report_api_key(self) -> str:
         api_key = os.environ.get("RESEND_API_KEY", "").strip()
