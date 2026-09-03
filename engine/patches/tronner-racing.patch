@@ -1,5 +1,5 @@
 diff --git a/src/engine/ePlayer.cpp b/src/engine/ePlayer.cpp
-index ee4880e..5abb6a8 100644
+index ee4880e..9e043e0 100644
 --- a/src/engine/ePlayer.cpp
 +++ b/src/engine/ePlayer.cpp
 @@ -8519,6 +8519,50 @@ void ePlayerNetID::GridPosLadderLog()
@@ -434,7 +434,7 @@ index 311610e..8742b6a 100644
  #endif
 -
 diff --git a/src/tron/gCycle.cpp b/src/tron/gCycle.cpp
-index 78153a3..2190568 100644
+index 78153a3..54145ac 100644
 --- a/src/tron/gCycle.cpp
 +++ b/src/tron/gCycle.cpp
 @@ -58,11 +58,18 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -1277,17 +1277,21 @@ index 78153a3..2190568 100644
  int sg_defaultRespawnPosition = 0;
  static tConfItem<int> sg_defaultRespawnPositionConf("RESPAWN_DEFAULT_POSITION",sg_defaultRespawnPosition);
  
-@@ -7266,7 +7938,8 @@ static tConfItem<bool> sg_RespawnPlayerCMConf("RESPAWN_MESSAGE",sg_RespawnPlayer
+@@ -7266,7 +7938,12 @@ static tConfItem<bool> sg_RespawnPlayerCMConf("RESPAWN_MESSAGE",sg_RespawnPlayer
  bool sg_RespawnPlayerStrict = false;
  static tConfItem<bool> sg_RespawnPlayerStrictConf("RESPAWN_STRICT",sg_RespawnPlayerStrict);
  
 -static void sg_RespawnPlayer(std::istream &s)
-+static void sg_RespawnPlayerInternal(std::istream &s, bool holdUntilBrake,
-+                                     bool restoreCheckpointState = false)
++static void sg_RespawnPlayerInternal(
++    std::istream &s,
++    bool holdUntilBrake,
++    bool restoreCheckpointState = false,
++    bool protectFromLastDeathZone = false
++)
  {
          eGrid *grid = eGrid::CurrentGrid();
          if( !grid || !SafeToSpawnObject() )
-@@ -7275,7 +7948,8 @@ static void sg_RespawnPlayer(std::istream &s)
+@@ -7275,7 +7952,8 @@ static void sg_RespawnPlayer(std::istream &s)
                  return;
          }
  
@@ -1297,7 +1301,7 @@ index 78153a3..2190568 100644
          int pos = 0; //
          tString PlayerName("");
          s >> PlayerName;
-@@ -7290,15 +7964,19 @@ static void sg_RespawnPlayer(std::istream &s)
+@@ -7290,15 +7968,19 @@ static void sg_RespawnPlayer(std::istream &s)
          tString x_str, y_str;
          REAL dirx,diry;
          
@@ -1319,7 +1323,7 @@ index 78153a3..2190568 100644
          {
              message = (
                  str0[0] == 't' || 
-@@ -7331,6 +8009,18 @@ static void sg_RespawnPlayer(std::istream &s)
+@@ -7331,6 +8013,22 @@ static void sg_RespawnPlayer(std::istream &s)
  
              gCycle *pCycle = new gCycle(grid, ppos, pdir, pPlayer);
              pPlayer->ControlObject(pCycle);
@@ -1332,13 +1336,17 @@ index 78153a3..2190568 100644
 +                pCycle->RestoreCheckpointState(
 +                    speed, static_cast<unsigned short>(restoredTurns));
 +            }
++            if (protectFromLastDeathZone)
++                sg_ArmPracticeDeathZoneProtection(pCycle, se_GameTime());
++            else
++                sg_ClearPracticeDeathZoneProtection(pPlayer);
 +            if (holdUntilBrake)
 +                pCycle->FreezeUntilBrake();
 +            sg_CancelPendingEmptyRoundEndForRespawn();
  
              if(message)
              {
-@@ -7345,8 +8035,34 @@ static void sg_RespawnPlayer(std::istream &s)
+@@ -7345,8 +8043,48 @@ static void sg_RespawnPlayer(std::istream &s)
          }
  }
  
@@ -1362,6 +1370,16 @@ index 78153a3..2190568 100644
 +    sg_RespawnPlayerInternal(s, true, true);
 +}
 +
++static void sg_RespawnPlayerPractice(std::istream &s)
++{
++    sg_RespawnPlayerInternal(s, false, true, true);
++}
++
++static void sg_RespawnPlayerPracticeHeld(std::istream &s)
++{
++    sg_RespawnPlayerInternal(s, true, true, true);
++}
++
  static tConfItemFunc sg_RespawnPlayer_conf("RESPAWN_PLAYER",&sg_RespawnPlayer);
  static tConfItemFunc sg_Respawn_conf("RESPAWN",&sg_RespawnPlayer);
 +static tConfItemFunc sg_RespawnPlayerHeldConf(
@@ -1370,10 +1388,14 @@ index 78153a3..2190568 100644
 +    "RESPAWN_PLAYER_CHECKPOINT", &sg_RespawnPlayerCheckpoint);
 +static tConfItemFunc sg_RespawnPlayerCheckpointHeldConf(
 +    "RESPAWN_PLAYER_CHECKPOINT_HELD", &sg_RespawnPlayerCheckpointHeld);
++static tConfItemFunc sg_RespawnPlayerPracticeConf(
++    "RESPAWN_PLAYER_PRACTICE", &sg_RespawnPlayerPractice);
++static tConfItemFunc sg_RespawnPlayerPracticeHeldConf(
++    "RESPAWN_PLAYER_PRACTICE_HELD", &sg_RespawnPlayerPracticeHeld);
  
  
  static void sg_TeleportPlayer(std::istream &s)
-@@ -7451,6 +8167,36 @@ static void sg_setCycleSpeed(std::istream &s)
+@@ -7451,6 +8189,36 @@ static void sg_setCycleSpeed(std::istream &s)
  }
  static tConfItemFunc sg_setCycleSpeedConf("SET_CYCLE_SPEED", sg_setCycleSpeed);
  
@@ -1954,7 +1976,7 @@ index 12b17b3..de61bf8 100644
      sizeMultiplier = aSizeMultiplier;
      // EOP
 diff --git a/src/tron/gZone.cpp b/src/tron/gZone.cpp
-index 68b539b..e6ac428 100644
+index 68b539b..e2e3cdd 100644
 --- a/src/tron/gZone.cpp
 +++ b/src/tron/gZone.cpp
 @@ -64,6 +64,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -2088,7 +2110,207 @@ index 68b539b..e6ac428 100644
      sg_winzonePlayerEnterWriter.write();
  
      //HACK RACE begin
-@@ -6958,6 +7039,7 @@ void gTargetZoneHack::OnEnter( gCycle * target, REAL time )
+@@ -2487,6 +2568,100 @@ static tSettingItem<bool> sg_deathZoneRotationConf("DEATHZONE_ROTATION", sg_deat
+ REAL sg_deathZoneRotationSpeed = 0.3f;
+ static tSettingItem<REAL> sg_deathZoneRotationSpeedConf("DEATHZONE_ROTATION_SPEED", sg_deathZoneRotationSpeed);
+ 
++static REAL sg_practiceDeathZoneProtectionTime = 1.0f;
++static tSettingItem<REAL> sg_practiceDeathZoneProtectionTimeConf(
++    "PRACTICE_DEATHZONE_PROTECTION_TIME",
++    sg_practiceDeathZoneProtectionTime
++);
++
++struct gPracticeDeathZoneProtection
++{
++    gPracticeDeathZoneProtection()
++        : cycle(NULL), zone(NULL), expiresAt(0), entered(false)
++    {
++    }
++
++    gCycle *cycle;
++    gDeathZoneHack *zone;
++    REAL expiresAt;
++    bool entered;
++};
++
++static std::map<ePlayerNetID *, gDeathZoneHack *>
++    sg_lastPracticeDeathZones;
++static std::map<ePlayerNetID *, gPracticeDeathZoneProtection>
++    sg_practiceDeathZoneProtections;
++
++static void sg_RememberPracticeDeathZone(
++    gDeathZoneHack *zone,
++    gCycle *cycle
++)
++{
++    if (!zone || !cycle || !cycle->Player())
++        return;
++    ePlayerNetID *player = cycle->Player();
++    sg_practiceDeathZoneProtections.erase(player);
++    sg_lastPracticeDeathZones[player] = zone;
++}
++
++void sg_ClearPracticeDeathZoneProtection(ePlayerNetID *player)
++{
++    if (!player)
++        return;
++    sg_lastPracticeDeathZones.erase(player);
++    sg_practiceDeathZoneProtections.erase(player);
++}
++
++void sg_ArmPracticeDeathZoneProtection(gCycle *cycle, REAL time)
++{
++    if (!cycle || !cycle->Player())
++        return;
++    ePlayerNetID *player = cycle->Player();
++    sg_practiceDeathZoneProtections.erase(player);
++    std::map<ePlayerNetID *, gDeathZoneHack *>::iterator found =
++        sg_lastPracticeDeathZones.find(player);
++    if (found == sg_lastPracticeDeathZones.end())
++        return;
++    gDeathZoneHack *zone = found->second;
++    sg_lastPracticeDeathZones.erase(found);
++    if (!zone || sg_practiceDeathZoneProtectionTime <= 0)
++        return;
++    gPracticeDeathZoneProtection protection;
++    protection.cycle = cycle;
++    protection.zone = zone;
++    protection.expiresAt = time + sg_practiceDeathZoneProtectionTime;
++    sg_practiceDeathZoneProtections[player] = protection;
++}
++
++static bool sg_IsPracticeDeathZoneProtected(
++    gDeathZoneHack *zone,
++    gCycle *cycle,
++    REAL time
++)
++{
++    if (!zone || !cycle || !cycle->Player())
++        return false;
++    ePlayerNetID *player = cycle->Player();
++    std::map<ePlayerNetID *, gPracticeDeathZoneProtection>::iterator found =
++        sg_practiceDeathZoneProtections.find(player);
++    if (found == sg_practiceDeathZoneProtections.end())
++        return false;
++    gPracticeDeathZoneProtection &protection = found->second;
++    if (protection.cycle != cycle || protection.zone != zone)
++        return false;
++    if (cycle->IsFrozen(time))
++    {
++        protection.expiresAt = time + sg_practiceDeathZoneProtectionTime;
++    }
++    else if (time >= protection.expiresAt)
++    {
++        sg_practiceDeathZoneProtections.erase(found);
++        return false;
++    }
++    protection.entered = true;
++    return true;
++}
++
+ gDeathZoneHack::gDeathZoneHack( eGrid * grid, const eCoord & pos, bool dynamicCreation, eTeam * teamowner, bool delayCreation )
+ :gZone( grid, pos, dynamicCreation, delayCreation )
+ {
+@@ -2569,6 +2744,28 @@ gDeathZoneHack::gDeathZoneHack( nMessage & m )
+ 
+ gDeathZoneHack::~gDeathZoneHack( void )
+ {
++    for (
++        std::map<ePlayerNetID *, gDeathZoneHack *>::iterator iterator =
++            sg_lastPracticeDeathZones.begin();
++        iterator != sg_lastPracticeDeathZones.end();
++    )
++    {
++        if (iterator->second == this)
++            sg_lastPracticeDeathZones.erase(iterator++);
++        else
++            ++iterator;
++    }
++    for (
++        std::map<ePlayerNetID *, gPracticeDeathZoneProtection>::iterator iterator =
++            sg_practiceDeathZoneProtections.begin();
++        iterator != sg_practiceDeathZoneProtections.end();
++    )
++    {
++        if (iterator->second.zone == this)
++            sg_practiceDeathZoneProtections.erase(iterator++);
++        else
++            ++iterator;
++    }
+     if( pLastShotCollision )
+     {
+         pLastShotCollision->pLastShotCollision = NULL;
+@@ -2782,9 +2979,12 @@ static eLadderLogWriter sg_deathDeathSelfDestructWriter("DEATH_SELF_DESTRUCT", t
+ 
+ void gDeathZoneHack::OnEnter( gCycle * target, REAL time )
+ {
++    if (sg_IsPracticeDeathZoneProtected(this, target, time))
++        return;
+     if (!dynamicCreation_ || ( deathZoneType == TYPE_NORMAL && !team ) )
+     {
+         target->Player()->AddScore(score_deathzone, tOutput(), "$player_lose_deathzone");
++        sg_RememberPracticeDeathZone(this, target);
+         target->Kill("DEATHZONE");
+         sg_deathDeathZoneWriter << target->Player()->GetUserName();
+         sg_deathDeathZoneWriter.write();
+@@ -2804,6 +3004,7 @@ void gDeathZoneHack::OnEnter( gCycle * target, REAL time )
+         {
+             target->Player()->AddScore(score_deathzone_team, "", "player_lose_deathzone_team");
+             target->deathReason_ << "DEATHZONE_TEAM " << ePlayerNetID::FilterName(team->Name());
++            sg_RememberPracticeDeathZone(this, target);
+             target->Kill();
+             sg_deathDeathZoneTeamWriter << ePlayerNetID::FilterName( team->Name() ) << target->Player()->GetUserName();
+             sg_deathDeathZoneTeamWriter.write();
+@@ -2850,6 +3051,7 @@ void gDeathZoneHack::OnEnter( gCycle * target, REAL time )
+                         target->Player()->AddScore(score_shot_suicide, tOutput(), "$player_shot_suicide");
+                     }
+                     target->deathReason_ << "SHOT " << target->Player()->GetUserName();
++                    sg_RememberPracticeDeathZone(this, target);
+                     target->Kill();
+                 }
+             }
+@@ -2959,6 +3161,7 @@ void gDeathZoneHack::OnEnter( gCycle * target, REAL time )
+ 
+                 target->Killed(pOwnerCycle); //???make this player so it isn't NULL if dead?
+ 
++                sg_RememberPracticeDeathZone(this, target);
+                 target->Kill();
+             }
+         }
+@@ -2969,6 +3172,7 @@ void gDeathZoneHack::OnEnter( gCycle * target, REAL time )
+                 sg_deathZombieZoneWriter << target->Player()->GetUserName();
+                 sg_deathZombieZoneWriter.write();
+                 target->Player()->AddScore(score_zombie_zone, tOutput(), "$player_lose_suicide");
++                sg_RememberPracticeDeathZone(this, target);
+                 target->Kill("ZOMBIE_ZONE ");
+             }
+         }
+@@ -2994,6 +3198,24 @@ void gDeathZoneHack::OnEnter( gCycle * target, REAL time )
+     }
+ }
+ 
++void gDeathZoneHack::OnExit( gCycle *target, REAL time )
++{
++    if (!target || !target->Player())
++        return;
++    ePlayerNetID *player = target->Player();
++    std::map<ePlayerNetID *, gPracticeDeathZoneProtection>::iterator found =
++        sg_practiceDeathZoneProtections.find(player);
++    if (
++        found != sg_practiceDeathZoneProtections.end() &&
++        found->second.cycle == target &&
++        found->second.zone == this &&
++        found->second.entered
++    )
++    {
++        sg_practiceDeathZoneProtections.erase(found);
++    }
++}
++
+ 
+ void gDeathZoneHack::OnEnter( gDeathZoneHack * target, REAL time )
+ {
+@@ -6958,6 +7180,7 @@ void gTargetZoneHack::OnEnter( gCycle * target, REAL time )
          std::istringstream stream(&OnEnterCmd(0));
          tCurrentAccessLevel elevator( sg_SetTargetCmd_conf.GetRequiredLevel(), true );
          tConfItemBase::LoadAll(stream);
@@ -2096,7 +2318,7 @@ index 68b539b..e6ac428 100644
      }
  
      if(!isInside(target))
-@@ -7012,6 +7094,7 @@ void gTargetZoneHack::OnExit(gCycle *target, REAL time)
+@@ -7012,6 +7235,7 @@ void gTargetZoneHack::OnExit(gCycle *target, REAL time)
      std::istringstream stream(&OnExitCmd(0));
      tCurrentAccessLevel elevator( sg_SetTargetCmd_conf.GetRequiredLevel(), true );
      tConfItemBase::LoadAll(stream);
@@ -2104,7 +2326,7 @@ index 68b539b..e6ac428 100644
  
      sg_targetzonePlayerLeftWriter << this->GetID() << name_ << MapPosition().x << MapPosition().y << target->Player()->GetUserName() << target->Player()->Object()->MapPosition().x << target->Player()->Object()->MapPosition().y << target->Player()->Object()->Direction().x << target->Player()->Object()->Direction().y << time;
      sg_targetzonePlayerLeftWriter.write();
-@@ -7036,6 +7119,7 @@ void gTargetZoneHack::OnVanish( void )
+@@ -7036,6 +7260,7 @@ void gTargetZoneHack::OnVanish( void )
      std::istringstream stream(&OnVanishCmd(0));
      tCurrentAccessLevel elevator( sg_SetTargetCmd_conf.GetRequiredLevel(), true );
      tConfItemBase::LoadAll(stream);
@@ -2112,7 +2334,7 @@ index 68b539b..e6ac428 100644
  
      // check if we have a winner ...
      if (sg_targetIsWinzone && (TargetZoneCounter_==1) && firstPlayer_)
-@@ -7392,7 +7476,15 @@ void gTeleportZoneHack::OnEnter( gCycle * target, REAL time )
+@@ -7392,7 +7617,15 @@ void gTeleportZoneHack::OnEnter( gCycle * target, REAL time )
      REAL l = (eCoord::F(v,d)*vn*2.0);
      // if center is behind, you might have been teleported in this zone. Don't jump !
      if (l<=0) return;
@@ -2129,7 +2351,7 @@ index 68b539b..e6ac428 100644
      // check if newPos is inside this zone
      //if ((newPos-GetPosition()).Norm()<=GetRadius()) return;
      // if not, let's jump
-@@ -8904,12 +8996,14 @@ void gRespawnZoneHack::OnVanish( void )
+@@ -8904,12 +9137,14 @@ void gRespawnZoneHack::OnVanish( void )
  //!
  // *******************************************************************************
  
@@ -2147,7 +2369,7 @@ index 68b539b..e6ac428 100644
  
      checkpointId_ = checkpointId;
  
-@@ -8917,7 +9011,11 @@ gCheckpointZoneHack::gCheckpointZoneHack( eGrid * grid, const eCoord & pos, int
+@@ -8917,7 +9152,11 @@ gCheckpointZoneHack::gCheckpointZoneHack( eGrid * grid, const eCoord & pos, int
      if (checkpointTime_ < 0)
          checkpointTime_ = 0;
  
@@ -2160,7 +2382,7 @@ index 68b539b..e6ac428 100644
  
      SetExpansionSpeed(0);
      SetRotationSpeed( .3f );
-@@ -8957,6 +9055,63 @@ tArray<gCheckpointZoneHack *> sg_GetCheckpointZones()
+@@ -8957,6 +9196,63 @@ tArray<gCheckpointZoneHack *> sg_GetCheckpointZones()
      return checkpointZones;
  }
  
@@ -2224,7 +2446,7 @@ index 68b539b..e6ac428 100644
  // *******************************************************************************
  // *
  // *    gCheckpointZoneHack
-@@ -8971,7 +9126,11 @@ tArray<gCheckpointZoneHack *> sg_GetCheckpointZones()
+@@ -8971,7 +9267,11 @@ tArray<gCheckpointZoneHack *> sg_GetCheckpointZones()
  gCheckpointZoneHack::gCheckpointZoneHack( nMessage & m )
  : gZone( m )
  {
@@ -2237,7 +2459,7 @@ index 68b539b..e6ac428 100644
  }
  
  
-@@ -8988,6 +9147,16 @@ gCheckpointZoneHack::~gCheckpointZoneHack( void )
+@@ -8988,6 +9288,16 @@ gCheckpointZoneHack::~gCheckpointZoneHack( void )
  {
  }
  
@@ -2254,7 +2476,7 @@ index 68b539b..e6ac428 100644
  
  // *******************************************************************************
  // *
-@@ -9021,6 +9190,24 @@ bool gCheckpointZoneHack::Timestep( REAL time )
+@@ -9021,6 +9331,24 @@ bool gCheckpointZoneHack::Timestep( REAL time )
  
  void gCheckpointZoneHack::OnEnter( gCycle * target, REAL time )
  {
@@ -2279,7 +2501,7 @@ index 68b539b..e6ac428 100644
      gRacePlayer *racer = gRacePlayer::GetPlayer(target->Player());
      if (racer && sg_RaceTimerEnabled)
      {
-@@ -9124,11 +9311,8 @@ void gCheckpointZoneHack::OnEnter( gCycle * target, REAL time )
+@@ -9124,11 +9452,8 @@ void gCheckpointZoneHack::OnEnter( gCycle * target, REAL time )
  
                  if (sg_RaceCheckpointRequireHit == 1)
                  {
@@ -2291,7 +2513,7 @@ index 68b539b..e6ac428 100644
                          racer->SetCanFinish(true);
                          racer->SetCheckpointsDone(true);
                      }
-@@ -9140,14 +9324,9 @@ void gCheckpointZoneHack::OnEnter( gCycle * target, REAL time )
+@@ -9140,14 +9465,9 @@ void gCheckpointZoneHack::OnEnter( gCycle * target, REAL time )
                      //  finish line (win/target zone)
                      if (all_done)
                      {
@@ -2307,7 +2529,7 @@ index 68b539b..e6ac428 100644
  
                  //  add the time to the countdown
 diff --git a/src/tron/gZone.h b/src/tron/gZone.h
-index 73c9a2d..6290606 100644
+index 73c9a2d..8cef960 100644
 --- a/src/tron/gZone.h
 +++ b/src/tron/gZone.h
 @@ -125,6 +125,9 @@ public:
@@ -2342,7 +2564,15 @@ index 73c9a2d..6290606 100644
      virtual void ReadSync(nMessage &m);    //!< reads sync data
  
      virtual void InteractWith( eGameObject *target,REAL time,int recursion=1 ); //!< looks for objects inzide the zone and reacts on them
-@@ -863,13 +867,19 @@ class gCheckpointZoneHack: public gZone
+@@ -377,6 +381,7 @@ class gDeathZoneHack: public gZone
+ 
+ 								 //!< reacts on objects inside the zone (kills them)
+ 		virtual void OnEnter( gCycle *target, REAL time );
++		virtual void OnExit( gCycle *target, REAL time );
+ };
+ //! Rubber zone: Increase players rubber on enter
+ class gRubberZoneHack: public gZone
+@@ -863,13 +868,19 @@ class gCheckpointZoneHack: public gZone
          int CheckpointID()      { return checkpointId_; }
          int CheckpointTime()   { return checkpointTime_; }
  
@@ -2362,3 +2592,11 @@ index 73c9a2d..6290606 100644
          virtual bool Timestep(REAL currentTime);
          virtual void OnVanish();
          virtual void OnEnter(gCycle *target, REAL time);    //!< reacts to players entering the zone
+@@ -1005,4 +1016,7 @@ tArray<gCheckpointZoneHack *> sg_GetCheckpointZones();
+ extern bool sg_deathZoneRotation;
+ extern REAL sg_deathZoneRotationSpeed;
+ 
++void sg_ArmPracticeDeathZoneProtection(gCycle *cycle, REAL time);
++void sg_ClearPracticeDeathZoneProtection(ePlayerNetID *player);
++
+ #endif
