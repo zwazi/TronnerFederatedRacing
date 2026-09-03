@@ -33,11 +33,11 @@ index ee4880e..5abb6a8 100644
 +        if ( alive )
 +        {
 +            se_playerActivityWriter << cycle->MapPosition().x
-+                                    << cycle->MapPosition().y;
++                                    << cycle->MapPosition().y << se_GameTime() << cycle->Direction().x << cycle->Direction().y << cycle->Speed() << cycle->GetTurns();
 +        }
 +        else
 +        {
-+            se_playerActivityWriter << 0 << 0;
++            se_playerActivityWriter << 0 << 0 << se_GameTime() << 0 << 0 << 0 << 0;
 +        }
 +        se_playerActivityWriter.write();
 +    }
@@ -1046,7 +1046,7 @@ index 78153a3..2190568 100644
  
 +                if ( sg_CycleReplayEligible(this) )
 +                {
-+                    se_cycleReplayEndWriter << ReplayToken() << Player()->GetLogName() <<
++                    sg_WriteCycleReplayState(this, "death", se_GameTime()); se_cycleReplayEndWriter << ReplayToken() << Player()->GetLogName() <<
 +                        sg_HighPrecisionRaceTime(se_GameTime()) << deathReason_;
 +                    se_cycleReplayEndWriter.write();
 +                }
