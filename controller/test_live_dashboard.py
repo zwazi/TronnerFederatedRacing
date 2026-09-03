@@ -322,6 +322,36 @@ class LiveDashboardTest(unittest.TestCase):
 
         self.assertEqual(len(calls[0][2]["entries"]), 25)
 
+    def test_private_user_audit_is_allowlisted_timestamped_and_bounded(self):
+        publisher = FirebaseLiveDashboardPublisher(
+            FakeFirebase(), "https://example.firebaseio.com", FakeStore()
+        )
+        calls = []
+        publisher._rtdb = lambda path, method, value=None, *, query=None: calls.append(
+            (path, method, value, query)
+        ) or ({} if method == "GET" else None)
+
+        key = publisher.publish_admin_audit("nyc1", {
+            "action": "chat",
+            "displayName": "Racer",
+            "authName": "racer@tronner",
+            "ipAddress": "203.0.113.9",
+            "message": "hello",
+            "secret": "must not cross the boundary",
+        })
+
+        self.assertTrue(calls[0][0].endswith(key))
+        self.assertEqual(calls[0][1], "PUT")
+        self.assertEqual(calls[0][2]["source"], "server")
+        self.assertEqual(calls[0][2]["serverId"], "nyc1")
+        self.assertEqual(calls[0][2]["ipAddress"], "203.0.113.9")
+        self.assertNotIn("secret", calls[0][2])
+        self.assertIn("occurredAt", calls[0][2])
+        self.assertEqual(
+            calls[1],
+            ("racing/admin/audit/events", "GET", None, {"shallow": "true"}),
+        )
+
     def test_admin_audit_pruning_uses_shallow_keys_and_caps_retention(self):
         publisher = FirebaseLiveDashboardPublisher(
             FakeFirebase(), "https://example.firebaseio.com", FakeStore()

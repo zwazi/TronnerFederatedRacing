@@ -89,6 +89,9 @@ class QueueControlTests(unittest.IsolatedAsyncioTestCase):
         await controller._command_queue(player, "add Sprint 1")
         await controller._command_queue(player, "add Sprint 2")
         self.assertEqual(list(controller.queue), [first.key, second.key])
+        self.assertEqual(
+            controller.queue_attribution[first.key]["queuedBy"], "Racer"
+        )
 
         await controller._command_queue(player, "remove Sprint 1")
         self.assertEqual(list(controller.queue), [second.key])
@@ -104,6 +107,24 @@ class QueueControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("queued Sprint 2 by Zulu (position 2)", output)
         self.assertIn("removed Sprint 1 by Alpha", output)
         self.assertIn("cleared 1 map from the queue", output)
+
+    async def test_public_rotation_preview_marks_manual_and_automatic_maps(self):
+        controller, first, second = queue_controller()
+        controller.current_size_factor = None
+        controller.pending_size_change = {}
+        player = Player("racer", "Racer", auth_name="racer@tronner")
+
+        await controller._command_queue(player, "add Sprint 1")
+        controller.rotation.append(second.key)
+
+        preview = controller._dashboard_upcoming_rotation()
+
+        self.assertEqual([item["name"] for item in preview], ["Sprint", "Sprint"])
+        self.assertEqual([item["author"] for item in preview], ["Alpha", "Zulu"])
+        self.assertTrue(preview[0]["queued"])
+        self.assertEqual(preview[0]["queuedBy"], "racer@tronner")
+        self.assertEqual(preview[0]["queuedVia"], "server")
+        self.assertFalse(preview[1]["queued"])
 
     async def test_remove_deletes_only_the_first_repeated_queue_entry(self):
         controller, first, _ = queue_controller()
