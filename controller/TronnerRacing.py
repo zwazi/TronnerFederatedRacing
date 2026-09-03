@@ -6517,6 +6517,25 @@ class TronnerRacing:
             "checkpointMode": entry.checkpoint_mode,
         }
 
+    def _dashboard_current_map_metadata(self) -> dict[str, object]:
+        metadata = self._dashboard_map_metadata(self.current)
+        if not metadata or self.current is None:
+            return metadata
+        selection = dict(getattr(self, "current_map_selection", {}))
+        if selection.get("resourcePath") != self.current.key:
+            selection = {}
+        metadata.update({
+            "queued": bool(selection.get("queued", False)),
+            "queuedBy": plain_console_text(
+                selection.get("queuedBy", "")
+            ).strip()[:128],
+            "queuedVia": clean_console_text(
+                selection.get("queuedVia", "rotation")
+            )[:32] or "rotation",
+            "queuedAt": max(0, int(selection.get("queuedAt", 0) or 0)),
+        })
+        return metadata
+
     def _remember_previous_map(self, entry: MapEntry | None) -> None:
         metadata = self._dashboard_map_metadata(entry)
         if not metadata:
@@ -6570,7 +6589,7 @@ class TronnerRacing:
         local_players, _ = self._dashboard_players()
         now = time.time()
         time_left = max(0, int((self.deadline_epoch or now) - now))
-        map_metadata = self._dashboard_map_metadata(self.current)
+        map_metadata = self._dashboard_current_map_metadata()
         current_records = self.store.records(map_records_key(self.current)) if self.current else []
         replay_player_ids = self.store.dashboard_replay_player_ids(
             map_records_key(self.current)
