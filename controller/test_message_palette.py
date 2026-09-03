@@ -3,16 +3,19 @@ import unittest
 
 from TronnerRacing import (
     COLOR_BORDER,
+    COLOR_COMMAND,
     COLOR_DATA,
     COLOR_NAME_HEADER,
     COLOR_RANK_HEADER,
     COLOR_RESET,
+    COLOR_TITLE,
     COLOR_TIME_HEADER,
     COLOR_TURNS_HEADER,
     Player,
     TronnerRacing,
     build_help_lines,
     build_leaderboard_table,
+    format_final_countdown_rating_message,
     plain_console_text,
     style_console_message,
 )
@@ -94,6 +97,30 @@ class MessagePaletteTests(unittest.IsolatedAsyncioTestCase):
         )
         visible_widths = {len(plain_console_text(line)) for line in lines}
         self.assertEqual(len(visible_widths), 1)
+
+    def test_countdown_rating_uses_full_command_and_rating_focus_colors(self):
+        styled = style_console_message(
+            format_final_countdown_rating_message((4.25, 2))
+        )
+
+        self.assertEqual(
+            plain_console_text(styled),
+            "Current rating: 4.2/5 (2 ratings). "
+            "Use /rate # for the current map or /rate [map] # "
+            "for a specific map.",
+        )
+        self.assertIn(
+            f"{COLOR_TITLE}Current rating: 4.2/5 (2 ratings).{COLOR_RESET}",
+            styled,
+        )
+        self.assertIn(f"{COLOR_COMMAND}/rate #{COLOR_RESET}", styled)
+        self.assertIn(
+            f"{COLOR_COMMAND}/rate [map] #{COLOR_RESET}", styled
+        )
+        self.assertIn(f"{COLOR_RESET} Use ", styled)
+        self.assertIn(f"{COLOR_RESET} for the current map or ", styled)
+        self.assertIn(f"{COLOR_RESET} for a specific map.", styled)
+        self.assertNotIn(f"{COLOR_COMMAND}/rate{COLOR_RESET} #", styled)
 
     async def test_all_message_routes_use_only_real_color_codes(self):
         controller = object.__new__(TronnerRacing)

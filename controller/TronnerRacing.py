@@ -891,6 +891,23 @@ def final_countdown_seconds(records: Sequence[Record]) -> float:
     return records[0].best_seconds * 1.5 if records else 90.0
 
 
+def format_final_countdown_rating_message(
+    rating_summary: tuple[float, int] | None,
+) -> str:
+    rating_text = (
+        f"Current rating: {rating_summary[0]:.1f}/5 "
+        f"({rating_summary[1]} "
+        f"{'rating' if rating_summary[1] == 1 else 'ratings'})."
+        if rating_summary
+        else "Current rating: unrated."
+    )
+    return (
+        f"{COLOR_TITLE}{rating_text}{COLOR_RESET} "
+        f"Use {COLOR_COMMAND}/rate #{COLOR_RESET} for the current map or "
+        f"{COLOR_COMMAND}/rate [map] #{COLOR_RESET} for a specific map."
+    )
+
+
 def map_play_seconds(
     records: Sequence[Record],
     maximum_seconds: float = 300.0,
@@ -5671,10 +5688,19 @@ class TronnerRacing:
         self.store.set_json("final_countdown_end_epoch", None)
         self.store.set_json("final_countdown_map_key", None)
 
+    async def broadcast_messages(self, *messages: str) -> None:
+        commands = []
+        for message in messages:
+            styled = style_console_message(message)
+            if styled:
+                commands.append(
+                    f"CONSOLE_MESSAGE {readline_console_text(styled)}"
+                )
+        if commands:
+            await self.sink.send(*commands)
 
     async def broadcast(self, message: str) -> None:
-        styled = style_console_message(message)
-        await self.sink.send(f"CONSOLE_MESSAGE {readline_console_text(styled)}")
+        await self.broadcast_messages(message)
 
     async def result_message(self, message: str) -> None:
         """Deliver race-result chatter only to players who opted in."""
@@ -9613,19 +9639,10 @@ class TronnerRacing:
             )
             self.final_countdown_announcement = None
             rating_summary = self.store.rating_summary(self.current.rating_key)
-            rating_text = (
-                f"Current rating: {rating_summary[0]:.1f}/5 "
-                f"({rating_summary[1]} "
-                f"{'rating' if rating_summary[1] == 1 else 'ratings'})."
-                if rating_summary
-                else "Current rating: unrated."
-            )
-            await self.broadcast(
+            await self.broadcast_messages(
                 f"{announcement} Respawning is disabled. "
-                f"Final countdown: {math.ceil(duration)} seconds. "
-                f"{rating_text} "
-                "Use /rate # for the current map or /rate [map] # "
-                "for a specific map."
+                f"Final countdown: {math.ceil(duration)} seconds.",
+                format_final_countdown_rating_message(rating_summary),
             )
             LOG.info(
                 "final countdown map=%s duration=%.3f record=%s",
