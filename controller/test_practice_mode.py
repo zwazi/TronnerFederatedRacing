@@ -256,6 +256,43 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("FREEZE_PLAYER racer 3", controller.sink.commands)
         await cancel_tasks(controller)
 
+    async def test_native_zone_protection_uses_practice_respawn_commands(self):
+        controller, player = practice_controller("countdown")
+        controller.config["practice_deathzone_protection_enabled"] = True
+        player.alive = False
+        player.practice_mode = "maintain"
+        player.practice_map_key = controller.current.key
+        controller._prepare_practice_respawn(
+            player, 5, 10, 20, 0, 1, speed=31.5, turns=8
+        )
+
+        await controller._respawn_player(player)
+
+        self.assertEqual(
+            controller.sink.commands[:2],
+            [
+                "RESPAWN_PLAYER_PRACTICE_HELD racer false 10 20 0 1 31.5 8",
+                "FREEZE_PLAYER racer 7",
+            ],
+        )
+        await cancel_tasks(controller)
+
+        controller, player = practice_controller("immediate")
+        controller.config["practice_deathzone_protection_enabled"] = True
+        player.alive = False
+        player.practice_mode = "reset"
+        player.practice_map_key = controller.current.key
+        controller._prepare_practice_respawn(
+            player, 5, 10, 20, 0, 1, speed=31.5, turns=8
+        )
+
+        await controller._respawn_player(player)
+
+        self.assertIn(
+            "RESPAWN_PLAYER_PRACTICE racer false 10 20 0 1 0 8",
+            controller.sink.commands,
+        )
+
     async def test_respawn_start_mode_waits_for_manual_start(self):
         controller, player = practice_controller("respawn")
         player.alive = False
@@ -375,6 +412,12 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             'sg_WriteCycleReplayState(this, "death", se_GameTime())',
             engine_patch,
+        )
+        self.assertIn("RESPAWN_PLAYER_PRACTICE", engine_patch)
+        self.assertIn("sg_IsPracticeDeathZoneProtected", engine_patch)
+        self.assertIn("gDeathZoneHack::OnExit", engine_patch)
+        self.assertIn(
+            "PRACTICE_DEATHZONE_PROTECTION_TIME 1.0", server_config
         )
         self.assertIn(" /practice ", server_config)
 

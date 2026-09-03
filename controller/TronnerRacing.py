@@ -8294,6 +8294,16 @@ class TronnerRacing:
         countdown_seconds = player.start_countdown_seconds
         player.pending_start_mode = start_mode
         speed = snapshot.speed if player.practice_mode == "maintain" else 0.0
+        zone_protection = bool(
+            self.config.get(
+                "practice_deathzone_protection_enabled", False
+            )
+        )
+        respawn_command = (
+            "RESPAWN_PLAYER_PRACTICE"
+            if zone_protection
+            else "RESPAWN_PLAYER_CHECKPOINT"
+        )
         spawn_arguments = (
             f"{player.target} false {snapshot.x:.9g} {snapshot.y:.9g} "
             f"{snapshot.xdir:.9g} {snapshot.ydir:.9g} "
@@ -8302,19 +8312,24 @@ class TronnerRacing:
         if start_mode in {"immediate", "respawn"}:
             await self.sink.send(
                 *reset_commands,
-                f"RESPAWN_PLAYER_CHECKPOINT {spawn_arguments}",
+                f"{respawn_command} {spawn_arguments}",
             )
             return
+        held_respawn_command = (
+            "RESPAWN_PLAYER_PRACTICE_HELD"
+            if zone_protection
+            else "RESPAWN_PLAYER_CHECKPOINT_HELD"
+        )
         if start_mode == "countdown":
             await self.sink.send(
                 *reset_commands,
-                f"RESPAWN_PLAYER_CHECKPOINT_HELD {spawn_arguments}",
+                f"{held_respawn_command} {spawn_arguments}",
                 f"FREEZE_PLAYER {player.target} {countdown_seconds}",
             )
         else:
             await self.sink.send(
                 *reset_commands,
-                f"RESPAWN_PLAYER_CHECKPOINT_HELD {spawn_arguments}",
+                f"{held_respawn_command} {spawn_arguments}",
             )
         old_task = self.freeze_tasks.pop(id(player), None)
         if old_task:

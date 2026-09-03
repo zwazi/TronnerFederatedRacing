@@ -232,6 +232,7 @@ def render(cluster: dict[str, Any], node: dict[str, Any], *, production: bool) -
         "checkpoint_double_respawn_seconds": 1.5,
         "practice_probe_interval_seconds": 0.25,
         "practice_max_rewind_seconds": 300,
+        "practice_deathzone_protection_enabled": True,
         "go_message_seconds": 1.0,
         "final_countdown_idle_seconds": 10,
         "final_countdown_progress_guard_enabled": True,
