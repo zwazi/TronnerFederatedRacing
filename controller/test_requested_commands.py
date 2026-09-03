@@ -6,6 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from TronnerRacing import (
+    COLOR_COMMAND,
+    COLOR_RESET,
+    COLOR_TITLE,
     Player,
     StateStore,
     TronnerRacing,
@@ -155,16 +158,32 @@ class RequestedBehaviorTests(unittest.IsolatedAsyncioTestCase):
             controller.activate_next_map = activate
             try:
                 await controller._run_final_countdown()
-                self.assertIn(
+                plain_commands = [
+                    plain_console_text(command)
+                    for command in controller.sink.commands
+                ]
+                countdown_index = plain_commands.index(
                     "CONSOLE_MESSAGE Map time expired. "
-                    "Respawning is disabled. Final countdown: 90 seconds. "
+                    "Respawning is disabled. Final countdown: 90 seconds."
+                )
+                self.assertEqual(
+                    plain_commands[countdown_index + 1],
+                    "CONSOLE_MESSAGE "
                     "Current rating: unrated. "
                     "Use /rate # for the current map or /rate [map] # "
                     "for a specific map.",
-                    [
-                        plain_console_text(command)
-                        for command in controller.sink.commands
-                    ],
+                )
+                rating_command = controller.sink.commands[countdown_index + 1]
+                self.assertIn(
+                    f"{COLOR_TITLE}Current rating: unrated.{COLOR_RESET}",
+                    rating_command,
+                )
+                self.assertIn(
+                    f"{COLOR_COMMAND}/rate #{COLOR_RESET}", rating_command
+                )
+                self.assertIn(
+                    f"{COLOR_COMMAND}/rate [map] #{COLOR_RESET}",
+                    rating_command,
                 )
                 self.assertEqual(
                     reasons, ["all racers finished final countdown"]
@@ -212,12 +231,19 @@ class RequestedBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(controller._run_final_countdown(), timeout=0.2)
                 await asyncio.wait_for(route_started.wait(), timeout=0.2)
                 self.assertFalse(release_route.is_set())
-                self.assertIn(
+                plain_commands = [
+                    plain_console_text(command)
+                    for command in controller.sink.commands
+                ]
+                countdown_index = plain_commands.index(
                     "CONSOLE_MESSAGE Map time expired. Respawning is disabled. "
-                    "Final countdown: 90 seconds. Current rating: unrated. "
+                    "Final countdown: 90 seconds."
+                )
+                self.assertEqual(
+                    plain_commands[countdown_index + 1],
+                    "CONSOLE_MESSAGE Current rating: unrated. "
                     "Use /rate # for the current map or /rate [map] # "
                     "for a specific map.",
-                    [plain_console_text(command) for command in controller.sink.commands],
                 )
                 self.assertEqual(reasons, ["all racers finished final countdown"])
             finally:
