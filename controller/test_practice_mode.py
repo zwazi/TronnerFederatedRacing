@@ -384,6 +384,27 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.speed, 42.25)
         self.assertEqual(snapshot.turns, 9)
 
+    def test_replay_capture_uses_the_leaderboard_record_key(self):
+        controller, _player = practice_controller()
+        controller.current = MapEntry(
+            "Author/maps/Practice-v1.aamap.xml",
+            "Practice",
+            "Author",
+            "1",
+            "maps",
+            "Practice-v1.aamap.xml",
+            Path("Practice-v1.aamap.xml"),
+            (SpawnPoint(3, 4, 0, 1),),
+            record_key="stable-record-key",
+        )
+
+        controller._handle_replay_begin("token racer 10 12 34 0 1 27.5 6")
+
+        self.assertEqual(
+            controller.replay_captures["token"].resource_key,
+            "stable-record-key",
+        )
+
     def test_map_transition_disables_practice(self):
         controller, player = practice_controller()
         player.practice_mode = "reset"
