@@ -7,6 +7,7 @@ from live_dashboard import (
     history_document_id,
     leaderboard_document_id,
     map_leaderboard,
+    map_rating_entries,
     map_rating_fields,
     overall_leaderboard,
 )
@@ -134,6 +135,23 @@ class LiveDashboardTest(unittest.TestCase):
             map_rating_fields({"rating": 4.333333, "ratingCount": 3}),
             {"rating": 4.3333, "ratingCount": 3},
         )
+
+    def test_individual_rating_entries_are_sanitized_and_bounded(self):
+        self.assertEqual(map_rating_entries({"ratings": [{
+            "playerId": "a" * 24,
+            "name": "Racer",
+            "authenticated": True,
+            "racingProfile": True,
+            "rating": 4,
+            "ratedAt": 123000,
+        }, {"playerId": "unsafe", "rating": 8, "ratedAt": 0}]}), [{
+            "playerId": "a" * 24,
+            "name": "Racer",
+            "authenticated": True,
+            "racingProfile": True,
+            "rating": 4,
+            "ratedAt": 123000,
+        }])
         self.assertEqual(
             map_rating_fields({"rating": None, "ratingCount": 0}),
             {"rating": None, "ratingCount": 0},
@@ -195,6 +213,48 @@ class LiveDashboardTest(unittest.TestCase):
             "entryCount": 0,
             "record": None,
         }])
+        leaderboard = next(
+            payload for collection, document_id, payload in firebase.documents
+            if collection == "racingLeaderboards"
+            and document_id == leaderboard_document_id("map-unfinished")
+        )
+        self.assertEqual(leaderboard["entries"], [])
+        self.assertEqual(leaderboard["rating"], 4.5)
+
+    def test_rating_command_poll_and_updates_are_bounded(self):
+        publisher = FirebaseLiveDashboardPublisher(
+            FakeFirebase(), "https://example.firebaseio.com", FakeStore()
+        )
+        calls = []
+
+        def request(path, method, value=None, *, query=None):
+            calls.append((path, method, value, query))
+            return {
+                "later": {"state": "queued", "requestedAt": 20},
+                "ignored": {"state": "running", "requestedAt": 1},
+                "first": {"state": "queued", "requestedAt": 10},
+            } if method == "GET" else None
+
+        publisher._rtdb = request
+        commands = publisher.queued_rating_commands("nyc1", 500)
+        self.assertEqual([command_id for command_id, _ in commands], ["first", "later"])
+        self.assertEqual(calls[0], (
+            "racing/ratingCommands/nyc1",
+            "GET",
+            None,
+            {
+                "orderBy": json.dumps("state"),
+                "equalTo": json.dumps("queued"),
+                "limitToFirst": "20",
+            },
+        ))
+        publisher.update_rating_command(
+            "nyc1", "first", "succeeded", result="Rated map 4/5."
+        )
+        self.assertEqual(calls[1][0:2], (
+            "racing/ratingCommands/nyc1/first", "PATCH"
+        ))
+        self.assertEqual(calls[1][2]["state"], "succeeded")
 
     def test_chat_retention_uses_shallow_global_keys(self):
         publisher = FirebaseLiveDashboardPublisher(
