@@ -73,6 +73,26 @@ async def cancel_player_tasks(controller, player):
 
 
 class StartModeTests(unittest.IsolatedAsyncioTestCase):
+    def test_engine_uses_stock_brake_protocol_without_decay_override(self):
+        root = Path(__file__).resolve().parents[1]
+        engine_patch = (root / "engine/patches/tronner-racing.patch").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('"RESPAWN_PLAYER_BRAKED"', engine_patch)
+        self.assertIn('"RESPAWN_PLAYER_CHECKPOINT_BRAKED"', engine_patch)
+        self.assertIn('"RESPAWN_PLAYER_PRACTICE_BRAKED"', engine_patch)
+        start_braked = engine_patch.split(
+            "+void gCycle::StartBraked(REAL releaseAfterSeconds)", 1
+        )[1].split("+void gCycle::RestoreCheckpointState", 1)[0]
+        self.assertIn("+    braking = 1;", start_braked)
+        self.assertIn("+    startBrakeReleaseSpeed_ = verletSpeed_;", start_braked)
+        self.assertNotIn("sg_AcquireClientZeroAcceleration", start_braked)
+        self.assertIn(
+            "a pre-brake turn must stay held",
+            engine_patch,
+        )
+
     async def test_brake_mode_clears_prompt_without_showing_go(self):
         controller, player = start_controller("brake")
 
@@ -80,8 +100,15 @@ class StartModeTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         self.assertIn(
-            "RESPAWN_PLAYER_HELD racer false 3 4 0 1",
+            "RESPAWN_PLAYER_BRAKED racer false 3 4 0 1",
             controller.sink.commands,
+        )
+        self.assertFalse(
+            any(
+                command.startswith("RESPAWN_PLAYER_HELD")
+                or command.startswith("FREEZE_PLAYER")
+                for command in controller.sink.commands
+            )
         )
         self.assertIn(
             'CENTER_PLAYER_MESSAGE racer "Press brake to start"',
@@ -133,12 +160,12 @@ class StartModeTests(unittest.IsolatedAsyncioTestCase):
         await controller._respawn_player(player)
         await asyncio.sleep(0)
 
-        self.assertEqual(
-            controller.sink.commands[:2],
-            [
-                "RESPAWN_PLAYER_HELD racer false 3 4 0 1",
-                "FREEZE_PLAYER racer 3",
-            ],
+        self.assertIn(
+            "RESPAWN_PLAYER_BRAKED racer false 3 4 0 1 3",
+            controller.sink.commands,
+        )
+        self.assertFalse(
+            any(command.startswith("FREEZE_PLAYER") for command in controller.sink.commands)
         )
         self.assertIn(
             'CENTER_PLAYER_MESSAGE racer "3"',
@@ -188,11 +215,7 @@ class StartModeTests(unittest.IsolatedAsyncioTestCase):
             {player.identity_key: "countdown 7"},
         )
         self.assertIn(
-            "RESPAWN_PLAYER_HELD racer false 3 4 0 1",
-            controller.sink.commands,
-        )
-        self.assertIn(
-            "FREEZE_PLAYER racer 7",
+            "RESPAWN_PLAYER_BRAKED racer false 3 4 0 1 7",
             controller.sink.commands,
         )
         self.assertIn(
