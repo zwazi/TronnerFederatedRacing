@@ -2975,6 +2975,33 @@ class StateStore:
             if row[1] is not None and int(row[2]) > 0
         }
 
+    def rating_entries_by_map(
+        self, per_map_limit: int = 500
+    ) -> dict[str, list[dict[str, object]]]:
+        """Return bounded current submissions for public per-map display."""
+        limit = max(1, min(int(per_map_limit), 500))
+        rows = self.current_connection().execute(
+            "WITH ranked AS ("
+            "SELECT map_key, identity_key, username, authenticated, rating, rated_at, "
+            "ROW_NUMBER() OVER (PARTITION BY map_key "
+            "ORDER BY rated_at DESC, identity_key ASC) AS position "
+            "FROM ratings) "
+            "SELECT map_key, identity_key, username, authenticated, rating, rated_at "
+            "FROM ranked WHERE position <= ? ORDER BY map_key, rated_at DESC",
+            (limit,),
+        ).fetchall()
+        result: dict[str, list[dict[str, object]]] = collections.defaultdict(list)
+        for map_key, identity_key, username, authenticated, rating, rated_at in rows:
+            result[str(map_key)].append({
+                "playerId": public_player_id(str(identity_key)),
+                "name": str(username)[:128],
+                "authenticated": bool(authenticated),
+                "racingProfile": str(identity_key).startswith("auth:"),
+                "rating": int(rating),
+                "ratedAt": int(float(rated_at) * 1000),
+            })
+        return dict(result)
+
     def rating_for(self, map_key: str, identity_key: str) -> int | None:
         row = self.connection.execute(
             "SELECT rating FROM ratings WHERE map_key=? AND identity_key=?",
@@ -2985,21 +3012,58 @@ class StateStore:
     def set_rating(
         self, map_key: str, player: Player, rating: int
     ) -> tuple[int | None, bool]:
+        return self.set_rating_identity(
+            map_key,
+            player.identity_key,
+            player.record_name,
+            bool(player.auth_name),
+            rating,
+        )
+
+    def set_rating_identity(
+        self,
+        map_key: str,
+        identity_key: str,
+        username: str,
+        authenticated: bool,
+        rating: int,
+        *,
+        rated_at: float | None = None,
+    ) -> tuple[int | None, bool]:
         if not 1 <= rating <= 5:
             raise ValueError("rating must be between 1 and 5")
-        previous = self.rating_for(map_key, player.identity_key)
-        now = time.time()
+        if (
+            not map_key
+            or len(map_key) > 1024
+            or not identity_key
+            or len(identity_key) > 512
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in map_key + identity_key
+            )
+        ):
+            raise ValueError("invalid rating identity")
+        clean_username = "".join(
+            " " if ord(character) < 32 or ord(character) == 127 else character
+            for character in str(username)
+        ).strip()[:128]
+        if not clean_username:
+            clean_username = "Racer"
+        previous = self.rating_for(map_key, identity_key)
+        now = time.time() if rated_at is None else float(rated_at)
+        if not math.isfinite(now) or now <= 0:
+            raise ValueError("invalid rating timestamp")
         if previous == rating:
             with self.connection:
                 self.connection.execute(
                     "UPDATE ratings SET username=?, authenticated=?, rated_at=? "
                     "WHERE map_key=? AND identity_key=?",
                     (
-                        player.record_name,
-                        int(bool(player.auth_name)),
+                        clean_username,
+                        int(bool(authenticated)),
                         now,
                         map_key,
-                        player.identity_key,
+                        identity_key,
                     ),
                 )
             return previous, False
@@ -3018,9 +3082,9 @@ class StateStore:
                 "rated_at=excluded.rated_at",
                 (
                     map_key,
-                    player.identity_key,
-                    player.record_name,
-                    int(bool(player.auth_name)),
+                    identity_key,
+                    clean_username,
+                    int(bool(authenticated)),
                     rating,
                     previous,
                     now,
@@ -4683,6 +4747,7 @@ class TronnerRacing:
         self._live_dashboard_tasks: set[asyncio.Task] = set()
         self.live_dashboard: FirebaseLiveDashboardPublisher | None = None
         self.live_dashboard_chat: FirebaseLiveDashboardPublisher | None = None
+        self.live_dashboard_refresh_requested = False
         if (
             isinstance(live_config, dict)
             and live_config.get("enabled") is True
@@ -7439,8 +7504,141 @@ class TronnerRacing:
             except TimeoutError:
                 pass
 
+    def _apply_website_rating_command(
+        self, command: dict[str, object]
+    ) -> str:
+        if int(command.get("schemaVersion", 0) or 0) != 1:
+            raise ValueError("Unsupported rating-command version.")
+        rating_key = unicodedata.normalize(
+            "NFKC", str(command.get("ratingKey", ""))
+        ).strip()
+        active_rating_keys = {
+            entry.rating_key for entry in self.repository.catalog.values()
+        }
+        if rating_key not in active_rating_keys:
+            raise ValueError("That map is no longer available to rate.")
+        try:
+            rating = int(command.get("rating", 0))
+            requested_at_ms = int(command.get("requestedAt", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("The rating command is malformed.") from exc
+        if not 1 <= rating <= 5:
+            raise ValueError("Choose a rating from 1 to 5.")
+        now_ms = int(time.time() * 1000)
+        if (
+            requested_at_ms < now_ms - 10 * 60 * 1000
+            or requested_at_ms > now_ms + 60 * 1000
+        ):
+            raise ValueError("The rating command has expired.")
+        website_uid = str(command.get("websiteUid", ""))
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", website_uid):
+            raise ValueError("The website account identity is invalid.")
+        display_name = unicodedata.normalize(
+            "NFKC", str(command.get("displayName", ""))
+        ).strip()
+        game_username = unicodedata.normalize(
+            "NFKC", str(command.get("gameUsername", ""))
+        ).strip()
+        if (
+            len(display_name) > 40
+            or len(game_username) > 64
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in display_name + game_username
+            )
+        ):
+            raise ValueError("The rating account name is invalid.")
+        website_identity = f"web:{website_uid}"
+        if game_username:
+            identity_key = f"auth:{game_username.casefold()}"
+            username = game_username
+            if identity_key != website_identity:
+                self.store.revoke_rating(rating_key, website_identity)
+        else:
+            identity_key = website_identity
+            username = display_name or "Racer"
+        self.store.set_rating_identity(
+            rating_key,
+            identity_key,
+            username,
+            True,
+            rating,
+            rated_at=requested_at_ms / 1000.0,
+        )
+        self.live_dashboard_refresh_requested = True
+        return f"Rated map {rating}/5."
+
+    async def website_rating_worker(self) -> None:
+        dashboard = self.live_dashboard
+        if dashboard is None:
+            return
+        server_id = self.server_id
+        next_prune = 0.0
+        while not self.stop_event.is_set():
+            try:
+                commands = await asyncio.to_thread(
+                    dashboard.queued_rating_commands, server_id
+                )
+                for command_id, command in commands:
+                    expires_at = int(command.get("expiresAt", 0) or 0)
+                    if expires_at <= int(time.time() * 1000):
+                        await asyncio.to_thread(
+                            dashboard.update_rating_command,
+                            server_id,
+                            command_id,
+                            "expired",
+                            result="Rating expired before it could be applied.",
+                        )
+                        continue
+                    await asyncio.to_thread(
+                        dashboard.update_rating_command,
+                        server_id,
+                        command_id,
+                        "running",
+                        result="Rating accepted by the server.",
+                    )
+                    try:
+                        result = self._apply_website_rating_command(command)
+                    except Exception as exc:
+                        LOG.warning(
+                            "website rating failed: server=%s id=%s error=%s",
+                            server_id,
+                            command_id,
+                            exc,
+                        )
+                        await asyncio.to_thread(
+                            dashboard.update_rating_command,
+                            server_id,
+                            command_id,
+                            "failed",
+                            result=str(exc),
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            dashboard.update_rating_command,
+                            server_id,
+                            command_id,
+                            "succeeded",
+                            result=result,
+                        )
+                monotonic_now = time.monotonic()
+                if monotonic_now >= next_prune:
+                    await asyncio.to_thread(
+                        dashboard.prune_rating_commands, server_id
+                    )
+                    next_prune = monotonic_now + 300.0
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("website rating worker failed")
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=2.0)
+            except TimeoutError:
+                pass
+
     def _dashboard_maps_by_record_key(self) -> dict[str, dict[str, object]]:
         ratings = self.store.rating_summaries()
+        rating_entries = self.store.rating_entries_by_map()
         return {
             map_records_key(entry): {
                 "mapId": entry.map_id,
@@ -7451,6 +7649,7 @@ class TronnerRacing:
                 "ratingKey": entry.rating_key,
                 "rating": ratings.get(entry.rating_key, (None, 0))[0],
                 "ratingCount": ratings.get(entry.rating_key, (None, 0))[1],
+                "ratings": rating_entries.get(entry.rating_key, []),
             }
             for entry in self.repository.catalog.values()
             if entry.storage_path
@@ -7493,7 +7692,8 @@ class TronnerRacing:
                         "y" if history_writes == 1 else "ies",
                     )
                 now = time.monotonic()
-                if now >= next_leaderboards:
+                if now >= next_leaderboards or self.live_dashboard_refresh_requested:
+                    self.live_dashboard_refresh_requested = False
                     rows = self.store.dashboard_record_rows()
                     maps = self._dashboard_maps_by_record_key()
                     writes = await asyncio.to_thread(
@@ -13352,6 +13552,10 @@ class TronnerRacing:
             asyncio.create_task(
                 self.server_management_worker(),
                 name="server-management",
+            ),
+            asyncio.create_task(
+                self.website_rating_worker(),
+                name="website-rating",
             ),
             asyncio.create_task(
                 self.follow_server_console(),

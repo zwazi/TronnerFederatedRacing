@@ -46,6 +46,10 @@ class MapRatingStoreTests(unittest.TestCase):
             self.assertEqual(store.rating_average("map"), 4.0)
             self.assertEqual(store.rating_summary("map"), (4.0, 1))
             self.assertEqual(store.rating_summaries(), {"map": (4.0, 1)})
+            entries = store.rating_entries_by_map()
+            self.assertEqual(entries["map"][0]["rating"], 4)
+            self.assertEqual(entries["map"][0]["name"], "Racer")
+            self.assertFalse(entries["map"][0]["racingProfile"])
             second = Player("second", "Second")
             self.assertEqual(store.set_rating("map", second, 2), (None, True))
             self.assertEqual(store.rating_summaries(), {"map": (3.0, 2)})
@@ -67,8 +71,64 @@ class MapRatingStoreTests(unittest.TestCase):
             self.assertIsNone(store.rating_for("map", player.identity_key))
             store.close()
 
+    def test_website_identity_setter_is_stable_and_timestamped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            self.assertEqual(
+                store.set_rating_identity(
+                    "map", "web:account", "Web Racer", True, 3, rated_at=123.5
+                ),
+                (None, True),
+            )
+            self.assertEqual(
+                store.set_rating_identity(
+                    "map", "web:account", "Web Racer", True, 3, rated_at=124.5
+                ),
+                (3, False),
+            )
+            entry = store.rating_entries_by_map()["map"][0]
+            self.assertEqual(entry["ratedAt"], 124500)
+            self.assertFalse(entry["racingProfile"])
+            store.close()
+
 
 class MapRatingCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_website_vote_updates_linked_game_vote_without_duplication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = object.__new__(TronnerRacing)
+            controller.store = StateStore(Path(tmp) / "state.sqlite3")
+            controller.repository = SimpleNamespace(catalog={"map": current_map()})
+            controller.live_dashboard_refresh_requested = False
+            controller.store.set_rating_identity(
+                current_map().rating_key,
+                "web:website-user",
+                "Web Racer",
+                True,
+                2,
+            )
+            now = __import__("time").time()
+            result = controller._apply_website_rating_command({
+                "schemaVersion": 1,
+                "ratingKey": current_map().rating_key,
+                "rating": 5,
+                "websiteUid": "website-user",
+                "displayName": "Web Racer",
+                "gameUsername": "Racer",
+                "requestedAt": int(now * 1000),
+            })
+            self.assertEqual(result, "Rated map 5/5.")
+            self.assertIsNone(
+                controller.store.rating_for(
+                    current_map().rating_key, "web:website-user"
+                )
+            )
+            self.assertEqual(
+                controller.store.rating_for(current_map().rating_key, "auth:racer"),
+                5,
+            )
+            self.assertTrue(controller.live_dashboard_refresh_requested)
+            controller.store.close()
+
     async def test_rate_announces_and_undo_revoke_apply_to_current_map(self):
         with tempfile.TemporaryDirectory() as tmp:
             controller = object.__new__(TronnerRacing)

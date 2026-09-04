@@ -26,6 +26,9 @@ OVERALL_ENTRY_LIMIT = 100
 HISTORY_ENTRY_LIMIT = 2500
 ADMIN_COMMAND_LIMIT = 10
 ADMIN_HISTORY_LIMIT = 200
+RATING_COMMAND_LIMIT = 20
+RATING_HISTORY_LIMIT = 200
+RATING_ENTRY_LIMIT = 500
 ADMIN_CONSOLE_BATCH_LIMIT = 12
 ADMIN_AUDIT_LIMIT = 1000
 LOG = logging.getLogger("TronnerRacing.live_dashboard")
@@ -88,6 +91,35 @@ def map_rating_fields(metadata: dict[str, object]) -> dict[str, object]:
     if not math.isfinite(rating) or not 1 <= rating <= 5 or count < 1:
         return {"rating": None, "ratingCount": 0}
     return {"rating": round(rating, 4), "ratingCount": count}
+
+
+def map_rating_entries(metadata: dict[str, object]) -> list[dict[str, object]]:
+    result = []
+    supplied = metadata.get("ratings", [])
+    if not isinstance(supplied, list):
+        return result
+    for entry in supplied[:RATING_ENTRY_LIMIT]:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            rating = int(entry.get("rating", 0))
+            rated_at = int(entry.get("ratedAt", 0))
+        except (TypeError, ValueError):
+            continue
+        player_id = str(entry.get("playerId", ""))
+        if not 1 <= rating <= 5 or rated_at <= 0 or not re.fullmatch(
+            r"[0-9a-f]{24}", player_id
+        ):
+            continue
+        result.append({
+            "playerId": player_id,
+            "name": str(entry.get("name", "Racer"))[:128] or "Racer",
+            "authenticated": bool(entry.get("authenticated")),
+            "racingProfile": bool(entry.get("racingProfile")),
+            "rating": rating,
+            "ratedAt": rated_at,
+        })
+    return result
 
 
 def public_player_id(identity_key: str) -> str:
@@ -458,6 +490,86 @@ class FirebaseLiveDashboardPublisher:
             )
         return len(expired)
 
+    def queued_rating_commands(
+        self,
+        server_id: str,
+        limit: int = RATING_COMMAND_LIMIT,
+    ) -> list[tuple[str, dict[str, object]]]:
+        """Read the bounded website-rating command queue for one authority."""
+        server = re.sub(r"[^A-Za-z0-9_-]", "_", server_id)[:64]
+        if not server:
+            return []
+        result = self._rtdb(
+            f"racing/ratingCommands/{server}",
+            "GET",
+            query={
+                "orderBy": json.dumps("state"),
+                "equalTo": json.dumps("queued"),
+                "limitToFirst": str(
+                    max(1, min(int(limit), RATING_COMMAND_LIMIT))
+                ),
+            },
+        )
+        if not isinstance(result, dict):
+            return []
+        commands = [
+            (str(command_id), command)
+            for command_id, command in result.items()
+            if isinstance(command, dict) and command.get("state") == "queued"
+        ]
+        return sorted(commands, key=lambda item: (
+            int(item[1].get("requestedAt", 0) or 0), item[0]
+        ))[:RATING_COMMAND_LIMIT]
+
+    def update_rating_command(
+        self,
+        server_id: str,
+        command_id: str,
+        state: str,
+        *,
+        result: str = "",
+    ) -> None:
+        server = re.sub(r"[^A-Za-z0-9_-]", "_", server_id)[:64]
+        command = re.sub(r"[^A-Za-z0-9_-]", "_", command_id)[:128]
+        if not server or not command or state not in {
+            "running", "succeeded", "failed", "expired"
+        }:
+            raise ValueError("invalid rating command update")
+        now_ms = int(time.time() * 1000)
+        payload = {
+            "state": state,
+            "result": str(result)[:1000],
+            "updatedAt": now_ms,
+            "startedAt" if state == "running" else "completedAt": now_ms,
+        }
+        self._rtdb(
+            f"racing/ratingCommands/{server}/{command}",
+            "PATCH",
+            payload,
+        )
+
+    def prune_rating_commands(
+        self,
+        server_id: str,
+        keep: int = RATING_HISTORY_LIMIT,
+    ) -> int:
+        server = re.sub(r"[^A-Za-z0-9_-]", "_", server_id)[:64]
+        if not server:
+            return 0
+        existing = self._rtdb(
+            f"racing/ratingCommands/{server}",
+            "GET",
+            query={"shallow": "true"},
+        )
+        keys = sorted(existing) if isinstance(existing, dict) else []
+        expired = keys[:-max(25, min(int(keep), RATING_HISTORY_LIMIT))]
+        for command_id in expired:
+            self._rtdb(
+                f"racing/ratingCommands/{server}/{command_id}",
+                "DELETE",
+            )
+        return len(expired)
+
     def publish_leaderboards(
         self,
         rows: list[dict[str, object]],
@@ -501,6 +613,7 @@ class FirebaseLiveDashboardPublisher:
                 "storagePath": str(metadata.get("storagePath", "")),
                 "ratingKey": str(metadata.get("ratingKey", "")),
                 **map_rating_fields(metadata),
+                "ratings": map_rating_entries(metadata),
                 "entryCount": len(map_rows),
                 "entries": entries,
             }
@@ -540,6 +653,21 @@ class FirebaseLiveDashboardPublisher:
             if map_key in grouped:
                 continue
             metadata = {**inferred_map_metadata(map_key), **supplied_metadata}
+            stable = {
+                "schemaVersion": SCHEMA_VERSION,
+                "mapKey": map_key,
+                "mapId": str(metadata.get("mapId", "")),
+                "name": str(metadata.get("name", "")),
+                "author": str(metadata.get("author", "")),
+                "version": str(metadata.get("version", "")),
+                "storagePath": str(metadata.get("storagePath", "")),
+                "ratingKey": str(metadata.get("ratingKey", "")),
+                **map_rating_fields(metadata),
+                "ratings": map_rating_entries(metadata),
+                "entryCount": 0,
+                "entries": [],
+            }
+            document_id = leaderboard_document_id(map_key)
             self.map_catalog[map_key] = {
                 "mapKey": map_key,
                 "mapId": str(metadata.get("mapId", "")),
@@ -553,6 +681,19 @@ class FirebaseLiveDashboardPublisher:
                 "entryCount": 0,
                 "record": None,
             }
+            digest = payload_hash(stable)
+            if self.leaderboard_hashes.get(document_id) != digest:
+                self.firebase.set_document("racingLeaderboards", document_id, {
+                    **stable,
+                    "payloadHash": digest,
+                    "updatedAt": FirestoreTimestamp(
+                        dt.datetime.now(dt.timezone.utc).isoformat().replace(
+                            "+00:00", "Z"
+                        )
+                    ),
+                })
+                self.leaderboard_hashes[document_id] = digest
+                writes += 1
 
         overall = overall_leaderboard(rows)
         stable_overall = {
