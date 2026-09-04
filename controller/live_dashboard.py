@@ -7,6 +7,7 @@ import datetime as dt
 import gzip
 import hashlib
 import json
+import logging
 import math
 import re
 import time
@@ -27,6 +28,7 @@ ADMIN_COMMAND_LIMIT = 10
 ADMIN_HISTORY_LIMIT = 200
 ADMIN_CONSOLE_BATCH_LIMIT = 12
 ADMIN_AUDIT_LIMIT = 1000
+LOG = logging.getLogger("TronnerRacing.live_dashboard")
 
 
 def _canonical(value: object) -> bytes:
@@ -181,6 +183,10 @@ class FirebaseLiveDashboardPublisher:
         self.profile_hashes = saved_profiles if isinstance(saved_profiles, dict) else {}
         saved_catalog = store.get_json("live_dashboard_map_catalog", {})
         self.map_catalog = saved_catalog if isinstance(saved_catalog, dict) else {}
+        saved_replay_maps = store.get_json("live_dashboard_replay_map_metadata_v2", {})
+        self.replay_map_metadata = (
+            saved_replay_maps if isinstance(saved_replay_maps, dict) else {}
+        )
         self.live_hash = ""
         self.live_written_at = 0.0
         self.event_writes: dict[str, int] = collections.defaultdict(int)
@@ -677,6 +683,106 @@ class FirebaseLiveDashboardPublisher:
         )
         return path
 
+    def _resolve_replay_map_metadata(
+        self, entries: list[dict[str, object]]
+    ) -> list[dict[str, object]]:
+        """Add the immutable map snapshot associated with every run revision."""
+        changed = False
+        resolved_entries = []
+        for original in entries:
+            entry = dict(original)
+            revision_id = str(entry.get("revisionId", "")).strip()
+            metadata = self.replay_map_metadata.get(revision_id, {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            storage_path = str(entry.get("mapStoragePath", "")).strip()
+            resource_path = str(entry.get("mapResourcePath", "")).strip()
+            if storage_path:
+                cached = {
+                    "storagePath": storage_path,
+                    "resourcePath": resource_path,
+                }
+                if revision_id and metadata != cached:
+                    self.replay_map_metadata[revision_id] = cached
+                    metadata = cached
+                    changed = True
+            elif revision_id and revision_id not in self.replay_map_metadata:
+                try:
+                    document = self.firebase.get_document(
+                        "mapSubmissions", revision_id
+                    )
+                    metadata = {
+                        "storagePath": str(document.get("storagePath", "")).strip(),
+                        "resourcePath": str(document.get("resourcePath", "")).strip(),
+                    }
+                    self.replay_map_metadata[revision_id] = metadata
+                    changed = True
+                except Exception as error:
+                    LOG.warning(
+                        "unable to resolve replay map revision %s: %s",
+                        revision_id,
+                        error,
+                    )
+            entry["mapStoragePath"] = storage_path or str(
+                metadata.get("storagePath", "")
+            )
+            entry["mapResourcePath"] = resource_path or str(
+                metadata.get("resourcePath", "")
+            )
+            resolved_entries.append(entry)
+        if changed:
+            self.store.set_json(
+                "live_dashboard_replay_map_metadata_v2",
+                self.replay_map_metadata,
+            )
+        return resolved_entries
+
+    def _publish_replay_histories(
+        self,
+        server_id: str,
+        affected: dict[tuple[str, str], dict[str, object]],
+    ) -> int:
+        now = FirestoreTimestamp(
+            dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+        writes = 0
+        for (identity_key, map_key), row in affected.items():
+            history = self.store.dashboard_player_map_history(
+                identity_key, map_key, HISTORY_ENTRY_LIMIT
+            )
+            entries = self._resolve_replay_map_metadata([
+                {
+                    key: value for key, value in entry.items()
+                    if key != "settingsRef"
+                } | {
+                    "replayPath": replay_storage_path(
+                        server_id, int(entry["runId"])
+                    )
+                }
+                for entry in history
+            ])
+            player_id = str(row["playerId"])
+            document_id = history_document_id(map_key, player_id, server_id)
+            stable = {
+                "schemaVersion": SCHEMA_VERSION,
+                "serverId": server_id,
+                "mapKey": map_key,
+                "mapId": str(row["mapId"]),
+                "revisionId": str(row["revisionId"]),
+                "playerId": player_id,
+                "name": str(row["username"])[:128],
+                "authenticated": bool(row["authenticated"]),
+                "entryCount": len(entries),
+                "entries": entries,
+            }
+            self.firebase.set_document("racingRunHistories", document_id, {
+                **stable,
+                "payloadHash": payload_hash(stable),
+                "updatedAt": now,
+            })
+            writes += 1
+        return writes
+
     def publish_replay_batch(self, server_id: str, limit: int = 40) -> int:
         """Publish new finished runs and exact-read per-player map histories."""
         cursor_key = f"live_dashboard_replay_cursor_{server_id}"
@@ -728,41 +834,37 @@ class FirebaseLiveDashboardPublisher:
             affected[(str(row["identityKey"]), str(row["mapKey"]))] = row
             published += 1
 
-        now = FirestoreTimestamp(
-            dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-        )
-        for (identity_key, map_key), row in affected.items():
-            history = self.store.dashboard_player_map_history(
-                identity_key, map_key, HISTORY_ENTRY_LIMIT
-            )
-            entries = [
-                {
-                    key: value for key, value in entry.items()
-                    if key != "settingsRef"
-                } | {
-                    "replayPath": replay_storage_path(server_id, int(entry["runId"]))
-                }
-                for entry in history
-            ]
-            player_id = str(row["playerId"])
-            document_id = history_document_id(map_key, player_id, server_id)
-            stable = {
-                "schemaVersion": SCHEMA_VERSION,
-                "serverId": server_id,
-                "mapKey": map_key,
-                "mapId": str(row["mapId"]),
-                "revisionId": str(row["revisionId"]),
-                "playerId": player_id,
-                "name": str(row["username"])[:128],
-                "authenticated": bool(row["authenticated"]),
-                "entryCount": len(entries),
-                "entries": entries,
-            }
-            self.firebase.set_document("racingRunHistories", document_id, {
-                **stable,
-                "payloadHash": payload_hash(stable),
-                "updatedAt": now,
-            })
+        self._publish_replay_histories(server_id, affected)
 
         self.store.set_json(cursor_key, max(int(row["runId"]) for row in rows))
         return published
+
+    def publish_replay_history_backfill_batch(
+        self, server_id: str, limit: int = 10
+    ) -> int:
+        """Refresh old history documents without rewriting immutable replays."""
+        cursor_key = f"live_dashboard_replay_history_backfill_v2_{server_id}"
+        cursor = self.store.get_json(cursor_key, {})
+        if not isinstance(cursor, dict):
+            cursor = {}
+        if cursor.get("complete") is True:
+            return 0
+        rows = self.store.dashboard_replay_history_groups_after(
+            str(cursor.get("mapKey", "")),
+            str(cursor.get("identityKey", "")),
+            limit,
+        )
+        if not rows:
+            self.store.set_json(cursor_key, {**cursor, "complete": True})
+            return 0
+        affected = {
+            (str(row["identityKey"]), str(row["mapKey"])): row for row in rows
+        }
+        writes = self._publish_replay_histories(server_id, affected)
+        last = rows[-1]
+        self.store.set_json(cursor_key, {
+            "mapKey": str(last["mapKey"]),
+            "identityKey": str(last["identityKey"]),
+            "complete": len(rows) < max(1, min(int(limit), 100)),
+        })
+        return writes

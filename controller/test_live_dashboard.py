@@ -69,6 +69,15 @@ class ReplayStore(FakeStore):
             "eventCount": 1, "settingsRef": 1, "mapId": "map", "revisionId": "rev"
         }]
 
+    def dashboard_replay_history_groups_after(self, map_key, identity_key, limit):
+        if map_key or identity_key:
+            return []
+        return [{
+            "identityKey": "auth:racer", "playerId": "player-id",
+            "username": "Racer", "authenticated": True,
+            "mapKey": "author/map-1.xml", "mapId": "map", "revisionId": "rev",
+        }]
+
 
 class ReplayFirebase:
     def __init__(self):
@@ -81,6 +90,14 @@ class ReplayFirebase:
 
     def set_document(self, collection, document_id, payload):
         self.documents.append((collection, document_id, payload))
+
+    def get_document(self, collection, document_id):
+        if collection != "mapSubmissions" or document_id != "rev":
+            raise AssertionError("unexpected replay map lookup")
+        return {
+            "storagePath": "_revisions/builder/rev/map.xml",
+            "resourcePath": "builder/map/rev/map.aamap.xml",
+        }
 
 
 class LiveDashboardTest(unittest.TestCase):
@@ -396,11 +413,42 @@ class LiveDashboardTest(unittest.TestCase):
         history = firebase.documents[0][2]
         self.assertNotIn("identityKey", history)
         self.assertEqual(history["entries"][0]["replayPath"], "_racing/replays/region-a/7.json.gz")
+        self.assertEqual(
+            history["entries"][0]["mapStoragePath"],
+            "_revisions/builder/rev/map.xml",
+        )
+        self.assertEqual(
+            history["entries"][0]["mapResourcePath"],
+            "builder/map/rev/map.aamap.xml",
+        )
         self.assertNotIn("settingsRef", history["entries"][0])
         self.assertEqual(store.saved["live_dashboard_replay_cursor_region-a"], 7)
 
         self.assertEqual(publisher.publish_replay_batch("region-a"), 0)
         self.assertEqual(len(firebase.objects), 2)
+
+    def test_replay_history_backfill_does_not_rewrite_replay_objects(self):
+        store = ReplayStore()
+        firebase = ReplayFirebase()
+        publisher = FirebaseLiveDashboardPublisher(
+            firebase, "https://example.firebaseio.com", store
+        )
+
+        self.assertEqual(
+            publisher.publish_replay_history_backfill_batch("region-a"), 1
+        )
+        self.assertEqual(firebase.objects, [])
+        self.assertEqual(firebase.documents[0][0], "racingRunHistories")
+        self.assertEqual(
+            firebase.documents[0][2]["entries"][0]["mapStoragePath"],
+            "_revisions/builder/rev/map.xml",
+        )
+        self.assertEqual(
+            publisher.publish_replay_history_backfill_batch("region-a"), 0
+        )
+        self.assertTrue(
+            store.saved["live_dashboard_replay_history_backfill_v2_region-a"]["complete"]
+        )
 
 
 if __name__ == "__main__":
