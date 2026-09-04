@@ -1920,6 +1920,17 @@ class UserMergeResult:
 
 
 @dataclasses.dataclass(frozen=True)
+class ReplayMapKeyMigration:
+    map_rows: int = 0
+    replay_runs: int = 0
+    finished_runs: int = 0
+    records_marked: int = 0
+    earliest_finished_run_id: int | None = None
+    previous_cursor: int = 0
+    replay_cursor: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
 class SavedPlayerMessage:
     id: int
     recipient_identity_key: str
@@ -2146,6 +2157,133 @@ class StateStore:
             (key, encoded),
         )
         connection.commit()
+
+    def rekey_replay_maps(
+        self,
+        record_keys_by_resource: dict[str, str],
+        server_id: str,
+    ) -> ReplayMapKeyMigration:
+        """Normalize old replay map references and queue them for republishing."""
+        aliases = {
+            str(resource_key).strip(): str(record_key).strip()
+            for resource_key, record_key in record_keys_by_resource.items()
+            if str(resource_key).strip()
+            and str(record_key).strip()
+            and str(resource_key).strip() != str(record_key).strip()
+        }
+        cursor_key = f"live_dashboard_replay_cursor_{server_id}"
+        connection = self.current_connection()
+        cursor_row = connection.execute(
+            "SELECT value FROM metadata WHERE key=?", (cursor_key,)
+        ).fetchone()
+        try:
+            previous_cursor = (
+                max(0, int(json.loads(cursor_row[0]))) if cursor_row else 0
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            previous_cursor = 0
+        if not aliases:
+            return ReplayMapKeyMigration(
+                previous_cursor=previous_cursor,
+                replay_cursor=previous_cursor,
+            )
+
+        map_rows = 0
+        replay_runs = 0
+        finished_runs = 0
+        records_marked = 0
+        earliest_finished_run_id: int | None = None
+        target_keys: set[str] = set()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            for resource_key, record_key in sorted(aliases.items()):
+                rows = connection.execute(
+                    "SELECT id, map_identifier, revision_identifier "
+                    "FROM replay_maps WHERE resource_key=? ORDER BY id",
+                    (resource_key,),
+                ).fetchall()
+                for map_ref, map_identifier, revision_identifier in rows:
+                    run_summary = connection.execute(
+                        "SELECT COUNT(*), SUM(CASE WHEN outcome=1 AND "
+                        "finish_seconds IS NOT NULL THEN 1 ELSE 0 END), "
+                        "MIN(CASE WHEN outcome=1 AND finish_seconds IS NOT NULL "
+                        "THEN id END) FROM replay_runs WHERE map_ref=?",
+                        (map_ref,),
+                    ).fetchone()
+                    replay_runs += int(run_summary[0] or 0)
+                    finished_runs += int(run_summary[1] or 0)
+                    if run_summary[2] is not None:
+                        run_id = int(run_summary[2])
+                        earliest_finished_run_id = (
+                            run_id
+                            if earliest_finished_run_id is None
+                            else min(earliest_finished_run_id, run_id)
+                        )
+                    existing = connection.execute(
+                        "SELECT id FROM replay_maps WHERE map_identifier=? AND "
+                        "revision_identifier=? AND resource_key=?",
+                        (map_identifier, revision_identifier, record_key),
+                    ).fetchone()
+                    if existing is None:
+                        connection.execute(
+                            "UPDATE replay_maps SET resource_key=? WHERE id=?",
+                            (record_key, map_ref),
+                        )
+                    else:
+                        target_ref = int(existing[0])
+                        if target_ref != int(map_ref):
+                            connection.execute(
+                                "UPDATE replay_runs SET map_ref=? WHERE map_ref=?",
+                                (target_ref, map_ref),
+                            )
+                            connection.execute(
+                                "DELETE FROM replay_maps WHERE id=?", (map_ref,)
+                            )
+                    map_rows += 1
+                    target_keys.add(record_key)
+
+            for record_key in sorted(target_keys):
+                marked = connection.execute(
+                    "UPDATE records SET replay_available=1 WHERE map_key=? AND "
+                    "authenticated=1 AND replay_available=0 AND EXISTS ("
+                    "SELECT 1 FROM replay_runs JOIN replay_maps ON "
+                    "replay_maps.id=replay_runs.map_ref JOIN replay_players ON "
+                    "replay_players.id=replay_runs.player_ref WHERE "
+                    "replay_maps.resource_key=records.map_key AND "
+                    "replay_players.identity_key=records.identity_key AND "
+                    "replay_runs.outcome=1 AND "
+                    "replay_runs.finish_seconds IS NOT NULL)",
+                    (record_key,),
+                )
+                records_marked += int(marked.rowcount)
+
+            replay_cursor = previous_cursor
+            if earliest_finished_run_id is not None:
+                replay_cursor = min(
+                    previous_cursor, max(0, earliest_finished_run_id - 1)
+                )
+                if replay_cursor != previous_cursor:
+                    connection.execute(
+                        "INSERT INTO metadata(key, value) VALUES(?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (
+                            cursor_key,
+                            json.dumps(replay_cursor, separators=(",", ":")),
+                        ),
+                    )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return ReplayMapKeyMigration(
+            map_rows=map_rows,
+            replay_runs=replay_runs,
+            finished_runs=finished_runs,
+            records_marked=records_marked,
+            earliest_finished_run_id=earliest_finished_run_id,
+            previous_cursor=previous_cursor,
+            replay_cursor=replay_cursor,
+        )
 
     def save_player_message(
         self,
@@ -4586,6 +4724,23 @@ class TronnerRacing:
             await asyncio.to_thread(self.repository.sync)
         else:
             await asyncio.to_thread(self.repository.scan)
+        replay_migration = await asyncio.to_thread(
+            self.store.rekey_replay_maps,
+            self._replay_record_key_aliases(),
+            self.server_id,
+        )
+        if replay_migration.map_rows:
+            LOG.info(
+                "normalized %d replay map reference(s) covering %d run(s), "
+                "%d finished; marked %d record(s) available and rewound "
+                "replay publication cursor from %d to %d",
+                replay_migration.map_rows,
+                replay_migration.replay_runs,
+                replay_migration.finished_runs,
+                replay_migration.records_marked,
+                replay_migration.previous_cursor,
+                replay_migration.replay_cursor,
+            )
         self._migrate_spawn_preferences()
         self._reconcile_rotation()
         self._restore_runtime_context()
@@ -7249,6 +7404,18 @@ class TronnerRacing:
             if entry.storage_path
         }
 
+    def _replay_record_key_aliases(self) -> dict[str, str]:
+        aliases = {
+            entry.key: map_records_key(entry)
+            for entry in self.repository.catalog.values()
+            if entry.key and map_records_key(entry) != entry.key
+        }
+        for resource_key, metadata in self.repository.firebase_maps_by_key.items():
+            record_key = str(metadata.get("recordKey") or "").strip()
+            if resource_key and record_key and resource_key != record_key:
+                aliases[resource_key] = record_key
+        return aliases
+
     async def live_dashboard_publisher(self) -> None:
         if self.live_dashboard is None:
             return
@@ -8047,7 +8214,7 @@ class TronnerRacing:
             authenticated=bool(player.auth_name),
             map_identifier=map_identifier,
             revision_identifier=revision_identifier,
-            resource_key=self.current.key,
+            resource_key=map_records_key(self.current),
             started_at=time.time(),
             spawn_game_time=game_time,
             x=x,
