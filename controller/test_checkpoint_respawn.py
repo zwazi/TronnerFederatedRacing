@@ -104,7 +104,7 @@ class CheckpointRespawnTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         self.assertIn(
-            "RESPAWN_PLAYER_CHECKPOINT_HELD racer false 10 20 0 1 12.5 7",
+            "RESPAWN_PLAYER_CHECKPOINT_BRAKED racer false 10 20 0 1 12.5 7",
             controller.sink.commands,
         )
         controller._handle_cycle_created("racer 10 20 0 1 30")
@@ -136,12 +136,13 @@ class CheckpointRespawnTests(unittest.IsolatedAsyncioTestCase):
         countdown, countdown_player = checkpoint_respawn_controller("countdown")
         countdown_player.checkpoint_respawn_requested = True
         await countdown._respawn_player(countdown_player)
-        self.assertEqual(
-            countdown.sink.commands[:2],
-            [
-                "RESPAWN_PLAYER_CHECKPOINT_HELD racer false 10 20 0 1 12.5 7",
-                "FREEZE_PLAYER racer 3",
-            ],
+        self.assertIn(
+            "RESPAWN_PLAYER_CHECKPOINT_BRAKED "
+            "racer false 10 20 0 1 12.5 7 3",
+            countdown.sink.commands,
+        )
+        self.assertFalse(
+            any(command.startswith("FREEZE_PLAYER") for command in countdown.sink.commands)
         )
         await cancel_tasks(countdown)
 
@@ -152,18 +153,15 @@ class CheckpointRespawnTests(unittest.IsolatedAsyncioTestCase):
 
         await controller._respawn_player(player)
 
-        self.assertEqual(
-            controller.sink.commands[:2],
-            [
-                "RESPAWN_PLAYER_CHECKPOINT_HELD "
-                "racer false 10 20 0 1 12.5 7",
-                "FREEZE_PLAYER racer 9",
-            ],
+        self.assertIn(
+            "RESPAWN_PLAYER_CHECKPOINT_BRAKED "
+            "racer false 10 20 0 1 12.5 7 9",
+            controller.sink.commands,
         )
         self.assertEqual(player.start_countdown_seconds, 9)
         await cancel_tasks(controller)
 
-    async def test_cp_can_replace_an_ordinary_held_spawn_before_takeoff(self):
+    async def test_cp_can_replace_an_ordinary_braked_spawn_before_takeoff(self):
         controller, player = checkpoint_respawn_controller("brake")
 
         await controller._respawn_player(player)
@@ -198,7 +196,7 @@ class CheckpointRespawnTests(unittest.IsolatedAsyncioTestCase):
         player.alive = False
         await controller._respawn_player(player)
         self.assertIn(
-            "RESPAWN_PLAYER_CHECKPOINT_HELD racer false 10 20 0 1 0 7",
+            "RESPAWN_PLAYER_CHECKPOINT_BRAKED racer false 10 20 0 1 0 7",
             controller.sink.commands,
         )
         await cancel_tasks(controller)

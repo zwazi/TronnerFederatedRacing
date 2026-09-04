@@ -434,7 +434,7 @@ index 311610e..8742b6a 100644
  #endif
 -
 diff --git a/src/tron/gCycle.cpp b/src/tron/gCycle.cpp
-index 78153a3..54145ac 100644
+index 78153a3..c443f43 100644
 --- a/src/tron/gCycle.cpp
 +++ b/src/tron/gCycle.cpp
 @@ -58,11 +58,18 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -485,14 +485,32 @@ index 78153a3..54145ac 100644
                  }
              }
      }
-@@ -1639,6 +1657,78 @@ void gCycle::OnNotifyNewDestination( gDestination* dest )
+@@ -1639,6 +1657,113 @@ void gCycle::OnNotifyNewDestination( gDestination* dest )
      }
  }
  
++static constexpr bool sg_ConsumeBrakedStartDestination(
++    bool turnCountAdvanced, bool clientBrakeWasDown, bool clientBrakeDown)
++{
++    // A turn carrying the client's pre-sync brake-off state is only a turn.
++    // Once brake-down has been reported, a combined turn/brake-off packet is
++    // the real release and must retain its stock simulation timestamp.
++    return turnCountAdvanced && !(clientBrakeWasDown && !clientBrakeDown);
++}
++
++static_assert(sg_ConsumeBrakedStartDestination(true, false, false),
++              "a pre-brake turn must stay held");
++static_assert(sg_ConsumeBrakedStartDestination(true, false, true),
++              "a turn that establishes brake-down must stay held");
++static_assert(!sg_ConsumeBrakedStartDestination(true, true, false),
++              "a combined turn and brake release must keep native timing");
++static_assert(!sg_ConsumeBrakedStartDestination(false, false, false),
++              "a brake-only release must keep native timing");
++
 +bool gCycle::HandleStartHoldDestination(const gDestination &destination)
 +{
 +    if (sn_GetNetState() != nSERVER || !freezeStartHoldTurns_ ||
-+            !IsFrozen(se_GameTime()))
++            (!IsFrozen(se_GameTime()) && !startBraked_))
 +        return false;
 +
 +    // A client sends turns as destinations. Only an advancing turn counter is
@@ -500,6 +518,14 @@ index 78153a3..54145ac 100644
 +    // different direction vector and must never rotate the held cycle.
 +    bool turnCountAdvanced = destination.turns != 0 &&
 +        static_cast<short>(destination.turns - turns) > 0;
++    bool consumeBrakedStartDestination = false;
++    if (startBraked_)
++    {
++        bool clientBrakeWasDown = freezeBrakeActionDown_;
++        freezeBrakeActionDown_ = destination.braking;
++        consumeBrakedStartDestination = sg_ConsumeBrakedStartDestination(
++            turnCountAdvanced, clientBrakeWasDown, destination.braking);
++    }
 +    if (turnCountAdvanced)
 +    {
 +        int winding = Grid()->DirectionWinding(destination.direction);
@@ -508,11 +534,20 @@ index 78153a3..54145ac 100644
 +        // This turn is applied here rather than entering the normal movement
 +        // queue. Acknowledge the turn itself so the owner cannot replay it
 +        // after launch, but leave the brake packet to the original path.
-+        if (destination.messageID > 1 &&
++        if ((!startBraked_ || consumeBrakedStartDestination) &&
++                destination.messageID > 1 &&
 +                (lastStartHoldMessageID_ <= 1 ||
 +                 static_cast<short>(destination.messageID -
 +                                    lastStartHoldMessageID_) > 0))
 +            lastStartHoldMessageID_ = destination.messageID;
++    }
++
++    if (startBraked_)
++    {
++        // Turns are consumed above so they cannot replay after launch. Leave
++        // the stock brake-off destination on the ordinary movement path: all
++        // 0.2.8+ clients already synchronize that state and its input time.
++        return consumeBrakedStartDestination;
 +    }
 +
 +    if (freezeUntilBrake_)
@@ -564,7 +599,7 @@ index 78153a3..54145ac 100644
  
  // *******************************************************************************************
  // *
-@@ -2428,11 +2518,206 @@ void gCycle::InitAfterCreation(){
+@@ -2428,11 +2553,209 @@ void gCycle::InitAfterCreation(){
  }
  
  static eLadderLogWriter se_cycleCreatedWriter("CYCLE_CREATED", false);
@@ -764,6 +799,9 @@ index 78153a3..54145ac 100644
 +        freezeStartHoldTurns_(false),
 +        freezeBrakeActionDown_(false),
 +        lastStartHoldMessageID_(0),
++        startBraked_(false),
++        startBrakeReleaseTime_(-1),
++        startBrakeReleaseSpeed_(0),
 +        replayToken_(++sg_cycleReplayToken),
 +        lastMovementStartPosition_(pos),
 +        lastMovementStartTime_(0),
@@ -771,7 +809,7 @@ index 78153a3..54145ac 100644
          skew(0),skewDot(0),
          rotationFrontWheel(1,0),rotationRearWheel(1,0),heightFrontWheel(0),heightRearWheel(0),
          tactical_pos(TP_Start),
-@@ -2441,6 +2726,13 @@ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
+@@ -2441,6 +2764,13 @@ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
          currentWall(NULL),
          lastWall(NULL)
  {
@@ -785,7 +823,7 @@ index 78153a3..54145ac 100644
      se_cycleCreatedWriter << p->GetLogName() << this->MapPosition().x << this->MapPosition().y << this->Direction().x << this->Direction().y;
      if(p->CurrentTeam())
          se_cycleCreatedWriter << Team()->Name().Filter();
-@@ -2475,12 +2767,27 @@ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
+@@ -2475,12 +2805,27 @@ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
  
      turnedPositions.push_back(startPos_);
      turnedDirections.push_back(startDir_);
@@ -813,7 +851,7 @@ index 78153a3..54145ac 100644
      // clear the destination list
  
      //Search the list for zones that could be referencing us
-@@ -2669,6 +2976,12 @@ REAL gCycle::CalculatePredictPosition( gPredictPositionData & data )
+@@ -2669,6 +3014,12 @@ REAL gCycle::CalculatePredictPosition( gPredictPositionData & data )
  }
  
  bool gCycle::Timestep(REAL currentTime){
@@ -826,10 +864,28 @@ index 78153a3..54145ac 100644
      // clear out dangerous info when we're done
      gMaxSpaceAheadHitInfoClearer hitInfoClearer( maxSpaceHit_ );
  
-@@ -2975,6 +3288,107 @@ bool gCycle::TimestepCore(REAL currentTime, bool calculateAcceleration ){
+@@ -2975,6 +3326,125 @@ bool gCycle::TimestepCore(REAL currentTime, bool calculateAcceleration ){
      if (!std::isfinite(skewDot))
          skewDot=0;
  
++    // Countdown starts use the same stock brake state as manual brake starts.
++    // Split the frame at the exact release time so controller timing remains
++    // independent of the dedicated server's frame duration.
++    if (sn_GetNetState() == nSERVER && startBraked_ &&
++            startBrakeReleaseTime_ >= 0 &&
++            currentTime >= startBrakeReleaseTime_)
++    {
++        REAL releaseTime = startBrakeReleaseTime_;
++        if (releaseTime > lastTime &&
++                gCycleMovement::TimestepCore(releaseTime, calculateAcceleration))
++            return true;
++        AccelerationDiscontinuity();
++        braking = 0;
++        OnBrakeStateChanged(releaseTime, braking);
++        RequestSyncOwner();
++        RequestSyncAll();
++    }
++
 +    // Tronner Racing start hold. Keep the cycle still up to the exact scheduled
 +    // simulation time, not merely until the first server frame after it. This
 +    // keeps the start independent of server frame duration and requires no
@@ -934,7 +990,7 @@ index 78153a3..54145ac 100644
      // eCoord oldpos=pos;
  
      REAL ts=(currentTime-lastTime);
-@@ -3098,6 +3512,16 @@ bool gCycle::TimestepCore(REAL currentTime, bool calculateAcceleration ){
+@@ -3098,6 +3568,16 @@ bool gCycle::TimestepCore(REAL currentTime, bool calculateAcceleration ){
                      lastTurnPos_ = pos; // hack last turn position to generate good wall
                  }
  
@@ -951,14 +1007,16 @@ index 78153a3..54145ac 100644
                  // simulate rest of frame
                  if ( gCycleMovement::TimestepCore( currentTime, calculateAcceleration ) )
                      return true;
-@@ -3828,6 +4252,51 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
+@@ -3828,6 +4308,54 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
      if (!Alive() && sn_GetNetState()==nSERVER)
          RequestSync(false);
  
 +    // A brake-start hold accepts turns in place, but consumes the next
 +    // brake-state change and schedules its exact release. No held action is
 +    // replayed by the normal movement simulation after release.
-+    if ( sn_GetNetState() == nSERVER && IsFrozen( se_GameTime() ) )
++    bool frozenStartHold = IsFrozen( se_GameTime() );
++    if ( sn_GetNetState() == nSERVER &&
++            (frozenStartHold || startBraked_) )
 +    {
 +        if ( freezeStartHoldTurns_ && se_turnLeft == *Act && x > .5 )
 +        {
@@ -970,7 +1028,7 @@ index 78153a3..54145ac 100644
 +            TurnDuringStartHold(1);
 +            return true;
 +        }
-+        if ( freezeUntilBrake_ && s_brake == *Act )
++        if ( frozenStartHold && freezeUntilBrake_ && s_brake == *Act )
 +        {
 +            bool down = x > 0;
 +            bool brakeChanged = down != freezeBrakeActionDown_;
@@ -985,7 +1043,7 @@ index 78153a3..54145ac 100644
 +            }
 +            return true;
 +        }
-+        if ( freezeUntilBrake_ && s_brakeToggle == *Act )
++        if ( frozenStartHold && freezeUntilBrake_ && s_brakeToggle == *Act )
 +        {
 +            if ( x > 0 )
 +            {
@@ -997,13 +1055,14 @@ index 78153a3..54145ac 100644
 +            }
 +            return true;
 +        }
-+        return true;
++        if ( frozenStartHold )
++            return true;
 +    }
 +
      if(se_turnLeft==*Act && x>.5){
          //SendControl(lastTime,&se_turnLeft,1);
          Turn(-1);
-@@ -3845,6 +4314,7 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
+@@ -3845,6 +4373,7 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
          {
              AccelerationDiscontinuity();
              braking = newBraking;
@@ -1011,7 +1070,7 @@ index 78153a3..54145ac 100644
              AddDestination();
  
              // brake changed, process shooting
-@@ -3860,6 +4330,7 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
+@@ -3860,6 +4389,7 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
          {
              AccelerationDiscontinuity();
              braking = !braking;
@@ -1019,19 +1078,49 @@ index 78153a3..54145ac 100644
              AddDestination();
  
              // brake changed, process shooting
-@@ -3873,6 +4344,11 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
+@@ -3873,6 +4403,41 @@ bool gCycle::Act(uActionPlayer *Act, REAL x){
      return false;
  }
  
 +void gCycle::OnBrakeStateChanged(REAL time, unsigned short brakeState)
 +{
 +    sg_WriteCycleReplayInput(this, time, brakeState ? "B1" : "B0");
++    if (sn_GetNetState() == nSERVER && startBraked_ && !brakeState)
++    {
++        REAL releaseSpeed = startBrakeReleaseSpeed_;
++        if (!std::isfinite(releaseSpeed) || releaseSpeed < 0)
++            releaseSpeed = 0;
++        startBraked_ = false;
++        startBrakeReleaseTime_ = -1;
++        startBrakeReleaseSpeed_ = 0;
++        freezeStartHoldTurns_ = false;
++        brakingReservoir = 1;
++        verletSpeed_ = releaseSpeed;
++        acceleration = 0;
++        lastTimestep_ = 0;
++        lastMovementStartPosition_ = pos;
++        lastMovementStartTime_ = time;
++        lastMovementValid_ = false;
++        correctPosSmooth = eCoord(0, 0);
++        correctDistanceSmooth = 0;
++        lastGoodPosition_ = pos;
++        predictPosition_ = pos;
++        if (Player())
++        {
++            se_cycleReleasedWriter << Player()->GetLogName() <<
++                sg_HighPrecisionRaceTime(time);
++            se_cycleReleasedWriter.write();
++            sg_WriteCycleReplayState(this, "release", time);
++        }
++        RequestSyncOwner();
++        RequestSyncAll();
++    }
 +}
 +
  // client side bugfix: network sync messages get actually used
  static nVersionFeature sg_SyncsAreUsed( 5 );
  
-@@ -4050,6 +4526,8 @@ bool gCycle::DoTurn(int d)
+@@ -4050,6 +4615,8 @@ bool gCycle::DoTurn(int d)
              turnedPositions.push_back(pos);
              turnedDirections.push_back(dirDrive);
  
@@ -1040,7 +1129,7 @@ index 78153a3..54145ac 100644
              return true;
          }
      }
-@@ -4356,6 +4834,13 @@ void gCycle::Kill(){
+@@ -4356,6 +4923,13 @@ void gCycle::Kill(){
                      se_cycleDestroyedWriter << "";
                  se_cycleDestroyedWriter.write();
  
@@ -1054,7 +1143,7 @@ index 78153a3..54145ac 100644
                  Player()->LogActivity(ACTIVITY_DIED);
  
                  sg_cycleRespawnZone_Create(this);
-@@ -5539,6 +6024,21 @@ gCycle::gCycle(nMessage &m)
+@@ -5539,6 +6113,24 @@ gCycle::gCycle(nMessage &m)
          engine(NULL),
          turning(NULL),
          spark(NULL),
@@ -1069,6 +1158,9 @@ index 78153a3..54145ac 100644
 +        freezeStartHoldTurns_(false),
 +        freezeBrakeActionDown_(false),
 +        lastStartHoldMessageID_(0),
++        startBraked_(false),
++        startBrakeReleaseTime_(-1),
++        startBrakeReleaseSpeed_(0),
 +        replayToken_(0),
 +        lastMovementStartPosition_(0, 0),
 +        lastMovementStartTime_(0),
@@ -1076,7 +1168,7 @@ index 78153a3..54145ac 100644
          skew(0),skewDot(0),
          rotationFrontWheel(1,0),rotationRearWheel(1,0),heightFrontWheel(0),heightRearWheel(0),
          tactical_pos(TP_Start),
-@@ -5652,6 +6152,10 @@ void gCycle::WriteSync(nMessage &m){
+@@ -5652,6 +6244,10 @@ void gCycle::WriteSync(nMessage &m){
      unsigned short lastMessageID = 0;
      if ( lastDestination )
          lastMessageID = lastDestination->messageID;
@@ -1087,7 +1179,7 @@ index 78153a3..54145ac 100644
      m.Write(lastMessageID);
  
      // write brake
-@@ -6292,7 +6796,10 @@ void gCycle::ReadSync( nMessage &m )
+@@ -6292,7 +6888,10 @@ void gCycle::ReadSync( nMessage &m )
  
              // update brake status
              AccelerationDiscontinuity();
@@ -1098,7 +1190,7 @@ index 78153a3..54145ac 100644
  
              // store last turn
              lastTurnPos_ = lastSyncMessage_.lastTurn;
-@@ -7194,6 +7701,9 @@ void gCycle::TeleportTo(eCoord dest, eCoord dir, REAL time) {
+@@ -7194,6 +7793,9 @@ void gCycle::TeleportTo(eCoord dest, eCoord dir, REAL time) {
  	}
  	// Do a safe move to destination
  	MoveSafely(dest,time,time);
@@ -1108,7 +1200,7 @@ index 78153a3..54145ac 100644
  	SetLastTurnPos(dest); // hacky way to ensure to build the wall properly
  	SetLastTurnTime(time);
  	// if dir is not (0,0), do a turn ...
-@@ -7213,6 +7723,168 @@ void gCycle::TeleportTo(eCoord dest, eCoord dir, REAL time) {
+@@ -7213,6 +7815,214 @@ void gCycle::TeleportTo(eCoord dest, eCoord dir, REAL time) {
  	RequestSync();
  }
  
@@ -1263,6 +1355,52 @@ index 78153a3..54145ac 100644
 +    RequestSyncAll();
 +}
 +
++void gCycle::StartBraked(REAL releaseAfterSeconds) {
++    if (!Alive())
++        return;
++    if (currentWall)
++        DropWall(false);
++
++    if (freezeClientZeroAcceleration_)
++    {
++        sg_ReleaseClientZeroAcceleration(Owner());
++        freezeClientZeroAcceleration_ = false;
++    }
++
++    freezeUntil_ = -1;
++    freezeReleaseStart_ = -1;
++    freezeReleaseUntil_ = -1;
++    freezeUntilBrake_ = false;
++    freezePosition_ = pos;
++    freezeDirection_ = dirDrive;
++    freezeStartHoldTurns_ = true;
++    freezeBrakeActionDown_ = false;
++    startBraked_ = true;
++    startBrakeReleaseTime_ = -1;
++    startBrakeReleaseSpeed_ = verletSpeed_;
++    if (std::isfinite(releaseAfterSeconds) && releaseAfterSeconds >= 0)
++        startBrakeReleaseTime_ = se_GameTime() + releaseAfterSeconds;
++
++    unsigned short oldBraking = braking;
++    braking = 1;
++    brakingReservoir = 1;
++    verletSpeed_ = 0;
++    acceleration = 0;
++    lastTimestep_ = 0;
++    lastMovementStartPosition_ = pos;
++    lastMovementStartTime_ = lastTime;
++    lastMovementValid_ = false;
++    correctPosSmooth = eCoord(0, 0);
++    correctDistanceSmooth = 0;
++    lastGoodPosition_ = pos;
++    predictPosition_ = pos;
++    if (braking != oldBraking)
++        OnBrakeStateChanged(se_GameTime(), braking);
++    sg_WriteCycleReplayState(this, "brake_hold", se_GameTime());
++    RequestSyncOwner();
++    RequestSyncAll();
++}
++
 +void gCycle::RestoreCheckpointState(REAL speed, unsigned short turnCount) {
 +    if (!std::isfinite(speed) || speed < 0)
 +        speed = 0;
@@ -1277,7 +1415,7 @@ index 78153a3..54145ac 100644
  int sg_defaultRespawnPosition = 0;
  static tConfItem<int> sg_defaultRespawnPositionConf("RESPAWN_DEFAULT_POSITION",sg_defaultRespawnPosition);
  
-@@ -7266,7 +7938,12 @@ static tConfItem<bool> sg_RespawnPlayerCMConf("RESPAWN_MESSAGE",sg_RespawnPlayer
+@@ -7266,7 +8076,13 @@ static tConfItem<bool> sg_RespawnPlayerCMConf("RESPAWN_MESSAGE",sg_RespawnPlayer
  bool sg_RespawnPlayerStrict = false;
  static tConfItem<bool> sg_RespawnPlayerStrictConf("RESPAWN_STRICT",sg_RespawnPlayerStrict);
  
@@ -1286,12 +1424,13 @@ index 78153a3..54145ac 100644
 +    std::istream &s,
 +    bool holdUntilBrake,
 +    bool restoreCheckpointState = false,
-+    bool protectFromLastDeathZone = false
++    bool protectFromLastDeathZone = false,
++    bool startBraked = false
 +)
  {
          eGrid *grid = eGrid::CurrentGrid();
          if( !grid || !SafeToSpawnObject() )
-@@ -7275,7 +7952,8 @@ static void sg_RespawnPlayer(std::istream &s)
+@@ -7275,7 +8091,8 @@ static void sg_RespawnPlayer(std::istream &s)
                  return;
          }
  
@@ -1301,12 +1440,12 @@ index 78153a3..54145ac 100644
          int pos = 0; //
          tString PlayerName("");
          s >> PlayerName;
-@@ -7290,15 +7968,19 @@ static void sg_RespawnPlayer(std::istream &s)
+@@ -7290,15 +8107,19 @@ static void sg_RespawnPlayer(std::istream &s)
          tString x_str, y_str;
          REAL dirx,diry;
          
 -        #define RESPAWN_MAX_PARAMS 5
-+        #define RESPAWN_MAX_PARAMS 7
++        #define RESPAWN_MAX_PARAMS 8
          tString str[RESPAWN_MAX_PARAMS];
 +        int paramCount = 0;
          for(int i=0;i<RESPAWN_MAX_PARAMS;++i)
@@ -1323,7 +1462,7 @@ index 78153a3..54145ac 100644
          {
              message = (
                  str0[0] == 't' || 
-@@ -7331,6 +8013,22 @@ static void sg_RespawnPlayer(std::istream &s)
+@@ -7331,6 +8152,29 @@ static void sg_RespawnPlayer(std::istream &s)
  
              gCycle *pCycle = new gCycle(grid, ppos, pdir, pPlayer);
              pPlayer->ControlObject(pCycle);
@@ -1340,13 +1479,20 @@ index 78153a3..54145ac 100644
 +                sg_ArmPracticeDeathZoneProtection(pCycle, se_GameTime());
 +            else
 +                sg_ClearPracticeDeathZoneProtection(pPlayer);
-+            if (holdUntilBrake)
++            if (startBraked)
++            {
++                REAL releaseAfterSeconds = -1;
++                if (pos < paramCount && str[pos] != "")
++                    releaseAfterSeconds = atof(str[pos]);
++                pCycle->StartBraked(releaseAfterSeconds);
++            }
++            else if (holdUntilBrake)
 +                pCycle->FreezeUntilBrake();
 +            sg_CancelPendingEmptyRoundEndForRespawn();
  
              if(message)
              {
-@@ -7345,8 +8043,48 @@ static void sg_RespawnPlayer(std::istream &s)
+@@ -7345,8 +8189,69 @@ static void sg_RespawnPlayer(std::istream &s)
          }
  }
  
@@ -1380,6 +1526,21 @@ index 78153a3..54145ac 100644
 +    sg_RespawnPlayerInternal(s, true, true, true);
 +}
 +
++static void sg_RespawnPlayerBraked(std::istream &s)
++{
++    sg_RespawnPlayerInternal(s, false, false, false, true);
++}
++
++static void sg_RespawnPlayerCheckpointBraked(std::istream &s)
++{
++    sg_RespawnPlayerInternal(s, false, true, false, true);
++}
++
++static void sg_RespawnPlayerPracticeBraked(std::istream &s)
++{
++    sg_RespawnPlayerInternal(s, false, true, true, true);
++}
++
  static tConfItemFunc sg_RespawnPlayer_conf("RESPAWN_PLAYER",&sg_RespawnPlayer);
  static tConfItemFunc sg_Respawn_conf("RESPAWN",&sg_RespawnPlayer);
 +static tConfItemFunc sg_RespawnPlayerHeldConf(
@@ -1392,10 +1553,16 @@ index 78153a3..54145ac 100644
 +    "RESPAWN_PLAYER_PRACTICE", &sg_RespawnPlayerPractice);
 +static tConfItemFunc sg_RespawnPlayerPracticeHeldConf(
 +    "RESPAWN_PLAYER_PRACTICE_HELD", &sg_RespawnPlayerPracticeHeld);
++static tConfItemFunc sg_RespawnPlayerBrakedConf(
++    "RESPAWN_PLAYER_BRAKED", &sg_RespawnPlayerBraked);
++static tConfItemFunc sg_RespawnPlayerCheckpointBrakedConf(
++    "RESPAWN_PLAYER_CHECKPOINT_BRAKED", &sg_RespawnPlayerCheckpointBraked);
++static tConfItemFunc sg_RespawnPlayerPracticeBrakedConf(
++    "RESPAWN_PLAYER_PRACTICE_BRAKED", &sg_RespawnPlayerPracticeBraked);
  
  
  static void sg_TeleportPlayer(std::istream &s)
-@@ -7451,6 +8189,36 @@ static void sg_setCycleSpeed(std::istream &s)
+@@ -7451,6 +8356,36 @@ static void sg_setCycleSpeed(std::istream &s)
  }
  static tConfItemFunc sg_setCycleSpeedConf("SET_CYCLE_SPEED", sg_setCycleSpeed);
  
@@ -1433,10 +1600,10 @@ index 78153a3..54145ac 100644
  {
      tString playerStr, rubberStr;
 diff --git a/src/tron/gCycle.h b/src/tron/gCycle.h
-index a003d88..342caa1 100644
+index a003d88..db31374 100644
 --- a/src/tron/gCycle.h
 +++ b/src/tron/gCycle.h
-@@ -169,6 +169,23 @@ class gCycle: public gCycleMovement
+@@ -169,6 +169,26 @@ class gCycle: public gCycleMovement
      eSoundPlayer *spark;
  
      REAL spawnTime_;    //!< time the cycle spawned at
@@ -1451,6 +1618,9 @@ index a003d88..342caa1 100644
 +    bool freezeStartHoldTurns_; //!< whether held turn destinations rotate the cycle in place
 +    bool freezeBrakeActionDown_; //!< last continuous-brake action state during the hold
 +    unsigned short lastStartHoldMessageID_; //!< newest consumed held input acknowledged to the owner
++    bool startBraked_; //!< whether this cycle is staged under its ordinary synchronized brake
++    REAL startBrakeReleaseTime_; //!< automatic brake-off time, or negative for player release
++    REAL startBrakeReleaseSpeed_; //!< native spawn/checkpoint speed restored at brake release
 +    unsigned long long replayToken_; //!< process-local identifier for compact replay events
 +    void ApplyStartHoldDirection(int winding, unsigned short turnCount); //!< rotate in place without creating movement or walls
 +    void TurnDuringStartHold(int direction); //!< apply one grid-relative turn while waiting for brake
@@ -1460,7 +1630,7 @@ index a003d88..342caa1 100644
      REAL lastTimeAnim;  //!< last time animation was simulated at
      REAL timeCameIntoView;
  
-@@ -278,6 +295,7 @@ private:
+@@ -278,6 +298,7 @@ private:
      void	SyncFromExtrapolator();							// take over the extrapolator's data
  
      virtual void OnNotifyNewDestination(gDestination *dest);   //!< called when a destination is successfully inserted into the destination list
@@ -1468,7 +1638,7 @@ index a003d88..342caa1 100644
      virtual void OnDropTempWall        ( gPlayerWall * wall, eCoord const & position, eCoord const & direction );   //!< called when another cycle grinds a wall; this cycle should then drop its current wall if the grinding is too close.
  
      //	unsigned short currentWallID;
-@@ -338,6 +356,7 @@ public:
+@@ -338,6 +359,7 @@ public:
      // virtual void SyncFriend( const eCoord& begWall );    //!< handle sync message for enemy cycles
  
      virtual void ReceiveControl(REAL time,uActionPlayer *Act,REAL x);
@@ -1476,14 +1646,16 @@ index a003d88..342caa1 100644
      virtual void PrintName(tString &s) const;
      virtual bool ActionOnQuit();
  
-@@ -372,6 +391,14 @@ public:
+@@ -372,6 +394,16 @@ public:
      // const gPlayerWall* LastWall();
  
  	void TeleportTo(eCoord dest, eCoord dir, REAL time);
 +    void FreezeFor(REAL seconds); //!< hold this cycle still without changing global physics
 +    void FreezeUntilBrake(); //!< hold until the owner changes the brake-key state
++    void StartBraked(REAL releaseAfterSeconds = -1); //!< stage under the stock synchronized brake
 +    void RestoreCheckpointState(REAL speed, unsigned short turnCount); //!< restore momentum without advancing the cycle
 +    bool IsFrozen(REAL gameTime) const { return freezeUntil_ > gameTime; }
++    bool IsStartHeld(REAL gameTime) const { return IsFrozen(gameTime) || startBraked_; }
 +    REAL ExactZoneEntryTime(const eCoord &center, REAL radius, REAL fallback) const;
 +    REAL SpawnTime() const { return spawnTime_; }
 +    unsigned long long ReplayToken() const { return replayToken_; }
@@ -1491,7 +1663,7 @@ index a003d88..342caa1 100644
      void SetWallBuilding(bool build);
  
  #ifndef DEDICATED
-@@ -418,4 +445,3 @@ extern REAL sg_cycleRespawnZoneRadius, sg_cycleRespawnZoneGrowth;
+@@ -418,4 +450,3 @@ extern REAL sg_cycleRespawnZoneRadius, sg_cycleRespawnZoneGrowth;
  extern bool sg_HideCycles, sg_HideCyclesWalls;
  
  #endif
@@ -1976,7 +2148,7 @@ index 12b17b3..de61bf8 100644
      sizeMultiplier = aSizeMultiplier;
      // EOP
 diff --git a/src/tron/gZone.cpp b/src/tron/gZone.cpp
-index 68b539b..e2e3cdd 100644
+index 68b539b..931d036 100644
 --- a/src/tron/gZone.cpp
 +++ b/src/tron/gZone.cpp
 @@ -64,6 +64,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -2195,7 +2367,7 @@ index 68b539b..e2e3cdd 100644
 +    gPracticeDeathZoneProtection &protection = found->second;
 +    if (protection.cycle != cycle || protection.zone != zone)
 +        return false;
-+    if (cycle->IsFrozen(time))
++    if (cycle->IsStartHeld(time))
 +    {
 +        protection.expiresAt = time + sg_practiceDeathZoneProtectionTime;
 +    }

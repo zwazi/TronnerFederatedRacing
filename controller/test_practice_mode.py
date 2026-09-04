@@ -230,10 +230,10 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
         await controller._respawn_player(player)
 
         self.assertEqual(
-            controller.sink.commands[:2],
+            controller.sink.commands,
             [
-                "RESPAWN_PLAYER_CHECKPOINT_HELD racer false 10 20 0 1 31.5 8",
-                "FREEZE_PLAYER racer 7",
+                "RESPAWN_PLAYER_CHECKPOINT_BRAKED "
+                "racer false 10 20 0 1 31.5 8 7",
             ],
         )
         await cancel_tasks(controller)
@@ -250,7 +250,7 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
         await controller._respawn_player(player)
 
         self.assertIn(
-            "RESPAWN_PLAYER_CHECKPOINT_HELD racer false 10 20 0 1 0 8",
+            "RESPAWN_PLAYER_CHECKPOINT_BRAKED racer false 10 20 0 1 0 8",
             controller.sink.commands,
         )
         self.assertNotIn("FREEZE_PLAYER racer 3", controller.sink.commands)
@@ -269,10 +269,10 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
         await controller._respawn_player(player)
 
         self.assertEqual(
-            controller.sink.commands[:2],
+            controller.sink.commands,
             [
-                "RESPAWN_PLAYER_PRACTICE_HELD racer false 10 20 0 1 31.5 8",
-                "FREEZE_PLAYER racer 7",
+                "RESPAWN_PLAYER_PRACTICE_BRAKED "
+                "racer false 10 20 0 1 31.5 8 7",
             ],
         )
         await cancel_tasks(controller)
@@ -322,10 +322,9 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
         await controller._command_respawn(player, kill_first=True)
 
         self.assertIn(
-            "RESPAWN_PLAYER_HELD racer false 3 4 0 1",
+            "RESPAWN_PLAYER_BRAKED racer false 3 4 0 1 7",
             controller.sink.commands,
         )
-        self.assertIn("FREEZE_PLAYER racer 7", controller.sink.commands)
         self.assertFalse(
             any("50 60" in command for command in controller.sink.commands)
         )
@@ -414,6 +413,8 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
             engine_patch,
         )
         self.assertIn("RESPAWN_PLAYER_PRACTICE", engine_patch)
+        self.assertIn("RESPAWN_PLAYER_PRACTICE_BRAKED", engine_patch)
+        self.assertIn("cycle->IsStartHeld(time)", engine_patch)
         self.assertIn("sg_IsPracticeDeathZoneProtected", engine_patch)
         self.assertIn("gDeathZoneHack::OnExit", engine_patch)
         self.assertIn(

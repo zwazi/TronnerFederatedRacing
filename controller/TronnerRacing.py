@@ -8726,13 +8726,12 @@ class TronnerRacing:
         if start_mode == "countdown":
             await self.sink.send(
                 *self._checkpoint_color_reset_commands(player),
-                f"RESPAWN_PLAYER_HELD {spawn_arguments}",
-                f"FREEZE_PLAYER {player.target} {countdown_seconds}",
+                f"RESPAWN_PLAYER_BRAKED {spawn_arguments} {countdown_seconds}",
             )
         else:
             await self.sink.send(
                 *self._checkpoint_color_reset_commands(player),
-                f"RESPAWN_PLAYER_HELD {spawn_arguments}",
+                f"RESPAWN_PLAYER_BRAKED {spawn_arguments}",
             )
         old_task = self.freeze_tasks.pop(id(player), None)
         if old_task:
@@ -8780,12 +8779,12 @@ class TronnerRacing:
             return
         if start_mode == "countdown":
             await self.sink.send(
-                f"RESPAWN_PLAYER_CHECKPOINT_HELD {spawn_arguments}",
-                f"FREEZE_PLAYER {player.target} {countdown_seconds}",
+                "RESPAWN_PLAYER_CHECKPOINT_BRAKED "
+                f"{spawn_arguments} {countdown_seconds}",
             )
         else:
             await self.sink.send(
-                f"RESPAWN_PLAYER_CHECKPOINT_HELD {spawn_arguments}"
+                f"RESPAWN_PLAYER_CHECKPOINT_BRAKED {spawn_arguments}"
             )
         old_task = self.freeze_tasks.pop(id(player), None)
         if old_task:
@@ -8840,21 +8839,21 @@ class TronnerRacing:
                 f"{respawn_command} {spawn_arguments}",
             )
             return
-        held_respawn_command = (
-            "RESPAWN_PLAYER_PRACTICE_HELD"
+        braked_respawn_command = (
+            "RESPAWN_PLAYER_PRACTICE_BRAKED"
             if zone_protection
-            else "RESPAWN_PLAYER_CHECKPOINT_HELD"
+            else "RESPAWN_PLAYER_CHECKPOINT_BRAKED"
         )
         if start_mode == "countdown":
             await self.sink.send(
                 *reset_commands,
-                f"{held_respawn_command} {spawn_arguments}",
-                f"FREEZE_PLAYER {player.target} {countdown_seconds}",
+                f"{braked_respawn_command} {spawn_arguments} "
+                f"{countdown_seconds}",
             )
         else:
             await self.sink.send(
                 *reset_commands,
-                f"{held_respawn_command} {spawn_arguments}",
+                f"{braked_respawn_command} {spawn_arguments}",
             )
         old_task = self.freeze_tasks.pop(id(player), None)
         if old_task:
