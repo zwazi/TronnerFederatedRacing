@@ -1811,6 +1811,8 @@ class ReplayCapture:
     size_factor: float | None
     start_mode: str
     checkpoint_spawn: bool
+    record_key: str = ""
+    storage_path: str = ""
     settings_identifier: str | None = None
     settings_transitions: list[tuple[int, str]] = dataclasses.field(default_factory=list)
     release_offset_us: int | None = None
@@ -2014,6 +2016,8 @@ class StateStore:
                 map_identifier TEXT NOT NULL,
                 revision_identifier TEXT NOT NULL,
                 resource_key TEXT NOT NULL,
+                record_key TEXT NOT NULL DEFAULT '',
+                storage_path TEXT NOT NULL DEFAULT '',
                 UNIQUE(map_identifier, revision_identifier, resource_key)
             );
             CREATE TABLE IF NOT EXISTS replay_players (
@@ -2120,6 +2124,20 @@ class StateStore:
                 "ALTER TABLE replay_runs ADD COLUMN settings_ref INTEGER "
                 "REFERENCES replay_settings(id)"
             )
+        replay_map_columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(replay_maps)")
+        }
+        if "record_key" not in replay_map_columns:
+            self.connection.execute(
+                "ALTER TABLE replay_maps ADD COLUMN record_key TEXT NOT NULL DEFAULT ''"
+            )
+        if "storage_path" not in replay_map_columns:
+            self.connection.execute(
+                "ALTER TABLE replay_maps ADD COLUMN storage_path TEXT NOT NULL DEFAULT ''"
+            )
+        self.connection.execute(
+            "UPDATE replay_maps SET record_key=resource_key WHERE record_key=''"
+        )
         self.connection.commit()
 
     def current_connection(self) -> sqlite3.Connection:
@@ -2163,7 +2181,7 @@ class StateStore:
         record_keys_by_resource: dict[str, str],
         server_id: str,
     ) -> ReplayMapKeyMigration:
-        """Normalize old replay map references and queue them for republishing."""
+        """Attach stable leaderboard keys without discarding exact map resources."""
         aliases = {
             str(resource_key).strip(): str(record_key).strip()
             for resource_key, record_key in record_keys_by_resource.items()
@@ -2198,11 +2216,10 @@ class StateStore:
         try:
             for resource_key, record_key in sorted(aliases.items()):
                 rows = connection.execute(
-                    "SELECT id, map_identifier, revision_identifier "
-                    "FROM replay_maps WHERE resource_key=? ORDER BY id",
+                    "SELECT id FROM replay_maps WHERE record_key=? ORDER BY id",
                     (resource_key,),
                 ).fetchall()
-                for map_ref, map_identifier, revision_identifier in rows:
+                for (map_ref,) in rows:
                     run_summary = connection.execute(
                         "SELECT COUNT(*), SUM(CASE WHEN outcome=1 AND "
                         "finish_seconds IS NOT NULL THEN 1 ELSE 0 END), "
@@ -2219,26 +2236,10 @@ class StateStore:
                             if earliest_finished_run_id is None
                             else min(earliest_finished_run_id, run_id)
                         )
-                    existing = connection.execute(
-                        "SELECT id FROM replay_maps WHERE map_identifier=? AND "
-                        "revision_identifier=? AND resource_key=?",
-                        (map_identifier, revision_identifier, record_key),
-                    ).fetchone()
-                    if existing is None:
-                        connection.execute(
-                            "UPDATE replay_maps SET resource_key=? WHERE id=?",
-                            (record_key, map_ref),
-                        )
-                    else:
-                        target_ref = int(existing[0])
-                        if target_ref != int(map_ref):
-                            connection.execute(
-                                "UPDATE replay_runs SET map_ref=? WHERE map_ref=?",
-                                (target_ref, map_ref),
-                            )
-                            connection.execute(
-                                "DELETE FROM replay_maps WHERE id=?", (map_ref,)
-                            )
+                    connection.execute(
+                        "UPDATE replay_maps SET record_key=? WHERE id=?",
+                        (record_key, map_ref),
+                    )
                     map_rows += 1
                     target_keys.add(record_key)
 
@@ -2249,7 +2250,7 @@ class StateStore:
                     "SELECT 1 FROM replay_runs JOIN replay_maps ON "
                     "replay_maps.id=replay_runs.map_ref JOIN replay_players ON "
                     "replay_players.id=replay_runs.player_ref WHERE "
-                    "replay_maps.resource_key=records.map_key AND "
+                    "replay_maps.record_key=records.map_key AND "
                     "replay_players.identity_key=records.identity_key AND "
                     "replay_runs.outcome=1 AND "
                     "replay_runs.finish_seconds IS NOT NULL)",
@@ -2417,14 +2418,19 @@ class StateStore:
 
     def add_replay(self, capture: ReplayCapture, ended_at: float) -> int:
         """Persist one compact, physics-free cycle input stream."""
+        record_key = capture.record_key or capture.resource_key
         self.connection.execute(
-            "INSERT INTO replay_maps(map_identifier, revision_identifier, resource_key) "
-            "VALUES(?, ?, ?) ON CONFLICT(map_identifier, revision_identifier, resource_key) "
-            "DO NOTHING",
+            "INSERT INTO replay_maps(map_identifier, revision_identifier, resource_key, "
+            "record_key, storage_path) VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(map_identifier, revision_identifier, resource_key) DO UPDATE SET "
+            "record_key=excluded.record_key, storage_path=CASE WHEN excluded.storage_path!='' "
+            "THEN excluded.storage_path ELSE replay_maps.storage_path END",
             (
                 capture.map_identifier,
                 capture.revision_identifier,
                 capture.resource_key,
+                record_key,
+                capture.storage_path,
             ),
         )
         map_ref = self.connection.execute(
@@ -2653,7 +2659,7 @@ class StateStore:
         replay_keys = {
             (str(row[0]), str(row[1]))
             for row in connection.execute(
-                "SELECT DISTINCT replay_maps.resource_key, "
+                "SELECT DISTINCT replay_maps.record_key, "
                 "replay_players.identity_key FROM replay_runs "
                 "JOIN replay_players ON replay_players.id=replay_runs.player_ref "
                 "JOIN replay_maps ON replay_maps.id=replay_runs.map_ref WHERE "
@@ -2681,7 +2687,7 @@ class StateStore:
             "SELECT DISTINCT replay_players.identity_key FROM replay_runs "
             "JOIN replay_players ON replay_players.id=replay_runs.player_ref "
             "JOIN replay_maps ON replay_maps.id=replay_runs.map_ref WHERE "
-            "replay_maps.resource_key=? AND replay_runs.outcome=1 AND "
+            "replay_maps.record_key=? AND replay_runs.outcome=1 AND "
             "replay_runs.finish_seconds IS NOT NULL",
             (map_key,),
         ).fetchall()
@@ -2715,7 +2721,8 @@ class StateStore:
             "SELECT replay_runs.id, replay_players.identity_key, "
             "replay_players.username, replay_players.authenticated, "
             "replay_maps.map_identifier, replay_maps.revision_identifier, "
-            "replay_maps.resource_key, replay_runs.recorded_at, "
+            "replay_maps.record_key, replay_maps.resource_key, "
+            "replay_maps.storage_path, replay_runs.recorded_at, "
             "replay_runs.ended_at, replay_runs.finish_seconds, "
             "replay_runs.finish_turns, replay_runs.personal_best, "
             "replay_runs.event_count, replay_runs.settings_ref "
@@ -2736,13 +2743,54 @@ class StateStore:
                 "mapId": str(row[4]),
                 "revisionId": str(row[5]),
                 "mapKey": str(row[6]),
-                "recordedAt": float(row[7]),
-                "endedAt": float(row[8]),
-                "seconds": float(row[9]),
-                "turns": int(row[10]) if row[10] is not None else None,
-                "personalBest": bool(row[11]),
-                "eventCount": int(row[12]),
-                "settingsRef": int(row[13]) if row[13] is not None else None,
+                "mapResourcePath": str(row[7]),
+                "mapStoragePath": str(row[8]),
+                "recordedAt": float(row[9]),
+                "endedAt": float(row[10]),
+                "seconds": float(row[11]),
+                "turns": int(row[12]) if row[12] is not None else None,
+                "personalBest": bool(row[13]),
+                "eventCount": int(row[14]),
+                "settingsRef": int(row[15]) if row[15] is not None else None,
+            }
+            for row in rows
+        ]
+
+    def dashboard_replay_history_groups_after(
+        self,
+        record_key: str = "",
+        identity_key: str = "",
+        limit: int = 20,
+    ) -> list[dict[str, object]]:
+        """Return stable player/map groups for metadata-only history backfills."""
+        rows = self.current_connection().execute(
+            "SELECT replay_maps.record_key, replay_players.identity_key, "
+            "replay_players.username, replay_players.authenticated, "
+            "MIN(replay_maps.map_identifier), MIN(replay_maps.revision_identifier) "
+            "FROM replay_runs JOIN replay_players ON "
+            "replay_players.id=replay_runs.player_ref JOIN replay_maps ON "
+            "replay_maps.id=replay_runs.map_ref WHERE replay_runs.outcome=1 "
+            "AND replay_runs.finish_seconds IS NOT NULL AND "
+            "(replay_maps.record_key > ? OR (replay_maps.record_key=? AND "
+            "replay_players.identity_key>?)) GROUP BY replay_maps.record_key, "
+            "replay_players.identity_key ORDER BY replay_maps.record_key, "
+            "replay_players.identity_key LIMIT ?",
+            (
+                record_key,
+                record_key,
+                identity_key,
+                max(1, min(int(limit), 100)),
+            ),
+        ).fetchall()
+        return [
+            {
+                "mapKey": str(row[0]),
+                "identityKey": str(row[1]),
+                "playerId": public_player_id(str(row[1])),
+                "username": str(row[2]),
+                "authenticated": bool(row[3]),
+                "mapId": str(row[4]),
+                "revisionId": str(row[5]),
             }
             for row in rows
         ]
@@ -2758,11 +2806,12 @@ class StateStore:
             "replay_runs.ended_at, replay_runs.finish_seconds, "
             "replay_runs.finish_turns, replay_runs.personal_best, "
             "replay_runs.event_count, replay_runs.settings_ref, "
-            "replay_maps.map_identifier, replay_maps.revision_identifier "
+            "replay_maps.map_identifier, replay_maps.revision_identifier, "
+            "replay_maps.resource_key, replay_maps.storage_path "
             "FROM replay_runs JOIN replay_players ON "
             "replay_players.id=replay_runs.player_ref JOIN replay_maps ON "
             "replay_maps.id=replay_runs.map_ref WHERE "
-            "replay_players.identity_key=? AND replay_maps.resource_key=? "
+            "replay_players.identity_key=? AND replay_maps.record_key=? "
             "AND replay_runs.outcome=1 AND replay_runs.finish_seconds IS NOT NULL "
             "ORDER BY replay_runs.recorded_at DESC, replay_runs.id DESC LIMIT ?",
             (identity_key, map_key, max(1, min(int(limit), 2500))),
@@ -2779,6 +2828,8 @@ class StateStore:
                 "settingsRef": int(row[7]) if row[7] is not None else None,
                 "mapId": str(row[8]),
                 "revisionId": str(row[9]),
+                "mapResourcePath": str(row[10]),
+                "mapStoragePath": str(row[11]),
             }
             for row in rows
         ]
@@ -6663,6 +6714,7 @@ class TronnerRacing:
             "mapKey": map_records_key(entry),
             "resourcePath": entry.key,
             "mapId": entry.map_id,
+            "revisionId": entry.revision_id,
             "name": entry.name,
             "author": entry.author,
             "version": entry.version,
@@ -7430,6 +7482,16 @@ class TronnerRacing:
                 )
                 if replay_writes:
                     LOG.info("published %d racing replay(s)", replay_writes)
+                history_writes = await asyncio.to_thread(
+                    self.live_dashboard.publish_replay_history_backfill_batch,
+                    self.server_id,
+                )
+                if history_writes:
+                    LOG.info(
+                        "refreshed %d racing replay histor%s with exact map revisions",
+                        history_writes,
+                        "y" if history_writes == 1 else "ies",
+                    )
                 now = time.monotonic()
                 if now >= next_leaderboards:
                     rows = self.store.dashboard_record_rows()
@@ -8214,7 +8276,7 @@ class TronnerRacing:
             authenticated=bool(player.auth_name),
             map_identifier=map_identifier,
             revision_identifier=revision_identifier,
-            resource_key=map_records_key(self.current),
+            resource_key=self.current.key,
             started_at=time.time(),
             spawn_game_time=game_time,
             x=x,
@@ -8226,6 +8288,8 @@ class TronnerRacing:
             size_factor=self.current_size_factor,
             start_mode=self._start_mode_for(player),
             checkpoint_spawn=player.pending_respawn_kind == "checkpoint",
+            record_key=map_records_key(self.current),
+            storage_path=self.current.storage_path,
             settings_identifier=(
                 parts[9]
                 if len(parts) >= 10
@@ -8449,7 +8513,8 @@ class TronnerRacing:
             self.store.add_replay(capture, ended_at or time.time())
             if capture.outcome == "finish" and capture.authenticated:
                 self.store.mark_replay_available(
-                    capture.resource_key, capture.identity_key
+                    capture.record_key or capture.resource_key,
+                    capture.identity_key,
                 )
         except Exception:
             LOG.exception("unable to save replay capture %s", capture.token)

@@ -33,6 +33,7 @@ class StateStoreMigrationTests(unittest.TestCase):
             size_factor=None,
             start_mode="immediate",
             checkpoint_spawn=False,
+            storage_path=f"_revisions/tester/{revision_identifier}/map.aamap.xml",
         )
         capture.outcome = "finish"
         capture.finish_seconds = 12.5
@@ -124,20 +125,36 @@ class StateStoreMigrationTests(unittest.TestCase):
                 first_run - 1,
             )
             replay_rows = store.connection.execute(
-                "SELECT replay_runs.id, replay_maps.resource_key FROM replay_runs "
+                "SELECT replay_runs.id, replay_maps.resource_key, "
+                "replay_maps.record_key FROM replay_runs "
                 "JOIN replay_maps ON replay_maps.id=replay_runs.map_ref "
                 "ORDER BY replay_runs.id"
             ).fetchall()
             self.assertEqual(
                 replay_rows,
-                [(first_run, "record-a"), (second_run, "record-b")],
+                [
+                    (first_run, "resource-a", "record-a"),
+                    (second_run, "resource-b", "record-b"),
+                ],
             )
             self.assertEqual(
                 store.connection.execute(
                     "SELECT COUNT(*) FROM replay_maps WHERE resource_key LIKE "
                     "'resource-%'"
                 ).fetchone()[0],
-                0,
+                2,
+            )
+            history = store.dashboard_player_map_history(
+                "auth:racer", "record-a"
+            )
+            self.assertEqual(history[0]["mapResourcePath"], "resource-a")
+            self.assertEqual(
+                history[0]["mapStoragePath"],
+                "_revisions/tester/rev-a/map.aamap.xml",
+            )
+            self.assertEqual(
+                store.dashboard_replay_payload(first_run)["mapKey"],
+                "resource-a",
             )
             self.assertEqual(
                 store.connection.execute(

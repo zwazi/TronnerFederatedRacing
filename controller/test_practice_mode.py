@@ -384,7 +384,7 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.speed, 42.25)
         self.assertEqual(snapshot.turns, 9)
 
-    def test_replay_capture_uses_the_leaderboard_record_key(self):
+    def test_replay_capture_keeps_exact_resource_and_leaderboard_record_key(self):
         controller, _player = practice_controller()
         controller.current = MapEntry(
             "Author/maps/Practice-v1.aamap.xml",
@@ -402,6 +402,10 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             controller.replay_captures["token"].resource_key,
+            "Author/maps/Practice-v1.aamap.xml",
+        )
+        self.assertEqual(
+            controller.replay_captures["token"].record_key,
             "stable-record-key",
         )
 
