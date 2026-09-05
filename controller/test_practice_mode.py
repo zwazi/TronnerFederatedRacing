@@ -369,10 +369,10 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(player.practice_samples[-1].turns, 6)
 
         controller._handle_replay_begin(
-            "token racer 10 12 34 0 1 27.5 6 settings"
+            "token racer 10 12 34 0 1 27.5 6 settings 10.5"
         )
         controller._handle_replay_state(
-            "token death 11 40 50 -1 0 42.25 9"
+            "token death 11 40 50 -1 0 42.25 9 260.5"
         )
 
         snapshot = player.practice_respawn_snapshot
@@ -383,6 +383,8 @@ class PracticeModeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(snapshot.speed, 42.25)
         self.assertEqual(snapshot.turns, 9)
+        self.assertEqual(controller.replay_captures["token"].initial_distance, 10.5)
+        self.assertEqual(controller.replay_captures["token"].latest_distance, 260.5)
 
     def test_replay_capture_keeps_exact_resource_and_leaderboard_record_key(self):
         controller, _player = practice_controller()

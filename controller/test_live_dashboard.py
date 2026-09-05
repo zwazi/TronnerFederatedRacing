@@ -10,6 +10,7 @@ from live_dashboard import (
     map_rating_entries,
     map_rating_fields,
     overall_leaderboard,
+    public_player_id,
 )
 
 
@@ -220,6 +221,86 @@ class LiveDashboardTest(unittest.TestCase):
         )
         self.assertEqual(leaderboard["entries"], [])
         self.assertEqual(leaderboard["rating"], 4.5)
+
+    def test_profiles_publish_rank_averages_and_cumulative_stats(self):
+        firebase = LeaderboardFirebase()
+        publisher = FirebaseLiveDashboardPublisher(
+            firebase, "https://example.firebaseio.com", FakeStore()
+        )
+        publisher.publish_leaderboards(
+            self.rows(),
+            {
+                "map-a": {"name": "Map A"},
+                "map-b": {"name": "Map B"},
+                "map-c": {"name": "Map C"},
+            },
+            [{
+                "identityKey": "one",
+                "username": "One",
+                "playSeconds": 3661.25,
+                "rubberDeaths": 4,
+                "deathzoneDeaths": 3,
+                "finishes": 12,
+                "distanceMeters": 12345.0,
+                "turns": 678,
+                "updatedAt": 123000,
+            }],
+        )
+
+        player_id = public_player_id("one")
+        profile = next(
+            payload for collection, document_id, payload in firebase.documents
+            if collection == "racingProfiles" and document_id == player_id
+        )
+        self.assertEqual(profile["rankStats"], {
+            "firstPlaceMaps": 0,
+            "ladderPosition": 1,
+            "completedMapCount": 2,
+            "totalMapCount": 3,
+            "averageCompletedRank": 2.0,
+            "averageAllMapsRank": 1.67,
+        })
+        self.assertEqual(profile["stats"], {
+            "playSeconds": 3661.25,
+            "rubberDeaths": 4,
+            "deathzoneDeaths": 3,
+            "finishes": 12,
+            "distanceKilometers": 12.345,
+            "turns": 678,
+            "updatedAt": 123000,
+        })
+
+    def test_profiles_keep_ladder_positions_beyond_public_top_one_hundred(self):
+        rows = [
+            {
+                "mapKey": "map-a",
+                "identityKey": f"player-{index:03d}",
+                "username": f"Player {index:03d}",
+                "authenticated": True,
+                "bestSeconds": float(index),
+                "bestTurns": index,
+                "achievedAt": index,
+            }
+            for index in range(1, 102)
+        ]
+        firebase = LeaderboardFirebase()
+        publisher = FirebaseLiveDashboardPublisher(
+            firebase, "https://example.firebaseio.com", FakeStore()
+        )
+        publisher.publish_leaderboards(rows, {"map-a": {"name": "Map A"}})
+
+        last_profile_id = public_player_id("player-101")
+        last_profile = next(
+            payload for collection, document_id, payload in firebase.documents
+            if collection == "racingProfiles" and document_id == last_profile_id
+        )
+        overall = next(
+            payload for collection, document_id, payload in firebase.documents
+            if collection == "racingOverall" and document_id == "current"
+        )
+        self.assertEqual(last_profile["rankStats"]["ladderPosition"], 101)
+        self.assertIsNone(last_profile["stats"]["distanceKilometers"])
+        self.assertEqual(len(overall["entries"]), 100)
 
     def test_rating_command_poll_and_updates_are_bounded(self):
         publisher = FirebaseLiveDashboardPublisher(
