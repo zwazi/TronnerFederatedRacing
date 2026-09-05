@@ -218,6 +218,7 @@ def render(cluster: dict[str, Any], node: dict[str, Any], *, production: bool) -
         "ladderlog": "/var/lib/armagetronad/ladderlog.txt",
         "online_players_file": "/var/lib/armagetronad/online_players.txt",
         "database": "/var/lib/tronner-racing/TronnerRacing.sqlite3",
+        "ghost_plan_dir": "/var/lib/armagetronad/ghosts",
         "spawn_preferences_file": "/var/lib/tronner-racing/spawn_preferences.json",
         "helpful_messages_file": "/etc/tronner-racing/helpful_messages.txt",
         "map_duration_seconds": 300,

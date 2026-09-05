@@ -6,7 +6,10 @@ install_prefix=${TRONNER_ENGINE_PREFIX:-/opt/armagetronad}
 jobs=${TRONNER_BUILD_JOBS:-1}
 upstream_url=${TRONNER_ENGINE_UPSTREAM_URL:-https://github.com/ArmagetronAd/armagetronad.git}
 upstream_commit=$(tr -d '[:space:]' < "$repository_dir/engine/UPSTREAM_COMMIT")
-patch_file="$repository_dir/engine/patches/tronner-racing.patch"
+patch_files=(
+    "$repository_dir/engine/patches/tronner-racing.patch"
+    "$repository_dir/engine/patches/ghost-replay.patch"
+)
 temporary_workspace=
 
 if [[ -n ${TRONNER_ENGINE_SOURCE_DIR:-} || -n ${TRONNER_ENGINE_BUILD_DIR:-} ]]; then
@@ -43,8 +46,10 @@ if ((!new_source)) && [[ -n $(git -C "$source_dir" status --porcelain) ]]; then
 fi
 git -C "$source_dir" fetch --depth 1 origin "$upstream_commit"
 git -C "$source_dir" checkout --detach "$upstream_commit"
-git -C "$source_dir" apply --check "$patch_file"
-git -C "$source_dir" apply "$patch_file"
+for patch_file in "${patch_files[@]}"; do
+    git -C "$source_dir" apply --check "$patch_file"
+    git -C "$source_dir" apply "$patch_file"
+done
 
 (
     cd "$source_dir"

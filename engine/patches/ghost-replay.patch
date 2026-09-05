@@ -1,0 +1,705 @@
+diff --git a/src/engine/ePlayer.cpp b/src/engine/ePlayer.cpp
+index 388d510f..c6c981d3 100644
+--- a/src/engine/ePlayer.cpp
++++ b/src/engine/ePlayer.cpp
+@@ -6306,13 +6306,33 @@ void ePlayerNetID::RemoveFromGame()
+     {
+         nameFromClient_ = nameFromServer_;
+ 
+-        nMessage *m=new nMessage(player_removed_from_game);
+-        m->Write(this->ID());
+-        m->BroadCast();
++        if ( !IsServerGhost() )
++        {
++            nMessage *m = new nMessage(player_removed_from_game);
++            m->Write(this->ID());
++            m->BroadCast();
++        }
++        else
++        {
++            // A private server-owned player must not leak an object reference
++            // to peers that never received its creation.
++            int maxUser = sn_GetNetState() == nSERVER ? MAXCLIENTS : 0;
++            int minUser = sn_GetNetState() == nSERVER ? 1 : 0;
++            for ( int user = maxUser; user >= minUser; --user )
++                if ( HasBeenTransmitted(user) )
++                {
++                    nMessage *m = new nMessage(player_removed_from_game);
++                    m->Write(this->ID());
++                    m->Send(user);
++                }
++        }
+ 
+         if ( listID >= 0 )
+         {
+-            if ( ( IsSpectating() || IsSuspended() || !se_assignTeamAutomatically ) && ( se_assignTeamAutomatically || se_specSpam ) && CurrentTeam() == NULL )
++            if ( !IsServerGhost() &&
++                    ( IsSpectating() || IsSuspended() || !se_assignTeamAutomatically ) &&
++                    ( se_assignTeamAutomatically || se_specSpam ) &&
++                    CurrentTeam() == NULL )
+             {
+                 // get colored player name
+                 tColoredString playerName;
+@@ -6337,7 +6357,7 @@ void ePlayerNetID::RemoveFromGame()
+ 
+                 this->LogActivity(ACTIVITY_LEFT);
+             }
+-            else
++            else if ( !IsServerGhost() )
+             {
+                 se_playerAILeftWriter << userName_;
+                 se_playerAILeftWriter.write();
+@@ -8581,6 +8601,8 @@ void ePlayerNetID::OnlineStatsLadderLog()
+         ePlayerNetID *p = se_PlayerNetIDs[i];
+         if (p)
+         {
++            if ( p->IsServerGhost() )
++                continue;
+             if( p->CanRespawn() || ( p->Object() && p->CurrentTeam() ) )
+             {
+                 if (p->IsHuman())
+@@ -10929,7 +10951,7 @@ public:
+                 se_playerColoredNameWriter << player_.GetUserName() << colouredName;
+                 se_playerColoredNameWriter.write();
+             }
+-            else
++            else if ( !player_.IsServerGhost() )
+             {
+                 se_playerAIEnteredWriter << logName << screenName;
+                 se_playerAIEnteredWriter.write();
+diff --git a/src/engine/ePlayer.h b/src/engine/ePlayer.h
+index 0650a456..e9ade6a6 100644
+--- a/src/engine/ePlayer.h
++++ b/src/engine/ePlayer.h
+@@ -416,6 +416,7 @@ public:
+     static void PoliceMenu();				// menu where you can silence and kick players
+ 
+     virtual bool IsHuman() const { return true; }
++    virtual bool IsServerGhost() const { return false; }
+ 
+     void Activity(); // call it if this player just showed some activity.
+     REAL LastActivity() const; //!< returns how long the last activity of this player was ago
+@@ -823,4 +824,3 @@ ePlayerNetID *se_GetLocalPlayer();
+ extern bool se_highlightMyName, se_tabCompletion, se_tabCompletionWithColors;
+ 
+ #endif
+-
+diff --git a/src/tron/gCycle.cpp b/src/tron/gCycle.cpp
+index c8a4959f..95e5e8a2 100644
+--- a/src/tron/gCycle.cpp
++++ b/src/tron/gCycle.cpp
+@@ -34,6 +34,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+ #include "rTexture.h"
+ #include "eTimer.h"
+ #include "tInitExit.h"
++#include "tToDo.h"
+ #include "tRecorder.h"
+ #include "rScreen.h"
+ #include "rFont.h"
+@@ -64,7 +65,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+ #include <memory>
+ #include <functional>
+ #include <algorithm>
++#include <cctype>
++#include <cstdio>
+ #include <limits>
++#include <map>
+ #include <set>
+ #include <sstream>
+ #include <string>
+@@ -2734,6 +2738,457 @@ static void sg_WriteCycleReplayInput(
+     se_cycleReplayInputWriter.write();
+ }
+ 
++namespace
++{
++const unsigned int sg_GhostMaxEvents = 100000;
++const long long sg_GhostMaxDurationUs = 3600000000LL;
++
++struct sg_GhostEvent
++{
++    long long offsetUs;
++    int action;
++};
++
++struct sg_GhostPlan
++{
++    unsigned long long runId;
++    tString requesterName;
++    tString displayName;
++    long long durationUs;
++    eCoord position;
++    eCoord direction;
++    REAL speed;
++    unsigned short turns;
++    std::vector< sg_GhostEvent > events;
++};
++
++class gGhostPlayer;
++class gGhostCycle;
++
++struct sg_GhostSession
++{
++    explicit sg_GhostSession( int ownerID )
++        : owner(ownerID), complete(false)
++    {
++    }
++
++    int owner;
++    bool complete;
++    tJUST_CONTROLLED_PTR< gGhostPlayer > player;
++    tJUST_CONTROLLED_PTR< gGhostCycle > cycle;
++};
++
++static std::map< int, sg_GhostPlan > sg_ghostPlans;
++static std::map< int, sg_GhostSession * > sg_ghostSessions;
++static bool sg_ghostSweepScheduled = false;
++static tString sg_ghostPlanDirectory("/var/lib/armagetronad/ghosts");
++static tSettingItem< tString > sg_ghostPlanDirectoryConf(
++    "GHOST_PLAN_DIRECTORY", sg_ghostPlanDirectory );
++
++static void sg_GhostSweep();
++
++class gGhostPlayer: public ePlayerNetID
++{
++public:
++    gGhostPlayer( int recipient, tString const & name )
++        : ePlayerNetID(), recipient_(recipient), visible_(false)
++    {
++        r = 4;
++        g = 13;
++        b = 15;
++        SetName(name);
++    }
++
++    virtual bool IsHuman() const { return false; }
++    virtual bool IsServerGhost() const { return true; }
++    virtual bool ShouldTransmitTo(int user) const
++    {
++        return visible_ && user == recipient_;
++    }
++    virtual bool ClearToTransmit(int user) const
++    {
++        return ShouldTransmitTo(user) && ePlayerNetID::ClearToTransmit(user);
++    }
++    virtual nDescriptor &CreatorDescriptor() const
++    {
++        // Descriptor 201 is understood by unmodified 0.2.8 clients.
++        return ePlayerNetID::CreatorDescriptor();
++    }
++
++    void Reveal()
++    {
++        visible_ = true;
++        RequestSync(recipient_, true);
++    }
++
++private:
++    int recipient_;
++    bool visible_;
++};
++
++class gGhostCycle: public gCycle
++{
++public:
++    gGhostCycle(
++        eGrid *grid,
++        sg_GhostPlan const & plan,
++        gGhostPlayer *player,
++        gCycle *human,
++        sg_GhostSession *session )
++        : gCycle(grid, plan.position, plan.direction, player),
++          plan_(plan), recipient_(session->owner), visible_(false),
++          started_(false), complete_(false), nextEvent_(0),
++          playbackStart_(0), human_(human), session_(session)
++    {
++        RestoreCheckpointState(plan_.speed, plan_.turns);
++        SetWallBuilding(false);
++    }
++
++    virtual bool IsServerGhost() const { return true; }
++    virtual bool ShouldTransmitTo(int user) const
++    {
++        return visible_ && user == recipient_;
++    }
++    virtual nDescriptor &CreatorDescriptor() const
++    {
++        // Descriptor 320 and its payload stay byte-compatible with 0.2.8.
++        return gCycle::CreatorDescriptor();
++    }
++    virtual bool Vulnerable() const { return false; }
++    virtual void InteractWith(eGameObject *, REAL, int) {}
++    virtual void Kill() {}
++    virtual void OnRoundEnd() {}
++
++    virtual void WriteSync(nMessage &message)
++    {
++        // Legacy clients infer wall birth time from distance/speed on their
++        // first cycle sync. A large negative wire-only distance pushes that
++        // time beyond this bounded replay, preventing a predicted ghost wall
++        // from entering the requester's local collision grid.
++        REAL realDistance = distance;
++        distance = realDistance - 1000000;
++        gCycle::WriteSync(message);
++        distance = realDistance;
++    }
++
++    bool Complete() const { return complete_; }
++
++protected:
++    virtual bool TimestepCore(REAL currentTime, bool calculateAcceleration)
++    {
++        if ( complete_ )
++            return false;
++        if ( !human_ || !human_->Alive() || human_->Player() == 0 )
++        {
++            Finish();
++            return false;
++        }
++        if ( !started_ )
++        {
++            if ( human_->IsStartHeld(currentTime) )
++            {
++                lastTime = currentTime;
++                return false;
++            }
++            playbackStart_ = human_->RaceStartTime();
++            if ( playbackStart_ > currentTime )
++                playbackStart_ = currentTime;
++            lastTime = playbackStart_;
++            RestoreCheckpointState(plan_.speed, plan_.turns);
++            started_ = true;
++            visible_ = true;
++            gGhostPlayer *ghostPlayer =
++                dynamic_cast< gGhostPlayer * >(Player());
++            if ( ghostPlayer )
++                ghostPlayer->Reveal();
++            RequestSync(recipient_, true);
++        }
++
++        REAL finishTime = playbackStart_ +
++            static_cast<REAL>(plan_.durationUs) / 1000000.0;
++        REAL targetTime = currentTime < finishTime ? currentTime : finishTime;
++        while ( nextEvent_ < plan_.events.size() )
++        {
++            sg_GhostEvent const &event = plan_.events[nextEvent_];
++            REAL eventTime = playbackStart_ +
++                static_cast<REAL>(event.offsetUs) / 1000000.0;
++            if ( eventTime > targetTime )
++                break;
++            if ( eventTime > lastTime &&
++                    gCycle::TimestepCore(eventTime, calculateAcceleration) )
++            {
++                Finish();
++                return false;
++            }
++            if ( event.action == 0 )
++                gCycle::DoTurn(-1);
++            else if ( event.action == 1 )
++                gCycle::DoTurn(1);
++            else if ( event.action == 2 )
++                gCycle::Act(&gCycle::s_brake, 0);
++            else if ( event.action == 3 )
++                gCycle::Act(&gCycle::s_brake, 1);
++            ++nextEvent_;
++        }
++        if ( targetTime > lastTime &&
++                gCycle::TimestepCore(targetTime, calculateAcceleration) )
++        {
++            Finish();
++            return false;
++        }
++        SetWallBuilding(false);
++        RequestSync(recipient_, false);
++        if ( currentTime >= finishTime )
++            Finish();
++        return false;
++    }
++
++private:
++    void Finish()
++    {
++        if ( complete_ )
++            return;
++        complete_ = true;
++        if ( session_ )
++            session_->complete = true;
++        if ( !sg_ghostSweepScheduled )
++        {
++            sg_ghostSweepScheduled = true;
++            st_ToDo(sg_GhostSweep);
++        }
++    }
++
++    sg_GhostPlan plan_;
++    int recipient_;
++    bool visible_;
++    bool started_;
++    bool complete_;
++    std::size_t nextEvent_;
++    REAL playbackStart_;
++    nObserverPtr< gCycle > human_;
++    sg_GhostSession *session_;
++};
++
++static void sg_DestroyGhostSession(int owner)
++{
++    std::map< int, sg_GhostSession * >::iterator found =
++        sg_ghostSessions.find(owner);
++    if ( found == sg_ghostSessions.end() )
++        return;
++    sg_GhostSession *session = found->second;
++    sg_ghostSessions.erase(found);
++    if ( session->cycle )
++        session->cycle->RemoveFromGame();
++    if ( session->player )
++        session->player->RemoveFromGame();
++    session->cycle = 0;
++    session->player = 0;
++    delete session;
++}
++
++static void sg_GhostSweep()
++{
++    sg_ghostSweepScheduled = false;
++    std::vector< int > completed;
++    for ( std::map< int, sg_GhostSession * >::const_iterator cursor =
++              sg_ghostSessions.begin(); cursor != sg_ghostSessions.end(); ++cursor )
++        if ( cursor->second && cursor->second->complete )
++            completed.push_back(cursor->first);
++    for ( std::vector< int >::const_iterator owner = completed.begin();
++          owner != completed.end(); ++owner )
++        sg_DestroyGhostSession(*owner);
++}
++
++static bool sg_GhostSafeFilename(std::string const &filename)
++{
++    if ( filename.size() < 7 || filename.size() > 128 || filename[0] == '.' )
++        return false;
++    for ( std::string::const_iterator character = filename.begin();
++          character != filename.end(); ++character )
++        if ( !std::isalnum(static_cast<unsigned char>(*character)) &&
++             *character != '-' && *character != '.' )
++            return false;
++    return filename.compare(filename.size() - 5, 5, ".plan") == 0;
++}
++
++static bool sg_GhostDecodeHex(std::string const &encoded, tString &decoded)
++{
++    if ( encoded == "-" )
++    {
++        decoded = "Ghost";
++        return true;
++    }
++    if ( encoded.empty() || encoded.size() > 96 || encoded.size() % 2 )
++        return false;
++    std::string value;
++    for ( std::size_t index = 0; index < encoded.size(); index += 2 )
++    {
++        char *end = 0;
++        long byte = strtol(encoded.substr(index, 2).c_str(), &end, 16);
++        if ( !end || *end || byte < 32 || byte > 126 )
++            return false;
++        value.push_back(static_cast<char>(byte));
++    }
++    decoded = value.c_str();
++    return true;
++}
++
++static bool sg_ReadGhostPlan(
++    std::string const &filename, sg_GhostPlan &plan, std::string &error )
++{
++    if ( !sg_GhostSafeFilename(filename) )
++    {
++        error = "unsafe filename";
++        return false;
++    }
++    std::string directory(static_cast<char const *>(sg_ghostPlanDirectory));
++    if ( directory.empty() || directory.find("..") != std::string::npos )
++    {
++        error = "invalid plan directory";
++        return false;
++    }
++    std::string path = directory + "/" + filename;
++    std::ifstream input(path.c_str());
++    if ( !input )
++    {
++        error = "plan unavailable";
++        return false;
++    }
++
++    std::string key;
++    int format = 0;
++    std::string encodedName;
++    unsigned int eventCount = 0;
++    unsigned int turns = 0;
++    bool valid =
++        static_cast<bool>(input >> key >> format) && key == "TRONNER_GHOST" && format == 1 &&
++        static_cast<bool>(input >> key >> plan.runId) && key == "RUN" && plan.runId > 0 &&
++        static_cast<bool>(input >> key >> encodedName) && key == "NAME" &&
++        sg_GhostDecodeHex(encodedName, plan.displayName) &&
++        static_cast<bool>(input >> key >> plan.durationUs) && key == "DURATION_US" &&
++        plan.durationUs > 0 && plan.durationUs <= sg_GhostMaxDurationUs &&
++        static_cast<bool>(input >> key >> plan.position.x >> plan.position.y >>
++                          plan.direction.x >> plan.direction.y >> plan.speed >> turns) &&
++        key == "START" && turns <= 65535 &&
++        static_cast<bool>(input >> key >> eventCount) && key == "EVENT_COUNT" &&
++        eventCount <= sg_GhostMaxEvents;
++    if ( valid )
++    {
++        plan.turns = static_cast<unsigned short>(turns);
++        valid = std::isfinite(plan.position.x) && std::isfinite(plan.position.y) &&
++            std::isfinite(plan.direction.x) && std::isfinite(plan.direction.y) &&
++            std::isfinite(plan.speed) && plan.speed > EPS &&
++            plan.direction.NormSquared() > EPS;
++    }
++    long long previousOffset = -1;
++    for ( unsigned int index = 0; valid && index < eventCount; ++index )
++    {
++        sg_GhostEvent event;
++        valid = static_cast<bool>(input >> key >> event.offsetUs >> event.action) &&
++            key == "EVENT" && event.offsetUs >= 0 &&
++            event.offsetUs >= previousOffset &&
++            event.offsetUs <= plan.durationUs + 1000000 &&
++            event.action >= 0 && event.action <= 3;
++        if ( valid )
++        {
++            plan.events.push_back(event);
++            previousOffset = event.offsetUs;
++        }
++    }
++    std::string trailing;
++    if ( valid )
++        valid = static_cast<bool>(input >> trailing) && trailing == "END" &&
++            !(input >> key);
++    input.close();
++    std::remove(path.c_str());
++    if ( !valid )
++        error = "invalid plan";
++    return valid;
++}
++
++static void sg_AttachGhostToHuman(gCycle *human)
++{
++    if ( sn_GetNetState() != nSERVER || !human || !human->Player() ||
++         !human->Player()->IsHuman() || human->Player()->Owner() <= 0 )
++        return;
++    int owner = human->Player()->Owner();
++    std::map< int, sg_GhostPlan >::const_iterator found = sg_ghostPlans.find(owner);
++    if ( found == sg_ghostPlans.end() ||
++         found->second.requesterName != human->Player()->GetLogName() )
++        return;
++
++    sg_DestroyGhostSession(owner);
++    sg_GhostSession *session = new sg_GhostSession(owner);
++    session->player = new gGhostPlayer(owner, found->second.displayName);
++    session->cycle = new gGhostCycle(
++        human->Grid(), found->second, session->player, human, session );
++    session->player->ControlObject(session->cycle);
++    sg_ghostSessions[owner] = session;
++}
++
++static void sg_GhostLoad(std::istream &stream)
++{
++    ePlayerNetID *requester = ePlayerNetID::ReadPlayer(stream);
++    tString filename;
++    stream >> filename;
++    if ( filename.Len() <= 1 )
++        return;
++    sg_GhostPlan plan;
++    std::string error;
++    if ( !sg_ReadGhostPlan(static_cast<char const *>(filename), plan, error) )
++    {
++        con << "Rejected ghost plan";
++        if ( requester )
++            con << " for " << requester->GetLogName();
++        con << ": " << error.c_str() << "\n";
++        return;
++    }
++    // The plan is one-shot and has already been removed by the parser. Bind
++    // it only if the requester still exists on the expected client slot.
++    if ( !requester || !requester->IsHuman() || requester->Owner() <= 0 )
++        return;
++    plan.requesterName = requester->GetLogName();
++    sg_ghostPlans[requester->Owner()] = plan;
++    sg_DestroyGhostSession(requester->Owner());
++}
++
++static void sg_GhostClear(std::istream &stream)
++{
++    ePlayerNetID *requester = ePlayerNetID::ReadPlayer(stream);
++    if ( !requester || requester->Owner() <= 0 )
++        return;
++    sg_ghostPlans.erase(requester->Owner());
++    sg_DestroyGhostSession(requester->Owner());
++}
++
++static void sg_GhostClearAll(std::istream &)
++{
++    std::vector< int > owners;
++    for ( std::map< int, sg_GhostSession * >::const_iterator cursor =
++              sg_ghostSessions.begin(); cursor != sg_ghostSessions.end(); ++cursor )
++        owners.push_back(cursor->first);
++    for ( std::vector< int >::const_iterator owner = owners.begin();
++          owner != owners.end(); ++owner )
++        sg_DestroyGhostSession(*owner);
++    sg_ghostPlans.clear();
++}
++
++static void sg_GhostConnectionChanged()
++{
++    if ( !nCallbackLoginLogout::Login() )
++    {
++        int owner = nCallbackLoginLogout::User();
++        sg_ghostPlans.erase(owner);
++        sg_DestroyGhostSession(owner);
++    }
++}
++
++static tConfItemFunc sg_ghostLoadConf("GHOST_LOAD", &sg_GhostLoad);
++static tConfItemFunc sg_ghostClearConf("GHOST_CLEAR", &sg_GhostClear);
++static tConfItemFunc sg_ghostClearAllConf("GHOST_CLEAR_ALL", &sg_GhostClearAll);
++static nCallbackLoginLogout sg_ghostConnectionCallback(sg_GhostConnectionChanged);
++}
++
+ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
+         :gCycleMovement(grid, pos,d,p,false),
+         engine(NULL),
+@@ -2752,6 +3207,7 @@ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
+         startBraked_(false),
+         startBrakeReleaseTime_(-1),
+         startBrakeReleaseSpeed_(0),
++        raceStartTime_(se_GameTime()),
+         replayToken_(++sg_cycleReplayToken),
+         lastMovementStartPosition_(pos),
+         lastMovementStartTime_(0),
+@@ -2815,6 +3271,7 @@ gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
+             Speed() << GetTurns() << sg_activeReplaySettings << GetDistance();
+         se_cycleReplayBeginWriter.write();
+     }
++    sg_AttachGhostToHuman(this);
+ }
+ 
+ gCycle::~gCycle(){
+@@ -3373,6 +3830,7 @@ bool gCycle::TimestepCore(REAL currentTime, bool calculateAcceleration ){
+     {
+         REAL releaseTime = freezeUntil_;
+         freezeUntil_ = -1;
++        raceStartTime_ = releaseTime;
+         freezeUntilBrake_ = false;
+         freezeStartHoldTurns_ = false;
+         freezeBrakeActionDown_ = false;
+@@ -4415,6 +4873,7 @@ void gCycle::OnBrakeStateChanged(REAL time, unsigned short brakeState)
+         startBrakeReleaseTime_ = -1;
+         startBrakeReleaseSpeed_ = 0;
+         freezeStartHoldTurns_ = false;
++        raceStartTime_ = time;
+         brakingReservoir = 1;
+         verletSpeed_ = releaseSpeed;
+         acceleration = 0;
+@@ -4626,6 +5085,9 @@ bool gCycle::DoTurn(int d)
+ 
+ void gCycle::DropWall( bool buildNew )
+ {
++    if ( IsServerGhost() )
++        buildNew = false;
++
+     // keep this cycle alive
+     tJUST_CONTROLLED_PTR< gCycle > keep( this->GetRefcount()>0 ? this : 0 );
+ 
+@@ -6127,6 +6589,7 @@ gCycle::gCycle(nMessage &m)
+         startBraked_(false),
+         startBrakeReleaseTime_(-1),
+         startBrakeReleaseSpeed_(0),
++        raceStartTime_(0),
+         replayToken_(0),
+         lastMovementStartPosition_(0, 0),
+         lastMovementStartTime_(0),
+diff --git a/src/tron/gCycle.h b/src/tron/gCycle.h
+index db313743..852697f4 100644
+--- a/src/tron/gCycle.h
++++ b/src/tron/gCycle.h
+@@ -183,6 +183,7 @@ class gCycle: public gCycleMovement
+     bool startBraked_; //!< whether this cycle is staged under its ordinary synchronized brake
+     REAL startBrakeReleaseTime_; //!< automatic brake-off time, or negative for player release
+     REAL startBrakeReleaseSpeed_; //!< native spawn/checkpoint speed restored at brake release
++    REAL raceStartTime_; //!< exact start used to align a private replay ghost
+     unsigned long long replayToken_; //!< process-local identifier for compact replay events
+     void ApplyStartHoldDirection(int winding, unsigned short turnCount); //!< rotate in place without creating movement or walls
+     void TurnDuringStartHold(int direction); //!< apply one grid-relative turn while waiting for brake
+@@ -402,6 +403,14 @@ public:
+     bool IsStartHeld(REAL gameTime) const { return IsFrozen(gameTime) || startBraked_; }
+     REAL ExactZoneEntryTime(const eCoord &center, REAL radius, REAL fallback) const;
+     REAL SpawnTime() const { return spawnTime_; }
++    REAL RaceStartTime() const
++    {
++        // Before the human cycle has taken its release frame, the scheduled
++        // timestamp is already authoritative and lets a ghost start exactly
++        // on time regardless of game-object iteration order.
++        return freezeUntil_ >= 0 ? freezeUntil_ : raceStartTime_;
++    }
++    virtual bool IsServerGhost() const { return false; }
+     unsigned long long ReplayToken() const { return replayToken_; }
+     static void RecordReplaySettingsChange(REAL gameTime); //!< snapshot a settings change at its exact simulation time
+     void SetWallBuilding(bool build);
+diff --git a/src/tron/gZone.cpp b/src/tron/gZone.cpp
+index 931d0362..fb3b2949 100644
+--- a/src/tron/gZone.cpp
++++ b/src/tron/gZone.cpp
+@@ -1733,6 +1733,8 @@ void gZone::InteractWith( eGameObject * target, REAL time, int recursion )
+     if(target == this || destroyed_) return;
+     
+     gCycle* prey = dynamic_cast< gCycle* >( target );
++    if ( prey && prey->IsServerGhost() && !InteractsWithServerGhost() )
++        return;
+     if ( InteractsWithCycle() && prey )
+     {
+         if (privateUser_ && privateUser_ != prey->Owner())
+@@ -3504,6 +3506,11 @@ void sg_RubberZoneHurt( gCycle * target, gRubberZoneHack *rubberZone,REAL timest
+ 
+         if ( rubber + newRubber >= sg_rubberCycle )       // max rubber amount reached, kill the cycle
+         {
++            if ( target->IsServerGhost() )
++            {
++                target->SetRubber( sg_rubberCycle );
++                return;
++            }
+             target->Player()->AddScore( score_rubberzone, tOutput(), "$player_lose_rubberzone" );
+             target->Kill("RUBBERZONE");
+             target->SetRubber( sg_rubberCycle );
+diff --git a/src/tron/gZone.h b/src/tron/gZone.h
+index 8cef960f..2ed5e9f5 100644
+--- a/src/tron/gZone.h
++++ b/src/tron/gZone.h
+@@ -254,6 +254,7 @@ private:
+     virtual void ReadSync(nMessage &m);    //!< reads sync data
+ 
+     virtual void InteractWith( eGameObject *target,REAL time,int recursion=1 ); //!< looks for objects inzide the zone and reacts on them
++    virtual bool InteractsWithServerGhost() const { return false; }
+ 
+     virtual void OnEnter( gCycle *target, REAL time ); //!< reacts on objects inside the zone
+     virtual void OnEnter( gZone *target, REAL time );  //!< reacts on objects inside the zone
+@@ -417,6 +418,7 @@ class gRubberZoneHack: public gZone
+ 								 //!< reacts on objects inside the zone (kills them)
+ 		virtual bool Timestep(REAL currentTime);
+ 		virtual void OnEnter( gCycle *target, REAL time );
++		virtual bool InteractsWithServerGhost() const { return true; }
+ };
+ 
+ extern inline bool BaseZoneIsAttackable();
+@@ -700,6 +702,7 @@ class gTeleportZoneHack: public gZone
+ 		virtual void OnVanish();
+ 		//!< reacts on objects inside the zone
+ 		virtual void OnEnter( gCycle *target, REAL time );
++		virtual bool InteractsWithServerGhost() const { return true; }
+ 
+ 	eCoord jump;
+ 	eCoord ndir;
+@@ -757,6 +760,7 @@ class gSpeedZoneHack: public gZone
+         virtual bool Timestep(REAL currentTime);
+         virtual void OnVanish();
+         virtual void OnEnter(gCycle *target, REAL time);
++        virtual bool InteractsWithServerGhost() const { return true; }
+ };
+ 
+ class gObjectZoneHack: public gZone

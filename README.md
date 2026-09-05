@@ -35,8 +35,8 @@ python3 deploy/render_node.py \
   --output /tmp/tronner-rendered
 ```
 
-See [Installation](docs/installation.md) and
-[Validation](docs/validation.md).
+See [Installation](docs/installation.md), [Validation](docs/validation.md), and
+[Private replay ghosts](docs/ghosts.md).
 
 ## Development
 
