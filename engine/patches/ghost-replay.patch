@@ -107,7 +107,7 @@ index c8a4959f..95e5e8a2 100644
  #include <set>
  #include <sstream>
  #include <string>
-@@ -2734,6 +2738,457 @@ static void sg_WriteCycleReplayInput(
+@@ -2734,6 +2738,548 @@ static void sg_WriteCycleReplayInput(
      se_cycleReplayInputWriter.write();
  }
  
@@ -120,6 +120,11 @@ index c8a4959f..95e5e8a2 100644
 +{
 +    long long offsetUs;
 +    int action;
++    bool hasState;
++    eCoord position;
++    eCoord direction;
++    REAL speed;
++    unsigned short turns;
 +};
 +
 +struct sg_GhostPlan
@@ -294,13 +299,22 @@ index c8a4959f..95e5e8a2 100644
 +                return false;
 +            }
 +            if ( event.action == 0 )
-+                gCycle::DoTurn(-1);
++                ReplayTurn(-1);
 +            else if ( event.action == 1 )
-+                gCycle::DoTurn(1);
++                ReplayTurn(1);
 +            else if ( event.action == 2 )
 +                gCycle::Act(&gCycle::s_brake, 0);
 +            else if ( event.action == 3 )
 +                gCycle::Act(&gCycle::s_brake, 1);
++            // Captured turns were accepted by the authoritative server. Do
++            // not let a replay-time timing edge leave one queued to execute
++            // later as an apparent extra turn.
++            pendingTurns.clear();
++            if ( event.hasState && event.action <= 1 )
++                RestoreReplayEventState(
++                    event.position * gArena::SizeMultiplier(),
++                    event.direction, event.speed, event.turns,
++                    event.action == 0 ? -1 : 1 );
 +            ++nextEvent_;
 +        }
 +        if ( targetTime > lastTime &&
@@ -317,6 +331,24 @@ index c8a4959f..95e5e8a2 100644
 +    }
 +
 +private:
++    void ReplayTurn(int direction)
++    {
++        // The source event was logged only after the authoritative server
++        // accepted it. Execute it at that exact recorded time even if float
++        // rounding would otherwise put it just inside the delay window.
++        pendingTurns.clear();
++        REAL previousLeft = lastTurnTimeLeft_;
++        REAL previousRight = lastTurnTimeRight_;
++        lastTurnTimeLeft_ = -std::numeric_limits<REAL>::max() / 4;
++        lastTurnTimeRight_ = lastTurnTimeLeft_;
++        gCycle::DoTurn(direction);
++        pendingTurns.clear();
++        if ( direction < 0 )
++            lastTurnTimeRight_ = previousRight;
++        else
++            lastTurnTimeLeft_ = previousLeft;
++    }
++
 +    void Finish()
 +    {
 +        if ( complete_ )
@@ -434,7 +466,8 @@ index c8a4959f..95e5e8a2 100644
 +    unsigned int eventCount = 0;
 +    unsigned int turns = 0;
 +    bool valid =
-+        static_cast<bool>(input >> key >> format) && key == "TRONNER_GHOST" && format == 1 &&
++        static_cast<bool>(input >> key >> format) && key == "TRONNER_GHOST" &&
++        (format == 1 || format == 2) &&
 +        static_cast<bool>(input >> key >> plan.runId) && key == "RUN" && plan.runId > 0 &&
 +        static_cast<bool>(input >> key >> encodedName) && key == "NAME" &&
 +        sg_GhostDecodeHex(encodedName, plan.displayName) &&
@@ -462,6 +495,30 @@ index c8a4959f..95e5e8a2 100644
 +            event.offsetUs >= previousOffset &&
 +            event.offsetUs <= plan.durationUs + 1000000 &&
 +            event.action >= 0 && event.action <= 3;
++        event.hasState = false;
++        if ( valid && format >= 2 )
++        {
++            unsigned int hasState = 0;
++            valid = static_cast<bool>(input >> hasState) && hasState <= 1;
++            event.hasState = hasState == 1;
++            if ( valid && event.hasState )
++            {
++                unsigned int stateTurns = 0;
++                valid = static_cast<bool>(input >> event.position.x >>
++                    event.position.y >> event.direction.x >> event.direction.y >>
++                    event.speed >> stateTurns) && stateTurns <= 65535;
++                if ( valid )
++                {
++                    event.turns = static_cast<unsigned short>(stateTurns);
++                    valid = std::isfinite(event.position.x) &&
++                        std::isfinite(event.position.y) &&
++                        std::isfinite(event.direction.x) &&
++                        std::isfinite(event.direction.y) &&
++                        std::isfinite(event.speed) && event.speed > EPS &&
++                        event.direction.NormSquared() > EPS;
++                }
++            }
++        }
 +        if ( valid )
 +        {
 +            plan.events.push_back(event);
@@ -562,6 +619,40 @@ index c8a4959f..95e5e8a2 100644
 +static nCallbackLoginLogout sg_ghostConnectionCallback(sg_GhostConnectionChanged);
 +}
 +
++void gCycle::RestoreReplayEventState(
++    const eCoord &position, const eCoord &direction, REAL speed,
++    unsigned short turnCount, int turnDirection )
++{
++    if ( !IsServerGhost() || !std::isfinite(position.x) ||
++         !std::isfinite(position.y) || !std::isfinite(direction.x) ||
++         !std::isfinite(direction.y) || !std::isfinite(speed) ||
++         speed <= EPS || direction.NormSquared() <= EPS )
++        return;
++
++    pendingTurns.clear();
++    AccelerationDiscontinuity();
++    pos = position;
++    lastGoodPosition_ = pos;
++    correctPosSmooth = eCoord(0, 0);
++    correctDistanceSmooth = 0;
++    predictPosition_ = pos;
++    lastTurnPos_ = pos;
++    lastMovementStartPosition_ = pos;
++    lastMovementStartTime_ = lastTime;
++    lastMovementValid_ = false;
++    windingNumberWrapped_ = Grid()->DirectionWinding(direction);
++    dirDrive = Grid()->GetDirection(windingNumberWrapped_);
++    dir = dirDrive;
++    verletSpeed_ = speed;
++    turns = turnCount;
++    if ( turnDirection < 0 )
++        lastTurnTimeLeft_ = lastTime;
++    else
++        lastTurnTimeRight_ = lastTime;
++    refreshSpaceAhead_ = true;
++    FindCurrentFace();
++}
++
  gCycle::gCycle(eGrid *grid, const eCoord &pos,const eCoord &d,ePlayerNetID *p)
          :gCycleMovement(grid, pos,d,p,false),
          engine(NULL),
@@ -627,7 +718,7 @@ index db313743..852697f4 100644
      unsigned long long replayToken_; //!< process-local identifier for compact replay events
      void ApplyStartHoldDirection(int winding, unsigned short turnCount); //!< rotate in place without creating movement or walls
      void TurnDuringStartHold(int direction); //!< apply one grid-relative turn while waiting for brake
-@@ -402,6 +403,14 @@ public:
+@@ -402,6 +403,17 @@ public:
      bool IsStartHeld(REAL gameTime) const { return IsFrozen(gameTime) || startBraked_; }
      REAL ExactZoneEntryTime(const eCoord &center, REAL radius, REAL fallback) const;
      REAL SpawnTime() const { return spawnTime_; }
@@ -640,6 +731,9 @@ index db313743..852697f4 100644
 +    }
 +    virtual bool IsServerGhost() const { return false; }
      unsigned long long ReplayToken() const { return replayToken_; }
++    void RestoreReplayEventState(const eCoord &position,
++                                 const eCoord &direction, REAL speed,
++                                 unsigned short turnCount, int turnDirection);
      static void RecordReplaySettingsChange(REAL gameTime); //!< snapshot a settings change at its exact simulation time
      void SetWallBuilding(bool build);
 diff --git a/src/tron/gZone.cpp b/src/tron/gZone.cpp

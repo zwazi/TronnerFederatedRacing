@@ -14,16 +14,26 @@
 `/ghost` defaults to PB. PB uses the requester's best time, WR uses rank 1, and
 rank/name selectors use the current map's leaderboard. A selection starts with
 the requester's next attempt and remains active until it is disabled, the map
-changes, or the requester disconnects. A record is eligible only when its full input replay
-matches the exact map revision, map size, finish time, turns, and current
-physics snapshot. Historical records without a matching replay are reported as
-unavailable.
+changes, or the requester disconnects. The controller prefers the exact replay
+for the selected leaderboard time. If that time predates input capture, it uses
+the player's fastest available full-run replay and states both the replay and
+ranked times in the confirmation.
+
+Historical resource names and revisions remain eligible when a strict XML
+comparison proves that their physical track geometry is identical to the active
+map. The comparison ignores map-local settings, checks those settings against
+the captured server physics separately, and normalizes spatial coordinates by
+`SIZE_FACTOR`. This also converts a legacy replay's start position when an old
+size-scaled map was migrated to baked coordinates. A replay remains unavailable
+when its inputs are missing or invalid, its geometry genuinely changed, or any
+movement/zone physics setting differs.
 
 Physics compatibility compares the captured setting values, not only the raw
 snapshot identifier. Runtime-only `SERVER_OPTIONS` text and
 `PING_CHARITY_SERVER` latency allowance are ignored because they cannot affect
-the route of a server-driven, non-colliding ghost; movement and zone settings
-must still match exactly.
+the route of a server-driven, non-colliding ghost. `SIZE_FACTOR` is compared via
+the physical-map normalization above; movement and zone settings must still
+match exactly, including every captured mid-run settings transition.
 
 The controller writes a bounded, mode-0600 one-shot plan under
 `/var/lib/armagetronad/ghosts`. The patched server creates an invulnerable,
@@ -32,6 +42,13 @@ microsecond offsets, and starts from the human cycle's authoritative release
 time. Teleport, speed, and rubber zones still affect playback so the recorded
 route remains faithful. Ghosts do not create walls, affect other cycles,
 trigger scoring/death/checkpoint zones, or enter racing ladder logs.
+
+Newly recorded replays also store the authoritative position, direction, speed,
+and turn count after every accepted turn. The server applies these turn
+keyframes after the recorded input and clears the ordinary delayed-input queue,
+preventing simulation drift near walls and preventing a queued turn from firing
+later as an apparent extra input. Version-1 plans and older runs without turn
+keyframes remain supported as best-effort input-only replays.
 
 Replay plans store positions in map coordinates. The server converts those
 positions through the arena size multiplier when it creates the ghost, matching

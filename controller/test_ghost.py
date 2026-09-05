@@ -6,9 +6,11 @@ from types import SimpleNamespace
 
 from TronnerRacing import (
     GHOST_PLAN_FILENAME_RE,
+    MapRepository,
     Player,
     Record,
     ReplayCapture,
+    ReplayEventState,
     StateStore,
     TronnerRacing as Controller,
     plain_console_text,
@@ -22,6 +24,16 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
 
         async def send(self, *commands):
             self.commands.extend(commands)
+
+    class Repository:
+        @staticmethod
+        def ghost_coordinate_scale(
+            _current,
+            _recorded_resource_key,
+            _recorded_size_factor,
+            _current_size_factor,
+        ):
+            return 1.0
 
     @staticmethod
     def add_recorded_finish(store: StateStore) -> tuple[Player, Record, int]:
@@ -59,6 +71,10 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
                 (1_250_000, 0),
                 (2_000_000, 3),
             ],
+            event_states={
+                0: ReplayEventState(0.5, -2.5, 0.0, -1.0, 29.0, 1),
+                2: ReplayEventState(2.0, -3.0, 0.0, 1.0, 31.0, 2),
+            },
         )
         capture.outcome = "finish"
         capture.finish_seconds = 12.5
@@ -72,19 +88,18 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
             store = StateStore(Path(directory) / "state.sqlite3")
             _player, record, run_id = self.add_recorded_finish(store)
 
-            replay = store.ghost_replay_for_record(
-                "resource-revision-1", "record-map", record
-            )
+            replays = store.ghost_replays_for_record("record-map", record)
 
-            self.assertIsNotNone(replay)
+            self.assertEqual(len(replays), 1)
+            replay = replays[0]
             self.assertEqual(replay.run_id, run_id)
             self.assertEqual(replay.events, ((0, 2), (250_000, 0), (1_000_000, 3)))
-            self.assertEqual(replay.settings_identifier, "physics-1")
-            self.assertIsNone(
-                store.ghost_replay_for_record(
-                    "different-resource-revision", "record-map", record
-                )
+            self.assertEqual(
+                replay.event_states,
+                (None, ReplayEventState(2.0, -3.0, 0.0, 1.0, 31.0, 2), None),
             )
+            self.assertEqual(replay.settings_identifier, "physics-1")
+            self.assertEqual(replay.resource_key, "resource-revision-1")
             store.close()
 
     def test_ghost_settings_ignore_runtime_metadata_but_not_physics(self):
@@ -117,13 +132,85 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
                     (b"SERVER_OPTIONS", b"Current map: Epyon | Next Map: Triform"),
                 ],
             )
+            store.add_replay_settings(
+                "changed-size",
+                1,
+                [(b"CYCLE_SPEED", b"20"), (b"SIZE_FACTOR", b"6")],
+            )
+            store.add_replay_settings(
+                "active-size",
+                1,
+                [(b"CYCLE_SPEED", b"20"), (b"SIZE_FACTOR", b"0")],
+            )
 
             self.assertTrue(store.ghost_settings_compatible("recorded", "active"))
             self.assertFalse(
                 store.ghost_settings_compatible("recorded", "changed-physics")
             )
+            self.assertFalse(
+                store.ghost_settings_compatible("changed-size", "active-size")
+            )
+            self.assertTrue(
+                store.ghost_settings_compatible(
+                    "changed-size", "active-size", ignore_size_factor=True
+                )
+            )
             self.assertFalse(store.ghost_settings_compatible("recorded", "missing"))
             store.close()
+
+    def test_historical_size_baked_map_gets_safe_coordinate_scale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            public = root / "public"
+            legacy = public / "Tester/maps/Race-1.aamap.xml"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text(
+                '<Resource author="Tester" name="Race" version="1" category="maps">'
+                '<Map><Settings><Setting name="SIZE_FACTOR" value="6"/></Settings>'
+                '<World><Field><Spawn x="10" y="-2" xdir="1" ydir="0"/>'
+                '<Wall><Point x="10" y="-2"/><Point x="12.5" y="3"/>'
+                '</Wall></Field></World></Map></Resource>',
+                encoding="utf-8",
+            )
+            current_path = root / "current.aamap.xml"
+            current_path.write_text(
+                '<Resource author="Tester" name="Race" version="2" category="maps">'
+                '<Map><Settings><Setting name="SIZE_FACTOR" value="0"/></Settings>'
+                '<World><Field><Spawn x="80" y="-16" xdir="1" ydir="0"/>'
+                '<Wall><Point x="80" y="-16"/><Point x="100" y="24"/>'
+                '</Wall></Field></World></Map></Resource>',
+                encoding="utf-8",
+            )
+            repository = object.__new__(MapRepository)
+            repository.public_dir = public
+            repository.firebase_maps_by_key = {}
+            repository._ghost_geometry_cache = {}
+            current = SimpleNamespace(local_path=current_path)
+
+            scale = repository.ghost_coordinate_scale(
+                current,
+                "Tester/maps/Race-1.aamap.xml",
+                0.0,
+                0.0,
+            )
+
+            self.assertEqual(scale, 8.0)
+
+            changed = public / "Tester/maps/Race-changed.aamap.xml"
+            changed.write_text(
+                legacy.read_text(encoding="utf-8").replace(
+                    '<Point x="12.5" y="3"/>', '<Point x="13" y="3"/>'
+                ),
+                encoding="utf-8",
+            )
+            self.assertIsNone(
+                repository.ghost_coordinate_scale(
+                    current,
+                    "Tester/maps/Race-changed.aamap.xml",
+                    0.0,
+                    0.0,
+                )
+            )
 
     def test_release_state_is_preserved_when_terminal_state_arrives(self):
         capture = ReplayCapture(
@@ -205,14 +292,62 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(capture.release_offset_us)
         self.assertEqual(capture.latest_distance, 500.0)
 
+    async def test_replay_input_captures_authoritative_post_turn_state(self):
+        capture = ReplayCapture(
+            token="run-state",
+            player_log_name="racer",
+            identity_key="auth:racer",
+            username="Racer",
+            authenticated=True,
+            map_identifier="Tester/maps/Race-v1.aamap.xml",
+            revision_identifier="revision-1",
+            resource_key="resource-revision-1",
+            started_at=1000.0,
+            spawn_game_time=10.0,
+            x=1.0,
+            y=2.0,
+            xdir=1.0,
+            ydir=0.0,
+            speed=30.0,
+            initial_turns=1,
+            size_factor=0.0,
+            start_mode="immediate",
+            checkpoint_spawn=False,
+        )
+        controller = object.__new__(Controller)
+        controller.replay_captures = {capture.token: capture}
+        controller.player_for = lambda _name: None
+
+        await controller._handle_replay_input(
+            "run-state 10.25 L 5 -7 0 1 31.5 2"
+        )
+
+        self.assertEqual(capture.events, [(250_000, 0)])
+        self.assertEqual(
+            capture.event_states,
+            {0: ReplayEventState(5.0, -7.0, 0.0, 1.0, 31.5, 2)},
+        )
+
     async def test_world_record_command_writes_private_one_shot_plan(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store = StateStore(root / "state.sqlite3")
             player, _record, run_id = self.add_recorded_finish(store)
+            transition_ref = store.add_replay_settings(
+                "physics-runtime-update",
+                1,
+                [(b"SERVER_OPTIONS", b"Next map changed")],
+            )
+            store.current_connection().execute(
+                "INSERT INTO replay_setting_transitions"
+                "(run_ref, offset_us, settings_ref) VALUES(?, ?, ?)",
+                (run_id, 2_000_000, transition_ref),
+            )
+            store.current_connection().commit()
             controller = object.__new__(Controller)
             controller.sink = self.Sink()
             controller.store = store
+            controller.repository = self.Repository()
             controller.current = SimpleNamespace(
                 key="resource-revision-1",
                 records_key="record-map",
@@ -236,12 +371,13 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
             self.assertRegex(filename, GHOST_PLAN_FILENAME_RE)
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
             lines = path.read_text(encoding="ascii").splitlines()
-            self.assertEqual(lines[0], "TRONNER_GHOST 1")
+            self.assertEqual(lines[0], "TRONNER_GHOST 2")
             self.assertEqual(lines[1], f"RUN {run_id}")
             self.assertEqual(lines[2], f"NAME {'Ghost WR'.encode().hex()}")
             self.assertIn("DURATION_US 12500000", lines)
             self.assertIn("EVENT_COUNT 3", lines)
-            self.assertIn("EVENT 250000 0", lines)
+            self.assertIn("EVENT 0 2 0", lines)
+            self.assertIn("EVENT 250000 0 1 2 -3 0 1 31 2", lines)
             confirmation = " ".join(
                 plain_console_text(command)
                 for command in controller.sink.commands
@@ -268,6 +404,7 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
             controller = object.__new__(Controller)
             controller.sink = self.Sink()
             controller.store = store
+            controller.repository = self.Repository()
             controller.current = SimpleNamespace(
                 key="resource-revision-1",
                 records_key="record-map",
@@ -293,6 +430,49 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
             controller.sink.commands.clear()
             await controller._command_ghost(player, "off")
             self.assertIn("GHOST_CLEAR racer", controller.sink.commands)
+            store.close()
+
+    async def test_command_uses_fastest_available_run_when_pb_predates_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = StateStore(root / "state.sqlite3")
+            player, _record, _run_id = self.add_recorded_finish(store)
+            record, improved, _old_time, _old_turns = store.add_finish(
+                "record-map", player, 11.0, 3
+            )
+            self.assertTrue(improved)
+            controller = object.__new__(Controller)
+            controller.sink = self.Sink()
+            controller.store = store
+            controller.repository = self.Repository()
+            controller.current = SimpleNamespace(
+                key="resource-revision-2",
+                records_key="record-map",
+                time_decimals=3,
+            )
+            controller.current_size_factor = 0.0
+            controller.active_replay_settings_identifier = "physics-1"
+            controller.round_active = True
+            controller.transitioning = False
+            controller.config = {"ghost_plan_dir": str(root / "ghosts")}
+
+            await controller._command_ghost(player, "pb")
+
+            self.assertTrue(
+                any(
+                    command.startswith("GHOST_LOAD ")
+                    for command in controller.sink.commands
+                )
+            )
+            confirmation = " ".join(
+                plain_console_text(command)
+                for command in controller.sink.commands
+                if command.startswith("PLAYER_MESSAGE ")
+            )
+            self.assertIn("fastest available replay", confirmation)
+            self.assertIn("12.500s", confirmation)
+            self.assertIn("ranked time 11.000s", confirmation)
+            self.assertEqual(record.best_seconds, 11.0)
             store.close()
 
     def test_rank_and_name_selectors_are_unambiguous(self):

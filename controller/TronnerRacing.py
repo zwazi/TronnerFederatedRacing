@@ -64,15 +64,19 @@ REPLAY_FORMAT_VERSION = 1
 REPLAY_ACTION_CODES = {"L": 0, "R": 1, "B0": 2, "B1": 3}
 REPLAY_ACTION_NAMES = tuple(REPLAY_ACTION_CODES)
 REPLAY_SETTINGS_FORMAT_VERSION = 1
-GHOST_PLAN_FORMAT_VERSION = 1
+GHOST_PLAN_FORMAT_VERSION = 2
 GHOST_MAX_EVENTS = 100_000
 GHOST_MAX_DURATION_SECONDS = 3_600.0
+GHOST_REPLAY_CANDIDATE_LIMIT = 100
 # These settings are captured in replay snapshots but cannot affect the path of
 # a private, server-driven ghost. Their values routinely change as players or
 # the map queue change, so comparing the raw snapshot identifier would reject
 # otherwise identical physics.
 GHOST_NON_PHYSICS_REPLAY_SETTINGS = frozenset(
     {b"PING_CHARITY_SERVER", b"SERVER_OPTIONS"}
+)
+GHOST_SPATIAL_MAP_ATTRIBUTES = frozenset(
+    {"x", "y", "radius", "growth", "destX", "destY"}
 )
 GHOST_PLAN_FILENAME_RE = re.compile(r"ghost-[0-9]+-[0-9]+\.plan")
 SERVER_CONSOLE_HISTORY_LINES = 250
@@ -277,6 +281,59 @@ def encode_game_text(text: str, encoding: str, context: str) -> bytes:
 
 def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
+
+
+def ghost_map_geometry(path: Path, size_factor: float) -> tuple | None:
+    """Return a strict, size-normalized representation of a map's geometry."""
+    try:
+        factor = float(size_factor)
+        if not math.isfinite(factor) or abs(factor) > 100:
+            return None
+        scale = 2.0 ** (factor / 2.0)
+        root = ET.parse(path).getroot()
+        map_node = next(node for node in root.iter() if local_name(node.tag) == "Map")
+    except (
+        ET.ParseError,
+        OSError,
+        StopIteration,
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
+        return None
+
+    def canonical(node: ET.Element) -> tuple:
+        attributes: list[tuple[str, str]] = []
+        for raw_name, raw_value in node.attrib.items():
+            name = local_name(raw_name)
+            value = raw_value.strip()
+            if name in GHOST_SPATIAL_MAP_ATTRIBUTES:
+                try:
+                    physical = float(value) * scale
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError("invalid spatial map coordinate") from exc
+                if not math.isfinite(physical):
+                    raise ValueError("non-finite spatial map coordinate")
+                physical = round(physical, 5)
+                if physical == 0:
+                    physical = 0.0
+                value = format(physical, ".5f")
+            attributes.append((name, value))
+        children: list[tuple] = []
+        for child in node:
+            if local_name(child.tag) != "Settings":
+                children.append(canonical(child))
+        return (
+            local_name(node.tag),
+            tuple(sorted(attributes)),
+            " ".join((node.text or "").split()),
+            tuple(children),
+        )
+
+    try:
+        return canonical(map_node)
+    except ValueError:
+        return None
 
 
 def clean_console_text(value: object) -> str:
@@ -1819,6 +1876,16 @@ class Player:
         return f"{color}{self.display_name or self.log_name}"
 
 
+@dataclasses.dataclass(frozen=True)
+class ReplayEventState:
+    x: float
+    y: float
+    xdir: float
+    ydir: float
+    speed: float
+    turns: int
+
+
 @dataclasses.dataclass
 class ReplayCapture:
     token: str
@@ -1849,6 +1916,7 @@ class ReplayCapture:
     release_offset_us: int | None = None
     events: list[tuple[int, int]] = dataclasses.field(default_factory=list)
     seen_events: set[tuple[int, int]] = dataclasses.field(default_factory=set)
+    event_states: dict[int, ReplayEventState] = dataclasses.field(default_factory=dict)
     braking: bool = False
     outcome: str = "death"
     death_reason: str = ""
@@ -1891,7 +1959,12 @@ class ReplayCapture:
                 (game_time - self.spawn_game_time) * 1_000_000
             )
 
-    def add_input(self, game_time: float, action_name: str) -> bool:
+    def add_input(
+        self,
+        game_time: float,
+        action_name: str,
+        state: ReplayEventState | None = None,
+    ) -> bool:
         action = REPLAY_ACTION_CODES.get(action_name)
         if action is None or not math.isfinite(game_time):
             return False
@@ -1905,7 +1978,10 @@ class ReplayCapture:
         if event in self.seen_events:
             return False
         self.seen_events.add(event)
+        event_index = len(self.events)
         self.events.append(event)
+        if state is not None:
+            self.event_states[event_index] = state
         return True
 
     def add_settings_transition(self, game_time: float, identifier: str) -> bool:
@@ -1948,7 +2024,11 @@ class GhostReplay:
     run_id: int
     identity_key: str
     username: str
+    resource_key: str
+    map_identifier: str
+    revision_identifier: str
     finish_seconds: float
+    finish_turns: int | None
     x: float
     y: float
     xdir: float
@@ -1957,7 +2037,9 @@ class GhostReplay:
     initial_turns: int
     size_factor: float | None
     events: tuple[tuple[int, int], ...]
+    event_states: tuple[ReplayEventState | None, ...] = ()
     settings_identifier: str | None = None
+    settings_identifiers: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2141,6 +2223,17 @@ class StateStore:
                 offset_us INTEGER NOT NULL,
                 settings_ref INTEGER NOT NULL REFERENCES replay_settings(id),
                 PRIMARY KEY(run_ref, offset_us, settings_ref)
+            );
+            CREATE TABLE IF NOT EXISTS replay_event_states (
+                run_ref INTEGER NOT NULL REFERENCES replay_runs(id) ON DELETE CASCADE,
+                event_index INTEGER NOT NULL,
+                x REAL NOT NULL,
+                y REAL NOT NULL,
+                xdir REAL NOT NULL,
+                ydir REAL NOT NULL,
+                speed REAL NOT NULL,
+                turns INTEGER NOT NULL,
+                PRIMARY KEY(run_ref, event_index)
             );
             """
         )
@@ -2635,10 +2728,15 @@ class StateStore:
         self,
         recorded_identifier: str,
         active_identifier: str,
+        *,
+        ignore_size_factor: bool = False,
     ) -> bool:
         """Compare replay settings while excluding non-simulation metadata."""
         if recorded_identifier == active_identifier:
             return True
+        ignored_settings = GHOST_NON_PHYSICS_REPLAY_SETTINGS
+        if ignore_size_factor:
+            ignored_settings = ignored_settings | {b"SIZE_FACTOR"}
         rows = self.current_connection().execute(
             "SELECT server_identifier, format_version, compression, setting_data "
             "FROM replay_settings WHERE server_identifier IN (?, ?)",
@@ -2658,7 +2756,7 @@ class StateStore:
                     sorted(
                         (name, value)
                         for name, value in decode_replay_settings(raw)
-                        if name not in GHOST_NON_PHYSICS_REPLAY_SETTINGS
+                        if name not in ignored_settings
                     )
                 )
                 snapshots[str(identifier)] = (int(format_version), relevant_items)
@@ -2771,6 +2869,24 @@ class StateStore:
             ),
         )
         run_ref = int(cursor.lastrowid)
+        for event_index, state in capture.event_states.items():
+            if event_index < 0 or event_index >= len(capture.events):
+                continue
+            self.connection.execute(
+                "INSERT OR IGNORE INTO replay_event_states("
+                "run_ref, event_index, x, y, xdir, ydir, speed, turns) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_ref,
+                    event_index,
+                    state.x,
+                    state.y,
+                    state.xdir,
+                    state.ydir,
+                    state.speed,
+                    state.turns,
+                ),
+            )
         for offset_us, identifier in capture.settings_transitions:
             transition_ref = self.replay_settings_ref(identifier)
             if transition_ref is None:
@@ -2908,96 +3024,162 @@ class StateStore:
             for row in rows
         ]
 
-    def ghost_replay_for_record(
+    def ghost_replays_for_record(
         self,
-        resource_key: str,
         record_key: str,
         record: Record,
-    ) -> GhostReplay | None:
-        """Return the exact full-run replay backing one ranked map record."""
-        row = self.current_connection().execute(
+    ) -> tuple[GhostReplay, ...]:
+        """Return ranked-first full-run replay candidates for one player."""
+        connection = self.current_connection()
+        rows = connection.execute(
             "SELECT replay_runs.id, replay_players.identity_key, "
             "replay_players.username, replay_runs.finish_seconds, "
-            "replay_runs.start_x, replay_runs.start_y, "
+            "replay_runs.finish_turns, replay_runs.start_x, replay_runs.start_y, "
             "replay_runs.start_xdir, replay_runs.start_ydir, "
             "replay_runs.start_speed, replay_runs.initial_turns, "
             "replay_runs.size_factor, replay_runs.release_offset_us, "
-            "replay_runs.input_data, replay_settings.server_identifier "
+            "replay_runs.input_data, replay_settings.server_identifier, "
+            "replay_maps.resource_key, replay_maps.map_identifier, "
+            "replay_maps.revision_identifier "
             "FROM replay_runs "
             "JOIN replay_players ON replay_players.id=replay_runs.player_ref "
             "JOIN replay_maps ON replay_maps.id=replay_runs.map_ref "
             "LEFT JOIN replay_settings ON replay_settings.id=replay_runs.settings_ref "
-            "WHERE replay_maps.resource_key=? AND replay_maps.record_key=? "
+            "WHERE replay_maps.record_key=? "
             "AND replay_players.identity_key=? AND replay_runs.outcome=1 "
             "AND replay_runs.checkpoint_spawn=0 "
-            "AND replay_runs.finish_seconds=? "
-            "AND (replay_runs.finish_turns=? OR "
-            "(replay_runs.finish_turns IS NULL AND ? IS NULL)) "
             "AND replay_runs.format_version=? "
-            "AND NOT EXISTS (SELECT 1 FROM replay_setting_transitions "
-            "WHERE replay_setting_transitions.run_ref=replay_runs.id) "
-            "ORDER BY replay_runs.recorded_at DESC, replay_runs.id DESC LIMIT 1",
+            "ORDER BY CASE WHEN replay_runs.finish_seconds=? AND "
+            "(replay_runs.finish_turns=? OR (replay_runs.finish_turns IS NULL "
+            "AND ? IS NULL)) THEN 0 ELSE 1 END, "
+            "replay_runs.finish_seconds ASC, replay_runs.finish_turns IS NULL, "
+            "replay_runs.finish_turns ASC, replay_runs.recorded_at DESC, "
+            "replay_runs.id DESC LIMIT ?",
             (
-                resource_key,
                 record_key,
                 record.identity_key,
+                REPLAY_FORMAT_VERSION,
                 record.best_seconds,
                 record.best_turns,
                 record.best_turns,
-                REPLAY_FORMAT_VERSION,
+                GHOST_REPLAY_CANDIDATE_LIMIT,
             ),
-        ).fetchone()
-        if row is None:
-            return None
-        finish_seconds = float(row[3])
-        if (
-            not math.isfinite(finish_seconds)
-            or finish_seconds <= 0
-            or finish_seconds > GHOST_MAX_DURATION_SECONDS
-        ):
-            return None
-        release_offset_us = int(row[11] or 0)
-        try:
-            decoded_events = decode_replay_inputs(bytes(row[12]))
-        except (TypeError, ValueError):
-            return None
-        normalized_events = tuple(
-            (int(offset_us) - release_offset_us, int(action))
-            for offset_us, action in decoded_events
-            if int(offset_us) >= release_offset_us
-        )
-        if len(normalized_events) > GHOST_MAX_EVENTS:
-            return None
-        duration_us = round(finish_seconds * 1_000_000)
-        if any(
-            offset_us < 0
-            or offset_us > duration_us + 1_000_000
-            or action not in range(len(REPLAY_ACTION_NAMES))
-            for offset_us, action in normalized_events
-        ):
-            return None
-        start_values = tuple(float(value) for value in row[4:10])
-        if (
-            not all(math.isfinite(value) for value in start_values)
-            or start_values[4] <= 1e-12
-            or start_values[2] ** 2 + start_values[3] ** 2 <= 1e-12
-        ):
-            return None
-        return GhostReplay(
-            run_id=int(row[0]),
-            identity_key=str(row[1]),
-            username=str(row[2]),
-            finish_seconds=finish_seconds,
-            x=start_values[0],
-            y=start_values[1],
-            xdir=start_values[2],
-            ydir=start_values[3],
-            speed=start_values[4],
-            initial_turns=max(0, min(65535, int(start_values[5]))),
-            size_factor=float(row[10]) if row[10] is not None else None,
-            events=normalized_events,
-            settings_identifier=str(row[13]) if row[13] is not None else None,
-        )
+        ).fetchall()
+        replays: list[GhostReplay] = []
+        for row in rows:
+            finish_seconds = float(row[3])
+            if (
+                not math.isfinite(finish_seconds)
+                or finish_seconds <= 0
+                or finish_seconds > GHOST_MAX_DURATION_SECONDS
+            ):
+                continue
+            release_offset_us = int(row[12] or 0)
+            try:
+                decoded_events = decode_replay_inputs(bytes(row[13]))
+            except (TypeError, ValueError):
+                continue
+            state_rows = connection.execute(
+                "SELECT event_index, x, y, xdir, ydir, speed, turns "
+                "FROM replay_event_states WHERE run_ref=? ORDER BY event_index",
+                (int(row[0]),),
+            ).fetchall()
+            saved_states: dict[int, ReplayEventState] = {}
+            for state_row in state_rows:
+                try:
+                    state = ReplayEventState(
+                        *(float(value) for value in state_row[1:6]),
+                        int(state_row[6]),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    all(
+                        math.isfinite(value)
+                        for value in (
+                            state.x,
+                            state.y,
+                            state.xdir,
+                            state.ydir,
+                            state.speed,
+                        )
+                    )
+                    and state.xdir * state.xdir + state.ydir * state.ydir > 1e-12
+                    and state.speed > 1e-12
+                    and 0 <= state.turns <= 65535
+                ):
+                    saved_states[int(state_row[0])] = state
+            normalized_events_list: list[tuple[int, int]] = []
+            normalized_states_list: list[ReplayEventState | None] = []
+            for event_index, (offset_us, action) in enumerate(decoded_events):
+                if int(offset_us) < release_offset_us:
+                    continue
+                normalized_events_list.append(
+                    (int(offset_us) - release_offset_us, int(action))
+                )
+                normalized_states_list.append(saved_states.get(event_index))
+            normalized_events = tuple(normalized_events_list)
+            normalized_states = tuple(normalized_states_list)
+            if len(normalized_events) > GHOST_MAX_EVENTS:
+                continue
+            duration_us = round(finish_seconds * 1_000_000)
+            if any(
+                offset_us < 0
+                or offset_us > duration_us + 1_000_000
+                or action not in range(len(REPLAY_ACTION_NAMES))
+                for offset_us, action in normalized_events
+            ):
+                continue
+            start_values = tuple(float(value) for value in row[5:11])
+            if (
+                not all(math.isfinite(value) for value in start_values)
+                or start_values[4] <= 1e-12
+                or start_values[2] ** 2 + start_values[3] ** 2 <= 1e-12
+            ):
+                continue
+            settings_identifier = str(row[14]) if row[14] is not None else None
+            transition_rows = connection.execute(
+                "SELECT replay_settings.server_identifier FROM "
+                "replay_setting_transitions JOIN replay_settings ON "
+                "replay_settings.id=replay_setting_transitions.settings_ref "
+                "WHERE replay_setting_transitions.run_ref=? ORDER BY "
+                "replay_setting_transitions.offset_us",
+                (int(row[0]),),
+            ).fetchall()
+            settings_identifiers = tuple(
+                dict.fromkeys(
+                    identifier
+                    for identifier in (
+                        settings_identifier,
+                        *(str(item[0]) for item in transition_rows),
+                    )
+                    if identifier is not None
+                )
+            )
+            replays.append(
+                GhostReplay(
+                    run_id=int(row[0]),
+                    identity_key=str(row[1]),
+                    username=str(row[2]),
+                    resource_key=str(row[15]),
+                    map_identifier=str(row[16]),
+                    revision_identifier=str(row[17]),
+                    finish_seconds=finish_seconds,
+                    finish_turns=int(row[4]) if row[4] is not None else None,
+                    x=start_values[0],
+                    y=start_values[1],
+                    xdir=start_values[2],
+                    ydir=start_values[3],
+                    speed=start_values[4],
+                    initial_turns=max(0, min(65535, int(start_values[5]))),
+                    size_factor=float(row[11]) if row[11] is not None else None,
+                    events=normalized_events,
+                    event_states=normalized_states,
+                    settings_identifier=settings_identifier,
+                    settings_identifiers=settings_identifiers,
+                )
+            )
+        return tuple(replays)
 
     def map_ranks_for_player(
         self,
@@ -4027,6 +4209,9 @@ class MapRepository:
         self.catalog: dict[str, MapEntry] = {}
         self.source_to_key: dict[str, str] = {}
         self.issues: list[str] = []
+        self._ghost_geometry_cache: dict[
+            tuple[str, int, int, float], tuple | None
+        ] = {}
 
     def _parsed_catalog_cache_path(self) -> Path | None:
         generation = self.firebase_generation
@@ -4753,6 +4938,107 @@ class MapRepository:
             ):
                 result = float(node.attrib["value"])
         return result
+
+    def _cached_ghost_map_geometry(
+        self,
+        path: Path,
+        size_factor: float,
+    ) -> tuple | None:
+        try:
+            stat = path.stat()
+            key = (
+                str(path.resolve()),
+                stat.st_mtime_ns,
+                stat.st_size,
+                float(size_factor),
+            )
+        except (OSError, TypeError, ValueError):
+            return None
+        cache = self._ghost_geometry_cache
+        if key not in cache:
+            if len(cache) >= 1024:
+                cache.clear()
+            cache[key] = ghost_map_geometry(path, size_factor)
+        return cache[key]
+
+    def ghost_coordinate_scale(
+        self,
+        current: MapEntry,
+        recorded_resource_key: str,
+        recorded_size_factor: float | None,
+        current_size_factor: float | None,
+    ) -> float | None:
+        """Return the safe start-coordinate conversion for a historical map."""
+        public_root = self.public_dir.resolve()
+        try:
+            recorded_path = (public_root / recorded_resource_key).resolve()
+        except (OSError, RuntimeError):
+            return None
+        if (
+            public_root != recorded_path
+            and public_root not in recorded_path.parents
+        ):
+            return None
+        if not recorded_path.is_file():
+            return None
+
+        try:
+            active_factor = float(
+                current_size_factor
+                if current_size_factor is not None
+                else (self.map_size_factor(current) or 0.0)
+            )
+        except (OSError, ET.ParseError, TypeError, ValueError):
+            return None
+        if not math.isfinite(active_factor) or abs(active_factor) > 100:
+            return None
+        active_geometry = self._cached_ghost_map_geometry(
+            current.local_path,
+            active_factor,
+        )
+        if active_geometry is None:
+            return None
+
+        candidate_factors: list[float] = []
+        if recorded_size_factor is not None:
+            try:
+                candidate_factors.append(float(recorded_size_factor))
+            except (TypeError, ValueError):
+                pass
+        try:
+            recorded_entry = self._parse_map(
+                recorded_path,
+                source_path=recorded_resource_key,
+            )
+            embedded_factor = self.map_size_factor(recorded_entry)
+            candidate_factors.append(
+                float(embedded_factor) if embedded_factor is not None else 0.0
+            )
+        except (
+            ET.ParseError,
+            KeyError,
+            OSError,
+            StopIteration,
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+        tried: set[float] = set()
+        for candidate_factor in candidate_factors:
+            if (
+                candidate_factor in tried
+                or not math.isfinite(candidate_factor)
+                or abs(candidate_factor) > 100
+            ):
+                continue
+            tried.add(candidate_factor)
+            if (
+                self._cached_ghost_map_geometry(recorded_path, candidate_factor)
+                == active_geometry
+            ):
+                return 2.0 ** ((candidate_factor - active_factor) / 2.0)
+        return None
 
     def _build_public_mirror(self) -> None:
         self.public_dir.mkdir(parents=True, exist_ok=True)
@@ -9086,7 +9372,33 @@ class TronnerRacing:
         except ValueError:
             return
         action = parts[2]
-        if not capture.add_input(game_time, action):
+        state = None
+        if action in {"L", "R"} and len(parts) >= 9:
+            try:
+                x, y, xdir, ydir, speed = map(float, parts[3:8])
+                turns = int(parts[8])
+            except ValueError:
+                return
+            if (
+                all(math.isfinite(value) for value in (x, y, xdir, ydir, speed))
+                and xdir * xdir + ydir * ydir > 1e-12
+                and speed > 1e-12
+                and 0 <= turns <= 65535
+            ):
+                state = ReplayEventState(
+                    x,
+                    y,
+                    xdir,
+                    ydir,
+                    speed,
+                    turns,
+                )
+        added = (
+            capture.add_input(game_time, action, state)
+            if state is not None
+            else capture.add_input(game_time, action)
+        )
+        if not added:
             return
         player = self.player_for(capture.player_log_name)
         if player and action in {"L", "R"}:
@@ -12399,8 +12711,36 @@ class TronnerRacing:
             raise RuntimeError("unable to create a safe ghost plan name")
         safe_label = plain_console_text(label).encode("ascii", "replace")[:48]
         duration_us = round(replay.finish_seconds * 1_000_000)
+        plan_format = (
+            GHOST_PLAN_FORMAT_VERSION
+            if any(state is not None for state in replay.event_states)
+            else 1
+        )
+        event_lines = []
+        for event_index, (offset_us, action) in enumerate(replay.events):
+            state = (
+                replay.event_states[event_index]
+                if event_index < len(replay.event_states)
+                else None
+            )
+            line = f"EVENT {offset_us} {action}"
+            if plan_format >= 2:
+                if state is None:
+                    line += " 0"
+                else:
+                    line += " 1 " + " ".join(
+                        (
+                            format(state.x, ".17g"),
+                            format(state.y, ".17g"),
+                            format(state.xdir, ".17g"),
+                            format(state.ydir, ".17g"),
+                            format(state.speed, ".17g"),
+                            str(state.turns),
+                        )
+                    )
+            event_lines.append(line)
         lines = [
-            f"TRONNER_GHOST {GHOST_PLAN_FORMAT_VERSION}",
+            f"TRONNER_GHOST {plan_format}",
             f"RUN {replay.run_id}",
             f"NAME {safe_label.hex() or '-'}",
             f"DURATION_US {duration_us}",
@@ -12416,10 +12756,7 @@ class TronnerRacing:
                 )
             ),
             f"EVENT_COUNT {len(replay.events)}",
-            *(
-                f"EVENT {offset_us} {action}"
-                for offset_us, action in replay.events
-            ),
+            *event_lines,
             "END",
         ]
         atomic_write_text(directory / filename, "\n".join(lines))
@@ -12441,48 +12778,79 @@ class TronnerRacing:
         if record is None or rank is None:
             await self.private(player, selection)
             return
-        replay = self.store.ghost_replay_for_record(
-            self.current.key,
+        replays = self.store.ghost_replays_for_record(
             map_records_key(self.current),
             record,
         )
-        if replay is None:
+        if not replays:
             await self.private(
                 player,
-                f"The {selection} time has no compatible full-run replay for this exact map revision.",
-            )
-            return
-        if (
-            replay.size_factor is not None
-            and self.current_size_factor is not None
-            and not math.isclose(
-                replay.size_factor,
-                self.current_size_factor,
-                rel_tol=0,
-                abs_tol=1e-9,
-            )
-        ):
-            await self.private(
-                player,
-                f"The {selection} replay was recorded at a different map size.",
+                f"The {selection} time has no compatible full-run replay.",
             )
             return
         active_settings = getattr(
             self, "active_replay_settings_identifier", None
         )
-        if (
-            replay.settings_identifier is not None
-            and active_settings is not None
-            and not self.store.ghost_settings_compatible(
-                replay.settings_identifier,
-                active_settings,
+        replay = None
+        position_scale = None
+        map_compatible_replay_found = False
+        for candidate in replays:
+            candidate_scale = self.repository.ghost_coordinate_scale(
+                self.current,
+                candidate.resource_key,
+                candidate.size_factor,
+                self.current_size_factor,
             )
-        ):
+            if candidate_scale is None:
+                continue
+            map_compatible_replay_found = True
+            if (
+                candidate.resource_key != self.current.key
+                and not candidate.settings_identifiers
+            ):
+                continue
+            if (
+                active_settings is not None
+                and candidate.settings_identifiers
+                and any(
+                    not self.store.ghost_settings_compatible(
+                        identifier,
+                        active_settings,
+                        ignore_size_factor=True,
+                    )
+                    for identifier in candidate.settings_identifiers
+                )
+            ):
+                continue
+            replay = candidate
+            position_scale = candidate_scale
+            break
+        if replay is None or position_scale is None:
             await self.private(
                 player,
-                f"The {selection} replay used different server physics settings.",
+                f"The {selection} replay "
+                + (
+                    "used different server physics settings."
+                    if map_compatible_replay_found
+                    else "was recorded on a physically different map revision."
+                ),
             )
             return
+        replay = dataclasses.replace(
+            replay,
+            x=replay.x * position_scale,
+            y=replay.y * position_scale,
+            event_states=tuple(
+                dataclasses.replace(
+                    state,
+                    x=state.x * position_scale,
+                    y=state.y * position_scale,
+                )
+                if state is not None
+                else None
+                for state in replay.event_states
+            ),
+        )
         label = "Ghost PB" if selection == "PB" else (
             "Ghost WR" if selection == "WR" else f"Ghost #{rank}"
         )
@@ -12507,11 +12875,25 @@ class TronnerRacing:
                     / filename
                 ).unlink()
             raise
+        decimals = race_time_decimals(self.current)
+        exact_ranked_run = (
+            replay.finish_seconds == record.best_seconds
+            and replay.finish_turns == record.best_turns
+        )
+        if exact_ranked_run:
+            message = (
+                f"Selected {selection}: {record.username}, "
+                f"{record.best_seconds:.{decimals}f}s. "
+            )
+        else:
+            message = (
+                f"Selected fastest available replay for {selection}: "
+                f"{record.username}, {replay.finish_seconds:.{decimals}f}s "
+                f"(ranked time {record.best_seconds:.{decimals}f}s). "
+            )
         await self.private(
             player,
-            f"Selected {selection}: {record.username}, "
-            f"{record.best_seconds:.{race_time_decimals(self.current)}f}s. "
-            "The private ghost will start with your next attempt.",
+            message + "The private ghost will start with your next attempt.",
         )
 
     async def _command_results(self, player: Player) -> None:
