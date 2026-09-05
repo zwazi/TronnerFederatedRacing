@@ -64,6 +64,10 @@ REPLAY_FORMAT_VERSION = 1
 REPLAY_ACTION_CODES = {"L": 0, "R": 1, "B0": 2, "B1": 3}
 REPLAY_ACTION_NAMES = tuple(REPLAY_ACTION_CODES)
 REPLAY_SETTINGS_FORMAT_VERSION = 1
+GHOST_PLAN_FORMAT_VERSION = 1
+GHOST_MAX_EVENTS = 100_000
+GHOST_MAX_DURATION_SECONDS = 3_600.0
+GHOST_PLAN_FILENAME_RE = re.compile(r"ghost-[0-9]+-[0-9]+\.plan")
 SERVER_CONSOLE_HISTORY_LINES = 250
 SERVER_CONSOLE_INITIAL_LINES = 100
 SERVER_CONSOLE_BATCH_SIZE = 25
@@ -1148,6 +1152,20 @@ def atomic_write_json(path: Path, value: object) -> None:
     os.replace(temporary, path)
 
 
+def atomic_write_text(path: Path, value: str) -> None:
+    """Write one private controller-to-engine artifact atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="ascii", newline="\n") as handle:
+        handle.write(value)
+        if not value.endswith("\n"):
+            handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
 def send_resend_report(
     api_key: str,
     recipient: str,
@@ -1282,6 +1300,10 @@ USER_COMMAND_HELP = (
     ("/exclusion_list", "Privately show maps excluded from rotation."),
     ("/leaderboard", "Privately show the current map's top 10 times."),
     ("/results", "Toggle finish and rank messages."),
+    (
+        "/ghost [pb|wr|rank #|player name|off]",
+        "Race a private replay ghost on your next attempt.",
+    ),
     (
         "/setspawn [#]",
         "Always use a spawn number; omit # for latest or use 0 to clear it.",
@@ -1909,6 +1931,23 @@ class Record:
     authenticated: bool
     best_turns: int | None = None
     achieved_at: float | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class GhostReplay:
+    run_id: int
+    identity_key: str
+    username: str
+    finish_seconds: float
+    x: float
+    y: float
+    xdir: float
+    ydir: float
+    speed: float
+    initial_turns: int
+    size_factor: float | None
+    events: tuple[tuple[int, int], ...]
+    settings_identifier: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2819,6 +2858,97 @@ class StateStore:
             )
             for row in rows
         ]
+
+    def ghost_replay_for_record(
+        self,
+        resource_key: str,
+        record_key: str,
+        record: Record,
+    ) -> GhostReplay | None:
+        """Return the exact full-run replay backing one ranked map record."""
+        row = self.current_connection().execute(
+            "SELECT replay_runs.id, replay_players.identity_key, "
+            "replay_players.username, replay_runs.finish_seconds, "
+            "replay_runs.start_x, replay_runs.start_y, "
+            "replay_runs.start_xdir, replay_runs.start_ydir, "
+            "replay_runs.start_speed, replay_runs.initial_turns, "
+            "replay_runs.size_factor, replay_runs.release_offset_us, "
+            "replay_runs.input_data, replay_settings.server_identifier "
+            "FROM replay_runs "
+            "JOIN replay_players ON replay_players.id=replay_runs.player_ref "
+            "JOIN replay_maps ON replay_maps.id=replay_runs.map_ref "
+            "LEFT JOIN replay_settings ON replay_settings.id=replay_runs.settings_ref "
+            "WHERE replay_maps.resource_key=? AND replay_maps.record_key=? "
+            "AND replay_players.identity_key=? AND replay_runs.outcome=1 "
+            "AND replay_runs.checkpoint_spawn=0 "
+            "AND replay_runs.finish_seconds=? "
+            "AND (replay_runs.finish_turns=? OR "
+            "(replay_runs.finish_turns IS NULL AND ? IS NULL)) "
+            "AND replay_runs.format_version=? "
+            "AND NOT EXISTS (SELECT 1 FROM replay_setting_transitions "
+            "WHERE replay_setting_transitions.run_ref=replay_runs.id) "
+            "ORDER BY replay_runs.recorded_at DESC, replay_runs.id DESC LIMIT 1",
+            (
+                resource_key,
+                record_key,
+                record.identity_key,
+                record.best_seconds,
+                record.best_turns,
+                record.best_turns,
+                REPLAY_FORMAT_VERSION,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        finish_seconds = float(row[3])
+        if (
+            not math.isfinite(finish_seconds)
+            or finish_seconds <= 0
+            or finish_seconds > GHOST_MAX_DURATION_SECONDS
+        ):
+            return None
+        release_offset_us = int(row[11] or 0)
+        try:
+            decoded_events = decode_replay_inputs(bytes(row[12]))
+        except (TypeError, ValueError):
+            return None
+        normalized_events = tuple(
+            (int(offset_us) - release_offset_us, int(action))
+            for offset_us, action in decoded_events
+            if int(offset_us) >= release_offset_us
+        )
+        if len(normalized_events) > GHOST_MAX_EVENTS:
+            return None
+        duration_us = round(finish_seconds * 1_000_000)
+        if any(
+            offset_us < 0
+            or offset_us > duration_us + 1_000_000
+            or action not in range(len(REPLAY_ACTION_NAMES))
+            for offset_us, action in normalized_events
+        ):
+            return None
+        start_values = tuple(float(value) for value in row[4:10])
+        if (
+            not all(math.isfinite(value) for value in start_values)
+            or start_values[4] <= 1e-12
+            or start_values[2] ** 2 + start_values[3] ** 2 <= 1e-12
+        ):
+            return None
+        return GhostReplay(
+            run_id=int(row[0]),
+            identity_key=str(row[1]),
+            username=str(row[2]),
+            finish_seconds=finish_seconds,
+            x=start_values[0],
+            y=start_values[1],
+            xdir=start_values[2],
+            ydir=start_values[3],
+            speed=start_values[4],
+            initial_turns=max(0, min(65535, int(start_values[5]))),
+            size_factor=float(row[10]) if row[10] is not None else None,
+            events=normalized_events,
+            settings_identifier=str(row[13]) if row[13] is not None else None,
+        )
 
     def map_ranks_for_player(
         self,
@@ -6416,6 +6546,7 @@ class TronnerRacing:
             # become empty.  transitioning is already true, so the deaths emitted
             # by KILL_ALL are deliberately not respawned.
             await self.sink.send(
+                "GHOST_CLEAR_ALL",
                 f"SIZE_FACTOR {format_size_factor(size_factor)}",
                 f"MAP_FILE {quote_console(entry.key)}",
                 "START_NEW_MATCH",
@@ -11488,6 +11619,8 @@ class TronnerRacing:
             await self._command_leaderboard(player)
         elif command == "/results":
             await self._command_results(player)
+        elif command == "/ghost":
+            await self._command_ghost(player, arguments)
         elif command == "/setspawn":
             await self._command_setspawn(player, arguments)
         elif command == "/start":
@@ -12147,6 +12280,187 @@ class TronnerRacing:
             time_decimals=race_time_decimals(self.current),
         )
         await self.private_block(player, lines)
+
+    @staticmethod
+    def _ghost_record_for_selector(
+        records: Sequence[Record],
+        player: Player,
+        argument: str,
+    ) -> tuple[Record | None, int | None, str]:
+        requested = plain_console_text(argument).strip()
+        parts = requested.split(maxsplit=1)
+        selector = parts[0].casefold() if parts else ""
+        value = parts[1].strip() if len(parts) > 1 else ""
+        if selector in {"", "pb", "personal", "personalbest"}:
+            for rank, record in enumerate(records, 1):
+                if record.identity_key == player.identity_key:
+                    return record, rank, "PB"
+            return None, None, "You do not have a recorded finish on this map."
+        if selector in {"wr", "world", "worldrecord"}:
+            if records:
+                return records[0], 1, "WR"
+            return None, None, "This map does not have a world record yet."
+        if selector == "rank" or selector.isdigit():
+            rank_text = value if selector == "rank" else selector
+            if not rank_text.isdigit() or int(rank_text) <= 0:
+                return None, None, "Usage: /ghost rank [positive number]"
+            rank = int(rank_text)
+            if rank > len(records):
+                return None, None, f"This map currently has only {len(records)} ranked finishes."
+            return records[rank - 1], rank, f"rank {rank}"
+        if selector in {"player", "name"}:
+            query = value
+        else:
+            query = requested
+        folded = query.casefold()
+        if not folded:
+            return None, None, "Usage: /ghost player [exact player name]"
+        exact = [
+            (rank, record)
+            for rank, record in enumerate(records, 1)
+            if record.username.casefold() == folded
+            or record.identity_key.casefold() == folded
+            or record.identity_key.removeprefix("auth:").casefold() == folded
+        ]
+        matches = exact or [
+            (rank, record)
+            for rank, record in enumerate(records, 1)
+            if folded in record.username.casefold()
+        ]
+        if not matches:
+            return None, None, f"No ranked player matches: {query}"
+        if len(matches) > 1:
+            preview = ", ".join(record.username for _, record in matches[:5])
+            return None, None, f"Player name is ambiguous: {preview}"
+        rank, record = matches[0]
+        return record, rank, record.username
+
+    def _write_ghost_plan(
+        self,
+        replay: GhostReplay,
+        label: str,
+    ) -> str:
+        directory = Path(
+            self.config.get(
+                "ghost_plan_dir", "/var/lib/armagetronad/ghosts"
+            )
+        )
+        filename = f"ghost-{os.getpid()}-{time.time_ns()}.plan"
+        if not GHOST_PLAN_FILENAME_RE.fullmatch(filename):
+            raise RuntimeError("unable to create a safe ghost plan name")
+        safe_label = plain_console_text(label).encode("ascii", "replace")[:48]
+        duration_us = round(replay.finish_seconds * 1_000_000)
+        lines = [
+            f"TRONNER_GHOST {GHOST_PLAN_FORMAT_VERSION}",
+            f"RUN {replay.run_id}",
+            f"NAME {safe_label.hex() or '-'}",
+            f"DURATION_US {duration_us}",
+            "START "
+            + " ".join(
+                (
+                    format(replay.x, ".17g"),
+                    format(replay.y, ".17g"),
+                    format(replay.xdir, ".17g"),
+                    format(replay.ydir, ".17g"),
+                    format(replay.speed, ".17g"),
+                    str(replay.initial_turns),
+                )
+            ),
+            f"EVENT_COUNT {len(replay.events)}",
+            *(
+                f"EVENT {offset_us} {action}"
+                for offset_us, action in replay.events
+            ),
+            "END",
+        ]
+        atomic_write_text(directory / filename, "\n".join(lines))
+        return filename
+
+    async def _command_ghost(self, player: Player, argument: str) -> None:
+        requested = plain_console_text(argument).strip() or "pb"
+        if requested.casefold() in {"off", "none", "clear"}:
+            await self.sink.send(f"GHOST_CLEAR {player.target}")
+            await self.private(player, "Your replay ghost is disabled.")
+            return
+        if not self.current or not self.round_active or self.transitioning:
+            await self.private(player, "A replay ghost requires an active map.")
+            return
+        records = self.store.records(map_records_key(self.current))
+        record, rank, selection = self._ghost_record_for_selector(
+            records, player, requested
+        )
+        if record is None or rank is None:
+            await self.private(player, selection)
+            return
+        replay = self.store.ghost_replay_for_record(
+            self.current.key,
+            map_records_key(self.current),
+            record,
+        )
+        if replay is None:
+            await self.private(
+                player,
+                f"The {selection} time has no compatible full-run replay for this exact map revision.",
+            )
+            return
+        if (
+            replay.size_factor is not None
+            and self.current_size_factor is not None
+            and not math.isclose(
+                replay.size_factor,
+                self.current_size_factor,
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+        ):
+            await self.private(
+                player,
+                f"The {selection} replay was recorded at a different map size.",
+            )
+            return
+        active_settings = getattr(
+            self, "active_replay_settings_identifier", None
+        )
+        if (
+            replay.settings_identifier is not None
+            and active_settings is not None
+            and replay.settings_identifier != active_settings
+        ):
+            await self.private(
+                player,
+                f"The {selection} replay used different server physics settings.",
+            )
+            return
+        label = "Ghost PB" if selection == "PB" else (
+            "Ghost WR" if selection == "WR" else f"Ghost #{rank}"
+        )
+        try:
+            filename = self._write_ghost_plan(replay, label)
+        except OSError:
+            LOG.exception("unable to write replay ghost plan")
+            await self.private(
+                player, "The replay ghost could not be prepared right now."
+            )
+            return
+        try:
+            await self.sink.send(f"GHOST_LOAD {player.target} {filename}")
+        except Exception:
+            with contextlib.suppress(OSError):
+                (
+                    Path(
+                        self.config.get(
+                            "ghost_plan_dir", "/var/lib/armagetronad/ghosts"
+                        )
+                    )
+                    / filename
+                ).unlink()
+            raise
+        await self.private(
+            player,
+            f"Selected {selection}: {record.username}, "
+            f"{record.best_seconds:.{race_time_decimals(self.current)}f}s. "
+            "The private ghost will start with your next attempt.",
+        )
 
     async def _command_results(self, player: Player) -> None:
         enabled = not self.result_message_preferences.get(

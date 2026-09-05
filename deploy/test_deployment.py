@@ -27,6 +27,10 @@ class RenderTests(unittest.TestCase):
             set(rendered), {"controller.json", "server.cfg", "manifest.json"}
         )
         self.assertIn("TALK_TO_MASTER 0", rendered["server.cfg"])
+        self.assertEqual(
+            json.loads(rendered["controller.json"])["ghost_plan_dir"],
+            "/var/lib/armagetronad/ghosts",
+        )
 
     def test_non_standalone_role_is_rejected(self):
         node = self.load("node.example.json")

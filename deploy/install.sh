@@ -163,7 +163,7 @@ if ((firebase_enabled)); then
 fi
 
 install -d -o armagetron -g armagetron -m 0750 \
-    /var/lib/armagetronad /var/lib/tronner-racing
+    /var/lib/armagetronad /var/lib/armagetronad/ghosts /var/lib/tronner-racing
 install -d -o armagetron -g armagetron -m 0755 \
     /var/lib/armagetronad/resource/automatic
 touch /var/lib/armagetronad/console.in /var/lib/armagetronad/ladderlog.txt
