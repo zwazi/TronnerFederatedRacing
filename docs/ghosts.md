@@ -17,23 +17,23 @@ the requester's next attempt and remains active until it is disabled, the map
 changes, or the requester disconnects. The controller prefers the exact replay
 for the selected leaderboard time. If that time predates input capture, it uses
 the player's fastest available full-run replay and states both the replay and
-ranked times in the confirmation.
+ranked times in the confirmation. When a new finish changes an active PB, WR,
+rank, or named-player selection, the controller reloads that selection for the
+requester and uses the updated ghost on their next attempt.
 
-Historical resource names and revisions remain eligible when a strict XML
-comparison proves that their physical track geometry is identical to the active
-map. The comparison ignores map-local settings, checks those settings against
-the captured server physics separately, and normalizes spatial coordinates by
-`SIZE_FACTOR`. This also converts a legacy replay's start position when an old
-size-scaled map was migrated to baked coordinates. A replay remains unavailable
-when its inputs are missing or invalid, its geometry genuinely changed, or any
-movement/zone physics setting differs.
+Historical resource names and revisions remain eligible. A strict XML and
+settings comparison is used to choose the verified coordinate conversion when
+possible, including `SIZE_FACTOR` normalization for maps migrated from scaled to
+baked coordinates. If geometry or historical server settings cannot be proven
+identical, the replay is still loaded with a best-effort size conversion instead
+of being rejected. Only a missing or structurally invalid full-run input stream
+prevents loading.
 
 Physics compatibility compares the captured setting values, not only the raw
 snapshot identifier. Runtime-only `SERVER_OPTIONS` text and
 `PING_CHARITY_SERVER` latency allowance are ignored because they cannot affect
-the route of a server-driven, non-colliding ghost. `SIZE_FACTOR` is compared via
-the physical-map normalization above; movement and zone settings must still
-match exactly, including every captured mid-run settings transition.
+the route of a server-driven, non-colliding ghost. Other differences are logged
+for diagnosis but no longer block playback.
 
 The controller writes a bounded, mode-0600 one-shot plan under
 `/var/lib/armagetronad/ghosts`. The patched server creates an invulnerable,
@@ -72,7 +72,9 @@ the existing player descriptor 201 and cycle descriptor 320 used by unmodified
 0.2.8 clients. A wire-only negative cycle distance prevents legacy clients from
 predicting a wall for the ghost. Because 0.2.8 has no translucent-cycle protocol,
 the compatibility rendering is an ordinary cyan cycle named for the selected
-slot.
+slot. Ghost names use `#[rank] - [Player name] Ghost`; the player-name portion is
+truncated as needed so the complete ASCII name is at most 15 visible bytes, the
+safe limit for 0.2.8's 16-character NUL-terminated player-name storage.
 
 Visibility is filtered per network connection. Other clients receive neither
 the ghost player nor its cycle. Multiple local players using one split-screen

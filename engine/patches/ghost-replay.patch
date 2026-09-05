@@ -423,7 +423,7 @@ index c8a4959f..95e5e8a2 100644
 +        decoded = "Ghost";
 +        return true;
 +    }
-+    if ( encoded.empty() || encoded.size() > 96 || encoded.size() % 2 )
++    if ( encoded.empty() || encoded.size() > 30 || encoded.size() % 2 )
 +        return false;
 +    std::string value;
 +    for ( std::size_t index = 0; index < encoded.size(); index += 2 )
