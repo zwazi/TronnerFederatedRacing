@@ -33,7 +33,7 @@ index ee4880e..9e043e0 100644
 +        if ( alive )
 +        {
 +            se_playerActivityWriter << cycle->MapPosition().x
-+                                    << cycle->MapPosition().y << se_GameTime() << cycle->Direction().x << cycle->Direction().y << cycle->Speed() << cycle->GetTurns();
++                                    << cycle->MapPosition().y << se_GameTime() << cycle->Direction().x << cycle->Direction().y << cycle->Speed() << cycle->GetTurns() << cycle->GetDistance();
 +        }
 +        else
 +        {
@@ -770,7 +770,7 @@ index 78153a3..c443f43 100644
 +        sg_HighPrecisionRaceTime(gameTime) <<
 +        cycle->MapPosition().x << cycle->MapPosition().y <<
 +        cycle->Direction().x << cycle->Direction().y <<
-+        cycle->Speed() << cycle->GetTurns();
++        cycle->Speed() << cycle->GetTurns() << cycle->GetDistance();
 +    se_cycleReplayStateWriter.write();
 +}
 +
@@ -834,7 +834,7 @@ index 78153a3..c443f43 100644
 +        se_cycleReplayBeginWriter << ReplayToken() << Player()->GetLogName() <<
 +            sg_HighPrecisionRaceTime(se_GameTime()) <<
 +            MapPosition().x << MapPosition().y << Direction().x << Direction().y <<
-+            Speed() << GetTurns() << sg_activeReplaySettings;
++            Speed() << GetTurns() << sg_activeReplaySettings << GetDistance();
 +        se_cycleReplayBeginWriter.write();
 +    }
  }

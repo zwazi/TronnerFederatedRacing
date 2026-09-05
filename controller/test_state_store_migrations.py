@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from TronnerRacing import ReplayCapture, StateStore
+from TronnerRacing import Player, ReplayCapture, StateStore
 
 
 class StateStoreMigrationTests(unittest.TestCase):
@@ -170,6 +170,63 @@ class StateStoreMigrationTests(unittest.TestCase):
             self.assertEqual(repeated.map_rows, 0)
             self.assertEqual(repeated.replay_cursor, first_run - 1)
             store.close()
+
+    def test_player_stats_are_transactional_and_backfill_from_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            store = StateStore(path)
+            deathzone = self.finished_replay("resource-a", "map-a", "rev-a")
+            deathzone.outcome = "death"
+            deathzone.death_reason = "DEATHZONE"
+            deathzone.initial_distance = 10.0
+            deathzone.latest_distance = 260.0
+            deathzone.events = [(100, 0), (200, 1), (300, 3)]
+            store.add_replay(deathzone, 1012.5)
+
+            rubber = self.finished_replay("resource-b", "map-b", "rev-b")
+            rubber.outcome = "death"
+            rubber.death_reason = "SUICIDE"
+            rubber.latest_distance = 125.0
+            rubber.events = [(100, 0), (200, 1)]
+            store.add_replay(rubber, 1007.5)
+            store.add_finish(
+                "record-a",
+                Player("racer", "Racer", auth_name="racer"),
+                12.5,
+                4,
+            )
+
+            self.assertEqual(store.dashboard_player_stats(), [{
+                "identityKey": "auth:racer",
+                "username": "racer",
+                "playSeconds": 20.0,
+                "rubberDeaths": 1,
+                "deathzoneDeaths": 1,
+                "finishes": 1,
+                "distanceMeters": 375.0,
+                "turns": 4,
+                "updatedAt": store.dashboard_player_stats()[0]["updatedAt"],
+            }])
+            store.close()
+
+            connection = sqlite3.connect(path)
+            connection.execute("DELETE FROM player_stats")
+            connection.execute(
+                "DELETE FROM metadata WHERE key=?",
+                (StateStore.PLAYER_STATS_BACKFILL_KEY,),
+            )
+            connection.commit()
+            connection.close()
+
+            migrated = StateStore(path)
+            stats = migrated.dashboard_player_stats()[0]
+            migrated.close()
+            self.assertEqual(stats["playSeconds"], 20.0)
+            self.assertEqual(stats["rubberDeaths"], 1)
+            self.assertEqual(stats["deathzoneDeaths"], 1)
+            self.assertEqual(stats["finishes"], 1)
+            self.assertEqual(stats["distanceMeters"], 375.0)
+            self.assertEqual(stats["turns"], 4)
 
 
 if __name__ == "__main__":

@@ -1811,6 +1811,8 @@ class ReplayCapture:
     size_factor: float | None
     start_mode: str
     checkpoint_spawn: bool
+    initial_distance: float = 0.0
+    latest_distance: float = 0.0
     record_key: str = ""
     storage_path: str = ""
     settings_identifier: str | None = None
@@ -1839,6 +1841,7 @@ class ReplayCapture:
         ydir: float,
         speed: float,
         turns: int,
+        distance: float | None = None,
         released: bool = False,
     ) -> None:
         if not all(math.isfinite(value) for value in (game_time, x, y, xdir, ydir, speed)):
@@ -1849,6 +1852,8 @@ class ReplayCapture:
         self.ydir = ydir
         self.speed = max(0.0, speed)
         self.initial_turns = max(0, turns)
+        if distance is not None and math.isfinite(distance):
+            self.latest_distance = max(self.initial_distance, float(distance))
         if released:
             self.release_offset_us = round(
                 (game_time - self.spawn_game_time) * 1_000_000
@@ -1945,6 +1950,7 @@ class SavedPlayerMessage:
 
 class StateStore:
     FINISH_HISTORY_BACKFILL_KEY = "schema:finish-history-backfill-v1"
+    PLAYER_STATS_BACKFILL_KEY = "schema:player-stats-backfill-v1"
 
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2069,6 +2075,18 @@ class StateStore:
             CREATE INDEX IF NOT EXISTS replay_runs_personal_bests
                 ON replay_runs(player_ref, map_ref, personal_best)
                 WHERE personal_best = 1;
+            CREATE TABLE IF NOT EXISTS player_stats (
+                identity_key TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                authenticated INTEGER NOT NULL,
+                play_seconds REAL NOT NULL DEFAULT 0,
+                rubber_deaths INTEGER NOT NULL DEFAULT 0,
+                deathzone_deaths INTEGER NOT NULL DEFAULT 0,
+                finishes INTEGER NOT NULL DEFAULT 0,
+                distance_meters REAL NOT NULL DEFAULT 0,
+                turns INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS replay_setting_transitions (
                 run_ref INTEGER NOT NULL REFERENCES replay_runs(id) ON DELETE CASCADE,
                 offset_us INTEGER NOT NULL,
@@ -2124,6 +2142,16 @@ class StateStore:
                 "ALTER TABLE replay_runs ADD COLUMN settings_ref INTEGER "
                 "REFERENCES replay_settings(id)"
             )
+        if "distance_meters" not in replay_run_columns:
+            self.connection.execute(
+                "ALTER TABLE replay_runs ADD COLUMN distance_meters REAL "
+                "NOT NULL DEFAULT 0"
+            )
+        if "turns_driven" not in replay_run_columns:
+            self.connection.execute(
+                "ALTER TABLE replay_runs ADD COLUMN turns_driven INTEGER "
+                "NOT NULL DEFAULT 0"
+            )
         replay_map_columns = {
             row[1] for row in self.connection.execute("PRAGMA table_info(replay_maps)")
         }
@@ -2138,7 +2166,145 @@ class StateStore:
         self.connection.execute(
             "UPDATE replay_maps SET record_key=resource_key WHERE record_key=''"
         )
+        self._backfill_player_stats()
         self.connection.commit()
+
+    @staticmethod
+    def _replay_death_counts(reason: str) -> tuple[int, int]:
+        """Classify public racing deaths without counting administrative kills."""
+        kind = str(reason or "").strip().split(maxsplit=1)[0].upper()
+        if kind in {"DEATHZONE", "DEATHZONE_TEAM"}:
+            return 0, 1
+        if kind in {
+            "FRAG",
+            "OTHER",
+            "RUBBERZONE",
+            "SUICIDE",
+            "TEAMKILL",
+            "UNKNOWN",
+        }:
+            return 1, 0
+        return 0, 0
+
+    @staticmethod
+    def _replay_turn_count(input_data: bytes) -> int:
+        return sum(
+            1 for _offset, action in decode_replay_inputs(bytes(input_data))
+            if action in {REPLAY_ACTION_CODES["L"], REPLAY_ACTION_CODES["R"]}
+        )
+
+    def _backfill_player_stats(self) -> None:
+        marker = self.connection.execute(
+            "SELECT 1 FROM metadata WHERE key=?",
+            (self.PLAYER_STATS_BACKFILL_KEY,),
+        ).fetchone()
+        if marker is not None:
+            return
+
+        # Rebuild instead of incrementing so an interrupted migration is safe
+        # to run again. Replays provide time, death cause, distance and turns;
+        # the finishes table remains the authority for completed attempts.
+        self.connection.execute("DELETE FROM player_stats")
+        identities: dict[str, list[object]] = {}
+        for identity_key, username, authenticated, saved_at in self.connection.execute(
+            "SELECT identity_key, username, authenticated, achieved_at AS saved_at FROM records "
+            "UNION ALL SELECT identity_key, username, authenticated, finished_at "
+            "FROM finishes UNION ALL SELECT replay_players.identity_key, "
+            "replay_players.username, replay_players.authenticated, "
+            "MAX(replay_runs.recorded_at) FROM replay_players JOIN replay_runs "
+            "ON replay_runs.player_ref=replay_players.id GROUP BY replay_players.id "
+            "ORDER BY saved_at ASC"
+        ):
+            identities[str(identity_key)] = [
+                str(username), bool(authenticated), 0.0, 0, 0, 0, 0.0, 0,
+                float(saved_at or 0),
+            ]
+        for identity_key, finish_count, finished_at in self.connection.execute(
+            "SELECT identity_key, COUNT(*), MAX(finished_at) FROM finishes "
+            "GROUP BY identity_key"
+        ):
+            if str(identity_key) in identities:
+                identities[str(identity_key)][5] = int(finish_count)
+                identities[str(identity_key)][8] = max(
+                    float(identities[str(identity_key)][8]), float(finished_at or 0)
+                )
+        for row in self.connection.execute(
+            "SELECT replay_players.identity_key, replay_runs.recorded_at, "
+            "replay_runs.ended_at, replay_runs.outcome, replay_runs.death_reason, "
+            "replay_runs.distance_meters, replay_runs.turns_driven, "
+            "replay_runs.input_data FROM replay_runs JOIN replay_players "
+            "ON replay_players.id=replay_runs.player_ref"
+        ):
+            identity_key = str(row[0])
+            values = identities.get(identity_key)
+            if values is None:
+                continue
+            values[2] = float(values[2]) + max(0.0, float(row[2]) - float(row[1]))
+            if int(row[3]) == 0:
+                rubber, deathzone = self._replay_death_counts(str(row[4]))
+                values[3] = int(values[3]) + rubber
+                values[4] = int(values[4]) + deathzone
+            values[6] = float(values[6]) + max(0.0, float(row[5] or 0))
+            stored_turns = max(0, int(row[6] or 0))
+            if stored_turns == 0 and row[7]:
+                stored_turns = self._replay_turn_count(row[7])
+            values[7] = int(values[7]) + stored_turns
+            values[8] = max(float(values[8]), float(row[2] or 0))
+
+        self.connection.executemany(
+            "INSERT INTO player_stats(identity_key, username, authenticated, "
+            "play_seconds, rubber_deaths, deathzone_deaths, finishes, "
+            "distance_meters, turns, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (identity_key, values[0], int(values[1]), *values[2:])
+                for identity_key, values in identities.items()
+            ],
+        )
+        self.connection.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, 'true')",
+            (self.PLAYER_STATS_BACKFILL_KEY,),
+        )
+
+    def _increment_player_stats(
+        self,
+        identity_key: str,
+        username: str,
+        authenticated: bool,
+        *,
+        play_seconds: float = 0,
+        rubber_deaths: int = 0,
+        deathzone_deaths: int = 0,
+        finishes: int = 0,
+        distance_meters: float = 0,
+        turns: int = 0,
+        updated_at: float | None = None,
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO player_stats(identity_key, username, authenticated, "
+            "play_seconds, rubber_deaths, deathzone_deaths, finishes, "
+            "distance_meters, turns, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(identity_key) DO UPDATE SET username=excluded.username, "
+            "authenticated=excluded.authenticated, "
+            "play_seconds=player_stats.play_seconds+excluded.play_seconds, "
+            "rubber_deaths=player_stats.rubber_deaths+excluded.rubber_deaths, "
+            "deathzone_deaths=player_stats.deathzone_deaths+excluded.deathzone_deaths, "
+            "finishes=player_stats.finishes+excluded.finishes, "
+            "distance_meters=player_stats.distance_meters+excluded.distance_meters, "
+            "turns=player_stats.turns+excluded.turns, "
+            "updated_at=MAX(player_stats.updated_at, excluded.updated_at)",
+            (
+                identity_key,
+                username,
+                int(authenticated),
+                max(0.0, float(play_seconds)),
+                max(0, int(rubber_deaths)),
+                max(0, int(deathzone_deaths)),
+                max(0, int(finishes)),
+                max(0.0, float(distance_meters)),
+                max(0, int(turns)),
+                float(updated_at if updated_at is not None else time.time()),
+            ),
+        )
 
     def current_connection(self) -> sqlite3.Connection:
         """Use one WAL connection per worker without sharing SQLite objects."""
@@ -2471,6 +2637,13 @@ class StateStore:
             "invalid_finish": 5,
         }
         blob = encode_replay_inputs(capture.events)
+        distance_meters = max(
+            0.0, float(capture.latest_distance) - float(capture.initial_distance)
+        )
+        turns_driven = sum(
+            1 for _offset, action in capture.events
+            if action in {REPLAY_ACTION_CODES["L"], REPLAY_ACTION_CODES["R"]}
+        )
         settings_ref = self.replay_settings_ref(capture.settings_identifier)
         cursor = self.connection.execute(
             "INSERT INTO replay_runs("
@@ -2478,8 +2651,8 @@ class StateStore:
             "release_offset_us, start_x, start_y, start_xdir, start_ydir, "
             "start_speed, initial_turns, size_factor, start_mode, checkpoint_spawn, settings_ref, "
             "outcome, death_reason, finish_seconds, finish_turns, personal_best, "
-            "event_count, format_version, input_data"
-            ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "event_count, format_version, input_data, distance_meters, turns_driven"
+            ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 map_ref,
                 player_ref,
@@ -2505,6 +2678,8 @@ class StateStore:
                 len(capture.events),
                 REPLAY_FORMAT_VERSION,
                 sqlite3.Binary(blob),
+                distance_meters,
+                turns_driven,
             ),
         )
         run_ref = int(cursor.lastrowid)
@@ -2522,6 +2697,22 @@ class StateStore:
                 "(run_ref, offset_us, settings_ref) VALUES(?, ?, ?)",
                 (run_ref, offset_us, transition_ref),
             )
+        rubber_deaths, deathzone_deaths = (
+            self._replay_death_counts(capture.death_reason)
+            if capture.outcome == "death"
+            else (0, 0)
+        )
+        self._increment_player_stats(
+            capture.identity_key,
+            capture.username,
+            capture.authenticated,
+            play_seconds=max(0.0, float(ended_at) - float(capture.started_at)),
+            rubber_deaths=rubber_deaths,
+            deathzone_deaths=deathzone_deaths,
+            distance_meters=distance_meters,
+            turns=turns_driven,
+            updated_at=ended_at,
+        )
         self.connection.commit()
         return run_ref
 
@@ -2542,6 +2733,13 @@ class StateStore:
                 turns,
                 now,
             ),
+        )
+        self._increment_player_stats(
+            player.identity_key,
+            player.record_name,
+            authenticated,
+            finishes=1,
+            updated_at=now,
         )
         old = self.connection.execute(
             "SELECT best_seconds, best_turns, achieved_at FROM records WHERE map_key=? AND identity_key=?",
@@ -2676,6 +2874,28 @@ class StateStore:
                 "bestTurns": int(row[5]) if row[5] is not None else None,
                 "achievedAt": float(row[6]),
                 "hasReplay": bool(row[7]) or (str(row[0]), str(row[1])) in replay_keys,
+            }
+            for row in rows
+        ]
+
+    def dashboard_player_stats(self) -> list[dict[str, object]]:
+        """Return durable cumulative totals for authenticated racing profiles."""
+        rows = self.current_connection().execute(
+            "SELECT identity_key, username, play_seconds, rubber_deaths, "
+            "deathzone_deaths, finishes, distance_meters, turns, updated_at "
+            "FROM player_stats WHERE authenticated=1 ORDER BY identity_key"
+        ).fetchall()
+        return [
+            {
+                "identityKey": str(row[0]),
+                "username": str(row[1]),
+                "playSeconds": round(max(0.0, float(row[2])), 3),
+                "rubberDeaths": max(0, int(row[3])),
+                "deathzoneDeaths": max(0, int(row[4])),
+                "finishes": max(0, int(row[5])),
+                "distanceMeters": round(max(0.0, float(row[6])), 3),
+                "turns": max(0, int(row[7])),
+                "updatedAt": int(float(row[8]) * 1000),
             }
             for row in rows
         ]
@@ -3386,6 +3606,29 @@ class StateStore:
                 self.connection.execute(
                     "DELETE FROM replay_players WHERE id=?",
                     (source_replay_player[0],),
+                )
+            source_stats = self.connection.execute(
+                "SELECT play_seconds, rubber_deaths, deathzone_deaths, finishes, "
+                "distance_meters, turns, updated_at FROM player_stats "
+                "WHERE identity_key=?",
+                (source_identity_key,),
+            ).fetchone()
+            if source_stats is not None:
+                self._increment_player_stats(
+                    destination.identity_key,
+                    destination.username,
+                    destination.authenticated,
+                    play_seconds=float(source_stats[0]),
+                    rubber_deaths=int(source_stats[1]),
+                    deathzone_deaths=int(source_stats[2]),
+                    finishes=int(source_stats[3]),
+                    distance_meters=float(source_stats[4]),
+                    turns=int(source_stats[5]),
+                    updated_at=float(source_stats[6]),
+                )
+                self.connection.execute(
+                    "DELETE FROM player_stats WHERE identity_key=?",
+                    (source_identity_key,),
                 )
         return UserMergeResult(
             records_moved=len(source_records),
@@ -7695,11 +7938,13 @@ class TronnerRacing:
                 if now >= next_leaderboards or self.live_dashboard_refresh_requested:
                     self.live_dashboard_refresh_requested = False
                     rows = self.store.dashboard_record_rows()
+                    player_stats = self.store.dashboard_player_stats()
                     maps = self._dashboard_maps_by_record_key()
                     writes = await asyncio.to_thread(
                         self.live_dashboard.publish_leaderboards,
                         rows,
                         maps,
+                        player_stats,
                     )
                     if writes:
                         self.store.set_json(
@@ -8446,6 +8691,10 @@ class TronnerRacing:
             turns = int(parts[8])
         except (TypeError, ValueError):
             return
+        initial_distance = 0.0
+        if len(parts) >= 11:
+            with contextlib.suppress(ValueError):
+                initial_distance = max(0.0, float(parts[10]))
         if not all(math.isfinite(value) for value in (game_time, x, y, xdir, ydir, speed)):
             return
         player.cycle_xdir = xdir
@@ -8485,6 +8734,8 @@ class TronnerRacing:
             ydir=ydir,
             speed=max(0.0, speed),
             initial_turns=max(0, turns),
+            initial_distance=initial_distance,
+            latest_distance=initial_distance,
             size_factor=self.current_size_factor,
             start_mode=self._start_mode_for(player),
             checkpoint_spawn=player.pending_respawn_kind == "checkpoint",
@@ -8597,6 +8848,10 @@ class TronnerRacing:
             turns = int(parts[8])
         except (TypeError, ValueError):
             return
+        distance = None
+        if len(parts) >= 10:
+            with contextlib.suppress(ValueError):
+                distance = max(0.0, float(parts[9]))
         capture.update_state(
             game_time,
             x,
@@ -8605,6 +8860,7 @@ class TronnerRacing:
             ydir,
             speed,
             turns,
+            distance=distance,
             released=state_kind == "release",
         )
         player = self.player_for(capture.player_log_name)
@@ -10120,6 +10376,7 @@ class TronnerRacing:
         snapshot_direction: tuple[float, float] | None = None
         snapshot_speed: float | None = None
         snapshot_turns: int | None = None
+        snapshot_distance: float | None = None
         if len(parts) >= 10:
             try:
                 exact_game_time = float(parts[5])
@@ -10148,6 +10405,14 @@ class TronnerRacing:
             snapshot_direction = (exact_xdir, exact_ydir)
             snapshot_speed = exact_speed
             snapshot_turns = exact_turns
+            if len(parts) >= 11:
+                try:
+                    exact_distance = float(parts[10])
+                except ValueError:
+                    return
+                if not math.isfinite(exact_distance) or exact_distance < 0:
+                    return
+                snapshot_distance = exact_distance
         now = time.monotonic()
         candidate_activity = now - native_idle_seconds
         previous_position = player.last_activity_position
@@ -10155,6 +10420,14 @@ class TronnerRacing:
         player.activity_snapshot_seen = True
         player.activity_cycle_alive = cycle_alive
         player.last_activity_position = position if cycle_alive else None
+
+        if snapshot_distance is not None:
+            token = self.active_replay_tokens.get(id(player))
+            capture = self.replay_captures.get(token or "")
+            if capture is not None:
+                capture.latest_distance = max(
+                    capture.initial_distance, snapshot_distance
+                )
 
         if not cycle_alive:
             if player.active and player.dead_since_monotonic is None:

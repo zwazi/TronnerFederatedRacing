@@ -150,7 +150,10 @@ def map_leaderboard(map_key: str, rows: list[dict[str, object]]) -> list[dict[st
     ]
 
 
-def overall_leaderboard(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+def overall_leaderboard(
+    rows: list[dict[str, object]],
+    limit: int | None = OVERALL_ENTRY_LIMIT,
+) -> list[dict[str, object]]:
     """Score authenticated racers: 100 points for first down to 1 for 100th."""
     maps: dict[str, list[dict[str, object]]] = collections.defaultdict(list)
     for row in rows:
@@ -165,8 +168,8 @@ def overall_leaderboard(rows: list[dict[str, object]]) -> list[dict[str, object]
                 math.inf if row.get("bestTurns") is None else int(row["bestTurns"]),
                 float(row["achievedAt"]),
             ),
-        )[:MAP_ENTRY_LIMIT]
-        for rank, row in enumerate(ordered, 1):
+        )
+        for row in ordered:
             identity = str(row["identityKey"])
             total = totals.setdefault(identity, {
                 "name": str(row["username"])[:128],
@@ -175,8 +178,11 @@ def overall_leaderboard(rows: list[dict[str, object]]) -> list[dict[str, object]
                 "wins": 0,
             })
             total["name"] = str(row["username"])[:128]
-            total["points"] = int(total["points"]) + (MAP_ENTRY_LIMIT + 1 - rank)
             total["maps"] = int(total["maps"]) + 1
+        for rank, row in enumerate(ordered[:MAP_ENTRY_LIMIT], 1):
+            identity = str(row["identityKey"])
+            total = totals[identity]
+            total["points"] = int(total["points"]) + (MAP_ENTRY_LIMIT + 1 - rank)
             total["wins"] = int(total["wins"]) + int(rank == 1)
     ordered_totals = sorted(
         totals.items(),
@@ -186,7 +192,9 @@ def overall_leaderboard(rows: list[dict[str, object]]) -> list[dict[str, object]
             -int(item[1]["maps"]),
             str(item[1]["name"]).casefold(),
         ),
-    )[:OVERALL_ENTRY_LIMIT]
+    )
+    if limit is not None:
+        ordered_totals = ordered_totals[:max(0, int(limit))]
     return [
         {
             "rank": rank,
@@ -574,6 +582,7 @@ class FirebaseLiveDashboardPublisher:
         self,
         rows: list[dict[str, object]],
         maps_by_record_key: dict[str, dict[str, object]],
+        player_stats: list[dict[str, object]] | None = None,
     ) -> int:
         writes = 0
         if not self.map_catalog and callable(getattr(self.firebase, "list_documents", None)):
@@ -695,7 +704,8 @@ class FirebaseLiveDashboardPublisher:
                 self.leaderboard_hashes[document_id] = digest
                 writes += 1
 
-        overall = overall_leaderboard(rows)
+        full_overall = overall_leaderboard(rows, limit=None)
+        overall = full_overall[:OVERALL_ENTRY_LIMIT]
         stable_overall = {
             "schemaVersion": SCHEMA_VERSION,
             "scoring": "Top 100 on each map earn 100 points down to 1 point.",
@@ -777,7 +787,23 @@ class FirebaseLiveDashboardPublisher:
                     "turns": row.get("bestTurns"),
                     "achievedAt": int(float(row["achievedAt"]) * 1000),
                 })
-        overall_by_player = {str(entry["playerId"]): entry for entry in overall}
+        stats_by_player: dict[str, dict[str, object]] = {}
+        for supplied in player_stats or []:
+            identity_key = str(supplied.get("identityKey", ""))
+            if not identity_key:
+                continue
+            player_id = public_player_id(identity_key)
+            stats_by_player[player_id] = supplied
+            profile = profiles.setdefault(player_id, {
+                "schemaVersion": SCHEMA_VERSION,
+                "playerId": player_id,
+                "name": str(supplied.get("username", "Racer"))[:128],
+                "maps": [],
+            })
+            profile["name"] = str(supplied.get("username", profile["name"]))[:128]
+        overall_by_player = {
+            str(entry["playerId"]): entry for entry in full_overall
+        }
         active_profile_ids = set()
         for player_id, stable_profile in profiles.items():
             overall_entry = overall_by_player.get(player_id, {})
@@ -788,6 +814,57 @@ class FirebaseLiveDashboardPublisher:
             stable_profile["maps"].sort(key=lambda item: (
                 int(item["rank"]), str(item["name"]).casefold(), str(item["mapKey"])
             ))
+            completed_ranks = [int(item["rank"]) for item in stable_profile["maps"]]
+            active_ranks = {
+                str(item["mapKey"]): int(item["rank"])
+                for item in stable_profile["maps"]
+                if str(item["mapKey"]) in maps_by_record_key
+            }
+            all_map_ranks = [
+                active_ranks.get(map_key, len(grouped.get(map_key, [])) + 1)
+                for map_key in maps_by_record_key
+            ]
+            stable_profile["rankStats"] = {
+                "firstPlaceMaps": sum(rank == 1 for rank in completed_ranks),
+                "ladderPosition": int(overall_entry.get("rank", 0) or 0),
+                "completedMapCount": len(completed_ranks),
+                "totalMapCount": len(maps_by_record_key),
+                "averageCompletedRank": (
+                    round(sum(completed_ranks) / len(completed_ranks), 2)
+                    if completed_ranks else None
+                ),
+                # An unfinished map counts one place after its current last
+                # finisher, matching the established racing ladder convention.
+                "averageAllMapsRank": (
+                    round(sum(all_map_ranks) / len(all_map_ranks), 2)
+                    if all_map_ranks else None
+                ),
+            }
+            supplied_stats = stats_by_player.get(player_id, {})
+            distance_meters = max(
+                0.0, float(supplied_stats.get("distanceMeters", 0) or 0)
+            )
+            stable_profile["stats"] = {
+                "playSeconds": round(
+                    max(0.0, float(supplied_stats.get("playSeconds", 0) or 0)), 3
+                ),
+                "rubberDeaths": max(
+                    0, int(supplied_stats.get("rubberDeaths", 0) or 0)
+                ),
+                "deathzoneDeaths": max(
+                    0, int(supplied_stats.get("deathzoneDeaths", 0) or 0)
+                ),
+                "finishes": max(0, int(supplied_stats.get("finishes", 0) or 0)),
+                # Older replay rows have no distance telemetry.  Leave the value
+                # unknown until the patched engine supplies a positive sample;
+                # publishing 0 km would incorrectly imply complete history.
+                "distanceKilometers": (
+                    round(distance_meters / 1000.0, 3)
+                    if distance_meters > 0 else None
+                ),
+                "turns": max(0, int(supplied_stats.get("turns", 0) or 0)),
+                "updatedAt": max(0, int(supplied_stats.get("updatedAt", 0) or 0)),
+            }
             profile_hash = payload_hash(stable_profile)
             active_profile_ids.add(player_id)
             if self.profile_hashes.get(player_id) == profile_hash:
