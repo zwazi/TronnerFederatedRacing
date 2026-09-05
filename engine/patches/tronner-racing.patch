@@ -599,7 +599,7 @@ index 78153a3..c443f43 100644
  
  // *******************************************************************************************
  // *
-@@ -2428,11 +2553,209 @@ void gCycle::InitAfterCreation(){
+@@ -2428,11 +2553,212 @@ void gCycle::InitAfterCreation(){
  }
  
  static eLadderLogWriter se_cycleCreatedWriter("CYCLE_CREATED", false);
@@ -780,7 +780,10 @@ index 78153a3..c443f43 100644
 +    if ( !sg_CycleReplayEligible(cycle) )
 +        return;
 +    se_cycleReplayInputWriter << cycle->ReplayToken() <<
-+        sg_HighPrecisionRaceTime(gameTime) << action;
++        sg_HighPrecisionRaceTime(gameTime) << action <<
++        cycle->MapPosition().x << cycle->MapPosition().y <<
++        cycle->Direction().x << cycle->Direction().y <<
++        cycle->Speed() << cycle->GetTurns();
 +    se_cycleReplayInputWriter.write();
 +}
  
