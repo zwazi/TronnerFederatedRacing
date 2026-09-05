@@ -27,6 +27,21 @@ time. Teleport, speed, and rubber zones still affect playback so the recorded
 route remains faithful. Ghosts do not create walls, affect other cycles,
 trigger scoring/death/checkpoint zones, or enter racing ladder logs.
 
+Replay plans store positions in map coordinates. The server converts those
+positions through the arena size multiplier when it creates the ghost, matching
+the normal player spawn path on both size-zero and resized maps.
+
+Administrators can recover start fields written by older controller versions
+from retained authoritative ladder logs. The repair defaults to a dry run,
+requires a new integrity-checked database backup for `--apply`, and skips every
+ambiguous match:
+
+```sh
+python3 tools/repair_replay_starts.py \
+  --database /var/lib/tronner-racing/TronnerRacing.sqlite3 \
+  --ladderlog /var/lib/armagetronad/ladderlog.txt
+```
+
 ## Legacy client compatibility
 
 No new network descriptor or client feature is required. The ghost is sent as

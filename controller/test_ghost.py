@@ -87,6 +87,86 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
             )
             store.close()
 
+    def test_release_state_is_preserved_when_terminal_state_arrives(self):
+        capture = ReplayCapture(
+            token="run-1",
+            player_log_name="racer",
+            identity_key="auth:racer",
+            username="Racer",
+            authenticated=True,
+            map_identifier="Tester/maps/Race-v1.aamap.xml",
+            revision_identifier="revision-1",
+            resource_key="resource-revision-1",
+            started_at=1000.0,
+            spawn_game_time=10.0,
+            x=-8.0,
+            y=-136.0,
+            xdir=-1.0,
+            ydir=0.0,
+            speed=0.0,
+            initial_turns=0,
+            size_factor=1.0,
+            start_mode="brake",
+            checkpoint_spawn=False,
+            initial_distance=12.0,
+            latest_distance=12.0,
+        )
+
+        capture.update_state(
+            10.5, -8.0, -136.0, -1.0, 0.0, 20.0, 1,
+            distance=12.0, released=True,
+        )
+        capture.update_state(
+            45.9, 43.0565, -106.419, 0.0, -1.0, 66.0392, 85,
+            distance=2604.33,
+        )
+
+        self.assertEqual(
+            (capture.x, capture.y, capture.xdir, capture.ydir),
+            (-8.0, -136.0, -1.0, 0.0),
+        )
+        self.assertEqual(capture.speed, 20.0)
+        self.assertEqual(capture.initial_turns, 1)
+        self.assertEqual(capture.release_offset_us, 500_000)
+        self.assertEqual(capture.latest_distance, 2604.33)
+
+    def test_begin_state_remains_fallback_without_release(self):
+        capture = ReplayCapture(
+            token="run-1",
+            player_log_name="racer",
+            identity_key="auth:racer",
+            username="Racer",
+            authenticated=True,
+            map_identifier="Tester/maps/Race-v1.aamap.xml",
+            revision_identifier="revision-1",
+            resource_key="resource-revision-1",
+            started_at=1000.0,
+            spawn_game_time=10.0,
+            x=5.0,
+            y=7.0,
+            xdir=0.0,
+            ydir=1.0,
+            speed=30.0,
+            initial_turns=0,
+            size_factor=0.0,
+            start_mode="immediate",
+            checkpoint_spawn=False,
+        )
+
+        capture.update_state(
+            20.0, 100.0, 200.0, -1.0, 0.0, 50.0, 6,
+            distance=500.0,
+        )
+
+        self.assertEqual(
+            (capture.x, capture.y, capture.xdir, capture.ydir),
+            (5.0, 7.0, 0.0, 1.0),
+        )
+        self.assertEqual(capture.speed, 30.0)
+        self.assertEqual(capture.initial_turns, 0)
+        self.assertIsNone(capture.release_offset_us)
+        self.assertEqual(capture.latest_distance, 500.0)
+
     async def test_world_record_command_writes_private_one_shot_plan(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -208,7 +208,7 @@ index c8a4959f..95e5e8a2 100644
 +        gGhostPlayer *player,
 +        gCycle *human,
 +        sg_GhostSession *session )
-+        : gCycle(grid, plan.position, plan.direction, player),
++        : gCycle(grid, plan.position * gArena::SizeMultiplier(), plan.direction, player),
 +          plan_(plan), recipient_(session->owner), visible_(false),
 +          started_(false), complete_(false), nextEvent_(0),
 +          playbackStart_(0), human_(human), session_(session)

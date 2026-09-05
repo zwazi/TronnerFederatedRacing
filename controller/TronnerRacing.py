@@ -1868,15 +1868,18 @@ class ReplayCapture:
     ) -> None:
         if not all(math.isfinite(value) for value in (game_time, x, y, xdir, ydir, speed)):
             return
-        self.x = x
-        self.y = y
-        self.xdir = xdir
-        self.ydir = ydir
-        self.speed = max(0.0, speed)
-        self.initial_turns = max(0, turns)
         if distance is not None and math.isfinite(distance):
             self.latest_distance = max(self.initial_distance, float(distance))
         if released:
+            # The replay begins at the authoritative start-hold release.  Later
+            # state messages describe the live/terminal cycle and must not
+            # overwrite the start used by ghost playback.
+            self.x = x
+            self.y = y
+            self.xdir = xdir
+            self.ydir = ydir
+            self.speed = max(0.0, speed)
+            self.initial_turns = max(0, turns)
             self.release_offset_us = round(
                 (game_time - self.spawn_game_time) * 1_000_000
             )
