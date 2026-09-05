@@ -1416,7 +1416,7 @@ USER_COMMAND_HELP = (
     ("/spec or /spectate", "Disable scripted respawning."),
     ("/report [message]", "Privately send a report to the server owner."),
     ("/suggest [message]", "Privately suggest a feature to the server owner."),
-    ("/help", "Show the commands available to you."),
+    ("/help [search term]", "Show or search the commands available to you."),
 )
 
 ADMIN_COMMAND_HELP = (
@@ -1470,6 +1470,35 @@ def build_help_lines(entries: Sequence[tuple[str, str]]) -> list[str]:
         f"{command.ljust(command_width)} - {description}"
         for command, description in visible_entries
     ]
+
+
+def search_help_entries(
+    entries: Sequence[tuple[str, str]], query: object
+) -> list[tuple[str, str]]:
+    """Return case-insensitive help matches, preferring an exact command name."""
+    needle = " ".join(plain_console_text(query).split()).casefold()
+    if not needle:
+        return list(entries)
+    command_name = needle.removeprefix("/")
+    exact_command_matches = [
+        (command, description)
+        for command, description in entries
+        if plain_console_text(command)
+        .lstrip("/")
+        .split(maxsplit=1)[0]
+        .casefold()
+        == command_name
+    ]
+    if exact_command_matches:
+        return exact_command_matches
+    matches = []
+    for command, description in entries:
+        haystack = (
+            f"{plain_console_text(command)} {plain_console_text(description)}"
+        ).casefold()
+        if needle in haystack:
+            matches.append((command, description))
+    return matches
 
 
 def build_compact_columns(
@@ -9258,8 +9287,16 @@ class TronnerRacing:
             return
         player = self.player_for(parts[0], create=True)
         assert player
-        with contextlib.suppress(ValueError):
+        try:
             player.owner_id = int(parts[1])
+        except ValueError:
+            pass
+        else:
+            # Dedicated-server bots, including private replay ghosts, use
+            # owner zero. ONLINE_PLAYER may arrive after PLAYER_AI_ENTERED,
+            # so never reclassify such a server-owned player as human.
+            player.is_ai = player.owner_id <= 0
+        with contextlib.suppress(ValueError):
             red, green, blue = (
                 max(0, min(15, int(value))) for value in parts[2:5]
             )
@@ -9275,7 +9312,6 @@ class TronnerRacing:
         # field is a native team. Script-forced racers intentionally have no
         # native team and remain active until they explicitly spectate.
         player.active = len(parts) >= 9 or player.forced_racing
-        player.is_ai = False
         self.register_alias(player, parts[0])
 
     def _handle_online_status(self, payload: str, alive: bool) -> None:
@@ -10655,8 +10691,16 @@ class TronnerRacing:
         return list(unique.values())
 
     def eligible_voters(self) -> list[Player]:
-        """Return active human racers who currently count toward votes."""
-        return [player for player in self.active_players() if not player.afk]
+        """Return active network-owned human racers who count toward votes."""
+        return [
+            player
+            for player in self.active_players()
+            if not player.afk
+            # Server-created players have owner zero. Keep this independent
+            # of ladderlog event ordering so a replay ghost can never become
+            # vote-eligible between its grid and AI classification events.
+            and (player.owner_id is None or player.owner_id > 0)
+        ]
 
     def _vote_generation(self, vote_name: str) -> int:
         return int(getattr(self, f"{vote_name}_vote_generation", 0))
@@ -10704,11 +10748,15 @@ class TronnerRacing:
             or not getattr(self, "current", None)
             or not self._round_is_active()
             or getattr(self, "transitioning", False)
-            or getattr(self, "final_countdown_active", False)
         ):
             return False
+        final_countdown_active = bool(
+            getattr(self, "final_countdown_active", False)
+        )
         restored = False
         for vote_name in ("extend", "skip"):
+            if final_countdown_active and vote_name != "extend":
+                continue
             generation = player.suspended_votes.pop(vote_name, None)
             if generation != self._vote_generation(vote_name):
                 continue
@@ -10723,7 +10771,6 @@ class TronnerRacing:
             not getattr(self, "current", None)
             or not self._round_is_active()
             or getattr(self, "transitioning", False)
-            or getattr(self, "final_countdown_active", False)
         ):
             return False
         voters = self.eligible_voters()
@@ -10737,13 +10784,31 @@ class TronnerRacing:
         if not self.extend_votes or len(self.extend_votes) < required:
             return False
         extension = float(self.config.get("extend_seconds", 300))
-        if self.deadline_epoch is None:
-            self.deadline_epoch = time.time() + extension
-        else:
-            self.deadline_epoch += extension
+        now = time.time()
+        countdown_was_active = bool(
+            getattr(self, "final_countdown_active", False)
+        )
+        self.deadline_epoch = max(now, self.deadline_epoch or now) + extension
         self.store.set_json("deadline_epoch", self.deadline_epoch)
         self._clear_vote("extend")
-        await self.broadcast("Map extended by 5 minutes.")
+        if countdown_was_active:
+            self._clear_final_countdown_state()
+            # Replace the last global countdown number immediately. Dead
+            # racers whose respawns were suppressed by the countdown can now
+            # re-enter through the normal scripted lifecycle.
+            await self.sink.send("CENTER_MESSAGE 0xffffff ")
+            resumed = self._schedule_startup_respawns()
+            await self.broadcast(
+                "Extend vote passed. Final countdown cancelled; "
+                "map extended by 5 minutes."
+            )
+            LOG.info(
+                "final countdown cancelled by extend vote; resumed=%d deadline=%.3f",
+                resumed,
+                self.deadline_epoch,
+            )
+        else:
+            await self.broadcast("Map extended by 5 minutes.")
         return True
 
     async def _resolve_skip_vote(self) -> bool:
@@ -10782,8 +10847,8 @@ class TronnerRacing:
         return True
 
     async def _resolve_votes_after_eligibility_change(self) -> None:
-        # Resolve skip first: once its final countdown starts, extend is no
-        # longer a valid live vote.
+        # Resolve skip first during ordinary play. During a final countdown it
+        # is intentionally ineligible, while an extend vote may cancel it.
         if await self._resolve_skip_vote():
             self._clear_vote("extend")
             return
@@ -12120,7 +12185,7 @@ class TronnerRacing:
         elif command == "/rate":
             await self._command_rate(player, arguments)
         elif command == "/help":
-            await self._command_help(player, access_level)
+            await self._command_help(player, access_level, arguments)
         elif command == "/report":
             await self._command_report(player, arguments, access_level)
         elif command == "/suggest":
@@ -12421,7 +12486,12 @@ class TronnerRacing:
             "Use /rate to submit your own rating."
         )
 
-    async def _command_help(self, player: Player, access_level: int) -> None:
+    async def _command_help(
+        self,
+        player: Player,
+        access_level: int,
+        search_term: str = "",
+    ) -> None:
         entries = list(USER_COMMAND_HELP)
         for setting, command, description in ADMIN_COMMAND_HELP:
             if access_level <= int(self.config.get(setting, 1)):
@@ -12429,9 +12499,21 @@ class TronnerRacing:
         hot_commands = getattr(self, "hot_commands", None)
         if hot_commands:
             entries.extend(hot_commands.help_entries(self.config, access_level))
+        query = " ".join(plain_console_text(search_term).split())[:80]
+        if query:
+            entries = search_help_entries(entries, query)
+            if not entries:
+                await self.private(
+                    player,
+                    f'No commands match "{query}". Use /help to list all commands.',
+                )
+                return
+            heading = f'TronnerRacing commands matching "{query}":'
+        else:
+            heading = "TronnerRacing commands:"
         await self.private_block(
             player,
-            ["TronnerRacing commands:", *build_help_lines(entries)],
+            [heading, *build_help_lines(entries)],
         )
 
     def _saved_message_recipient(self, query: str) -> StoredIdentity:
@@ -13493,8 +13575,11 @@ class TronnerRacing:
         )
 
     async def _command_extend(self, player: Player) -> None:
-        if self.final_countdown_active:
-            await self.private(player, "The final countdown has started; this map cannot be extended.")
+        if not self.current or not self._round_is_active():
+            await self.private(player, "No active map is available to extend.")
+            return
+        if self.transitioning:
+            await self.private(player, "A map change is already in progress.")
             return
         voters = self.eligible_voters()
         voter_ids = {id(voter) for voter in voters}
