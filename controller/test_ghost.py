@@ -87,6 +87,44 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
             )
             store.close()
 
+    def test_ghost_settings_ignore_runtime_metadata_but_not_physics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.add_replay_settings(
+                "recorded",
+                1,
+                [
+                    (b"CYCLE_SPEED", b"20"),
+                    (b"PING_CHARITY_SERVER", b"151"),
+                    (b"SERVER_OPTIONS", b"Current map: Epyon | Next Map: Retro"),
+                ],
+            )
+            store.add_replay_settings(
+                "active",
+                1,
+                [
+                    (b"CYCLE_SPEED", b"20"),
+                    (b"PING_CHARITY_SERVER", b"181"),
+                    (b"SERVER_OPTIONS", b"Current map: Epyon | Next Map: Triform"),
+                ],
+            )
+            store.add_replay_settings(
+                "changed-physics",
+                1,
+                [
+                    (b"CYCLE_SPEED", b"21"),
+                    (b"PING_CHARITY_SERVER", b"181"),
+                    (b"SERVER_OPTIONS", b"Current map: Epyon | Next Map: Triform"),
+                ],
+            )
+
+            self.assertTrue(store.ghost_settings_compatible("recorded", "active"))
+            self.assertFalse(
+                store.ghost_settings_compatible("recorded", "changed-physics")
+            )
+            self.assertFalse(store.ghost_settings_compatible("recorded", "missing"))
+            store.close()
+
     def test_release_state_is_preserved_when_terminal_state_arrives(self):
         capture = ReplayCapture(
             token="run-1",

@@ -67,6 +67,13 @@ REPLAY_SETTINGS_FORMAT_VERSION = 1
 GHOST_PLAN_FORMAT_VERSION = 1
 GHOST_MAX_EVENTS = 100_000
 GHOST_MAX_DURATION_SECONDS = 3_600.0
+# These settings are captured in replay snapshots but cannot affect the path of
+# a private, server-driven ghost. Their values routinely change as players or
+# the map queue change, so comparing the raw snapshot identifier would reject
+# otherwise identical physics.
+GHOST_NON_PHYSICS_REPLAY_SETTINGS = frozenset(
+    {b"PING_CHARITY_SERVER", b"SERVER_OPTIONS"}
+)
 GHOST_PLAN_FILENAME_RE = re.compile(r"ghost-[0-9]+-[0-9]+\.plan")
 SERVER_CONSOLE_HISTORY_LINES = 250
 SERVER_CONSOLE_INITIAL_LINES = 100
@@ -2623,6 +2630,45 @@ class StateStore:
             (server_identifier,),
         ).fetchone()
         return int(row[0]) if row else None
+
+    def ghost_settings_compatible(
+        self,
+        recorded_identifier: str,
+        active_identifier: str,
+    ) -> bool:
+        """Compare replay settings while excluding non-simulation metadata."""
+        if recorded_identifier == active_identifier:
+            return True
+        rows = self.current_connection().execute(
+            "SELECT server_identifier, format_version, compression, setting_data "
+            "FROM replay_settings WHERE server_identifier IN (?, ?)",
+            (recorded_identifier, active_identifier),
+        ).fetchall()
+        snapshots: dict[str, tuple[int, tuple[tuple[bytes, bytes], ...]]] = {}
+        try:
+            for identifier, format_version, compression, setting_data in rows:
+                if int(compression) not in {0, 1}:
+                    return False
+                raw = (
+                    zlib.decompress(bytes(setting_data))
+                    if int(compression) == 1
+                    else bytes(setting_data)
+                )
+                relevant_items = tuple(
+                    sorted(
+                        (name, value)
+                        for name, value in decode_replay_settings(raw)
+                        if name not in GHOST_NON_PHYSICS_REPLAY_SETTINGS
+                    )
+                )
+                snapshots[str(identifier)] = (int(format_version), relevant_items)
+        except (TypeError, ValueError, zlib.error):
+            return False
+        return (
+            len(snapshots) == 2
+            and snapshots.get(recorded_identifier)
+            == snapshots.get(active_identifier)
+        )
 
     def add_replay(self, capture: ReplayCapture, ended_at: float) -> int:
         """Persist one compact, physics-free cycle input stream."""
@@ -12427,7 +12473,10 @@ class TronnerRacing:
         if (
             replay.settings_identifier is not None
             and active_settings is not None
-            and replay.settings_identifier != active_settings
+            and not self.store.ghost_settings_compatible(
+                replay.settings_identifier,
+                active_settings,
+            )
         ):
             await self.private(
                 player,

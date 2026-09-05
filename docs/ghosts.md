@@ -19,6 +19,12 @@ matches the exact map revision, map size, finish time, turns, and current
 physics snapshot. Historical records without a matching replay are reported as
 unavailable.
 
+Physics compatibility compares the captured setting values, not only the raw
+snapshot identifier. Runtime-only `SERVER_OPTIONS` text and
+`PING_CHARITY_SERVER` latency allowance are ignored because they cannot affect
+the route of a server-driven, non-colliding ghost; movement and zone settings
+must still match exactly.
+
 The controller writes a bounded, mode-0600 one-shot plan under
 `/var/lib/armagetronad/ghosts`. The patched server creates an invulnerable,
 server-driven cycle, replays accepted turn and brake inputs at their recorded
